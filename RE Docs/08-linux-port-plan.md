@@ -434,23 +434,51 @@ camera is already useful, and chasing calibration before the frame layout is kno
 
 ---
 
-## 8.9 Suggested repository layout
+## 8.9 Repository layout
+
+As built (git `main`, initialised 2026-09-20). An earlier version of this section
+proposed a flat `dyt-thermal/` tree; the port is instead self-contained under
+`linux-port/`, so it builds and tests on its own.
 
 ```
-dyt-thermal/
-├── libuvc/                 upstream, unmodified (git submodule)
-├── src/
-│   ├── control.c           uvc_diy_communicate + the transaction state machine
-│   ├── orders.c            the opcode table (once recovered)
-│   ├── frame.c             frame acquisition + user-area parsing
-│   ├── thermometry.c       port of libthermometry.so
-│   ├── palette.c           768-byte RGB24 LUT loader
-│   └── dytfile.c           DYT container read/write
-├── tools/
-│   ├── probe.c             Phase 0/1 smoke test: enumerate + read serial
-│   └── dumpframe.c         Phase 2: dump a raw frame to disk
-└── docs/                   copy of RE Docs/ for reference
+Thermal Camera/
+├── RE Docs/                this document set
+├── RE Workspace/           generated, disposable (see 02); only the scripts are tracked
+├── linux-port/
+│   ├── Makefile            `make` builds; `make check` is the regression gate
+│   ├── src/
+│   │   ├── control.c       uvc_diy_communicate + the transaction state machine
+│   │   ├── frame.c         frame acquisition + user-area parsing
+│   │   ├── thermometry.c   port of libthermometry.so
+│   │   ├── calib.c         tau_*.bin / MILI6_*.bin reader (not wired in; see 10 §4.5)
+│   │   ├── capture.c       libuvc streaming layer
+│   │   ├── serial.c        serial-number decode (DecryptSNE)
+│   │   └── dumpframe.c     Phase 2: run the pipeline over a frozen frame
+│   ├── calib/              the four extracted calibration blobs
+│   ├── third_party/libuvc/ vendored v0.0.8, compiled from source — see below
+│   └── tools/
+│       ├── probe.c         Phase 0/1 smoke test: enumerate + read serial
+│       ├── capture_demo.c  live UVC capture demo
+│       ├── taucmp.c        tau-model comparison diagnostic (see 10 §8.3)
+│       └── thermometry_diff/
+│           ├── harness.c   runs the vendor libthermometry.so for ground truth
+│           ├── port.c      runs the port, for byte-comparison
+│           ├── diff.py     the comparison
+│           └── out/<cfg>/  frozen vendor ground truth, one dir per configuration
+└── iScout … v3.0.6+windows/ vendor originals (not tracked)
 ```
+
+Two deviations from what this section originally proposed:
+
+* **libuvc is vendored as source files, not a git submodule.** The build needs
+  `include/libuvc/libuvc_config.h`, which is hand-written here to replace the header
+  CMake would generate and therefore does not exist upstream — a gitlink would drop it
+  and break the build. The vendored sources are compiled directly by `linux-port/Makefile`,
+  with JPEG disabled.
+* **The opcode table lives in `control.c`**, not a separate `orders.c` as sketched above.
+
+Not yet written: `palette.c` (768-byte RGB24 LUT loader) and `dytfile.c` (DYT container
+read/write) — Phase 5, see §8.8.
 
 ---
 

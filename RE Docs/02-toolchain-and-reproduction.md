@@ -4,36 +4,40 @@ Everything in this document set can be regenerated from the two original artifac
 This file is the recipe. **All paths are relative to the thermal-camera folder.**
 
 ```
-iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/     <- originals (do not modify)
-├── MechanicTi.apk
-├── iScout Mechanic-Ti VisualPlatformSetUp v3.0.6.exe
+Thermal Camera/                                            <- repository root
 ├── RE Docs/                                               <- THIS DOCUMENT SET
-└── ../RE Workspace/                                       <- generated, large, disposable
-    ├── apk/                  extracted APK contents (libs, assets, dex)
-    ├── jadx/                 jadx decompilation (sources/ + resources/)
-    ├── exe/                  installer carving + extracted NSIS payload
-    │   ├── nsis_blocks/
-    │   │   ├── blk000..blk206.bin          every NSIS data block
-    │   │   ├── _nsis_header.bin            decompressed NSIS header
-    │   │   ├── _nsis_header_strings.txt    581-entry UTF-16LE string table
-    │   │   ├── INVENTORY.md                block / size / kind / verified identity
-    │   │   ├── manifest.txt walk*.log      extraction records
-    │   │   └── walk2.py block_file_map.txt exploratory walker + its output
-    │   ├── boot1/ boot3/     WiX Burn bootstrapper tree (from blk203's 7z SFX)
-    │   └── *.cab             carved bootstrapper CABs (prerequisites only)
-    ├── ghidra/
-    │   ├── proj/             Ghidra project (ThermalCam)
-    │   ├── out/*.so.c        decompiled C for each native library
-    │   └── scripts/ExportDecompiled.java
-    ├── tools/
-    │   ├── nsis_extract.py   reusable NSIS extractor (written here)
-    │   ├── dotnet_id.py      authoritative .NET assembly identification
-    │   └── pe_ident.py       best-effort native PE identification
-    └── logs/                 tool logs
+├── linux-port/                                            <- the Linux port (see 08)
+├── RE Workspace/                                          <- generated, large, disposable
+│   ├── apk/                  extracted APK contents (libs, assets, dex)
+│   ├── jadx/                 jadx decompilation (sources/ + resources/)
+│   ├── exe/                  installer carving + extracted NSIS payload
+│   │   ├── nsis_blocks/
+│   │   │   ├── blk000..blk206.bin          every NSIS data block
+│   │   │   ├── _nsis_header.bin            decompressed NSIS header
+│   │   │   ├── _nsis_header_strings.txt    581-entry UTF-16LE string table
+│   │   │   ├── INVENTORY.md                block / size / kind / verified identity
+│   │   │   ├── manifest.txt walk*.log      extraction records
+│   │   │   └── walk2.py block_file_map.txt exploratory walker + its output
+│   │   ├── boot1/ boot3/     WiX Burn bootstrapper tree (from blk203's 7z SFX)
+│   │   └── *.cab             carved bootstrapper CABs (prerequisites only)
+│   ├── ghidra/
+│   │   ├── proj/             Ghidra project (ThermalCam)
+│   │   ├── out/*.so.c        decompiled C for each native library
+│   │   └── scripts/ExportDecompiled.java
+│   ├── tools/
+│   │   ├── nsis_extract.py   reusable NSIS extractor (written here)
+│   │   ├── dotnet_id.py      authoritative .NET assembly identification
+│   │   └── pe_ident.py       best-effort native PE identification
+│   └── logs/                 tool logs
+└── iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/
+    ├── MechanicTi.apk
+    └── iScout Mechanic-Ti VisualPlatformSetUp v3.0.6.exe
 ```
 
-> `RE Workspace/` is disposable. It is ~2 GB. Nothing in it is a primary source —
-> it can always be rebuilt with the commands below. Keep it inside `GitIgnore/`.
+> `RE Workspace/` is disposable. It is ~583 MB. Nothing in it is a primary source —
+> it can always be rebuilt with the commands below. `.gitignore` excludes it, apart
+> from the scripts under `tools/` and `ghidra/`, which are tracked because this
+> document cites them as the reproduction pipeline.
 >
 > **Exception:** `_nsis_header_strings.txt` and `INVENTORY.md` encode recovered knowledge that is
 > cheap to lose and annoying to redo. If you delete the workspace, keep those two (or accept
@@ -61,7 +65,7 @@ iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/     <- originals (do not 
 ## 2.2 Android APK
 
 ```bash
-cd "GitIgnore/Thermal Camera"
+# Run from the repository root (paths below are relative to it).
 WS="RE Workspace"
 
 # Full listing

@@ -1,12 +1,11 @@
 # ---------------------------------------------------------------------------
-# Vendor binaries — large, proprietary, re-obtainable from the vendor.
+# Vendor originals — large, proprietary, re-obtainable from the vendor.
 #
-# Note the trailing form: the RE Docs/ tree lives *inside* the vendor
-# directory, and it is tracked.  So the two binaries are excluded by name
-# rather than ignoring the whole directory.
+# The whole directory is excluded.  RE Docs/ used to live inside it, which
+# forced the two binaries to be excluded by name; it now sits at the repo
+# root, so the directory holds nothing but the two originals.
 # ---------------------------------------------------------------------------
-/iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/*.exe
-/iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/*.apk
+/iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/
 
 # ---------------------------------------------------------------------------
 # RE Workspace — derived trees, extracted or decompiled from the vendor

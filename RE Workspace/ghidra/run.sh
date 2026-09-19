@@ -1,6 +1,9 @@
 #!/bin/bash
 GH=/home/shaanair/Projects/Ghidra/ghidra_12.1.2_PUBLIC/support/analyzeHeadless
-BASE="/home/shaanair/Projects/msm8916-openwrt-clean/GitIgnore/Thermal Camera/RE Workspace"
+# Derived from this script's own location (<workspace>/ghidra/run.sh), so the
+# workspace can be moved without editing this file.  It used to be a hardcoded
+# absolute path into a different project's tree, which silently broke it.
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJ="$BASE/ghidra/proj"
 SCRIPTS="$BASE/ghidra/scripts"
 OUT="$BASE/ghidra/out"

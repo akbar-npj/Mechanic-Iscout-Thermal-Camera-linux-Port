@@ -2,9 +2,11 @@
 
 Generated analysis artifacts. **Disposable** — everything here is reproducible from
 `../iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/` using the recipes in
-`../iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/RE Docs/02-toolchain-and-reproduction.md`.
+`../RE Docs/02-toolchain-and-reproduction.md`.
 
-Total size ~550 MB. Lives under `GitIgnore/` and is not committed.
+Total size ~583 MB. Derived material, so `.gitignore` excludes it — with the exception
+of the scripts under `tools/` and `ghidra/`, which are tracked because the docs cite
+them as the reproduction pipeline.
 
 ```
 apk/                    extracted from MechanicTi.apk
@@ -58,10 +60,10 @@ GH=/home/shaanair/Projects/Ghidra/ghidra_12.1.2_PUBLIC/support/analyzeHeadless
 
 ## Start here
 
-`../iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/RE Docs/README.md`
+`../RE Docs/README.md`
 
 ## Key results
 
-* USB protocol: `RE Docs/04-usb-protocol.md`
-* Thermometry math + constants: `RE Docs/05-thermometry-algorithm.md`
-* What is still unknown: `RE Docs/09-open-questions-and-next-steps.md`
+* USB protocol: `../RE Docs/04-usb-protocol.md`
+* Thermometry math + constants: `../RE Docs/05-thermometry-algorithm.md`
+* What is still unknown: `../RE Docs/09-open-questions-and-next-steps.md`

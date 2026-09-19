@@ -12,7 +12,9 @@
 # architectures do not mix.
 set -u
 GH=/home/shaanair/Projects/Ghidra/ghidra_12.1.2_PUBLIC/support/analyzeHeadless
-BASE="/home/shaanair/Projects/Thermal Camera/RE Workspace"
+# Derived from this script's own location (<workspace>/ghidra/run_win.sh);
+# see run.sh.
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJ="$BASE/ghidra/win/proj"
 SCRIPTS="$BASE/ghidra/scripts"
 OUT="$BASE/ghidra/win/out"
