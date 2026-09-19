@@ -55,10 +55,13 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
 
 TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/calib_test
-TOOLS := $(BUILD)/dumpframe $(BUILD)/capture_demo $(BUILD)/taucmp
-# probe talks to the device directly through libusb — only buildable with it.
+TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
+# capture_demo and probe talk to the device directly through libusb — only
+# buildable with it.  capture_demo's prereq on $(UVC_LIB) is what pulls the
+# vendored libuvc into the build when libusb is present; with no libusb,
+# nothing references $(UVC_LIB) and it stays dormant.
 ifdef HAVE_LIBUSB
-TOOLS += $(BUILD)/probe
+TOOLS += $(BUILD)/capture_demo $(BUILD)/probe
 endif
 
 # Frozen vendor ground truth, produced by tools/thermometry_diff/run.sh
@@ -68,7 +71,10 @@ FROZEN := $(addprefix tools/thermometry_diff/out/, \
 
 .PHONY: all check clean
 
-all: $(LIB) $(UVC_LIB) $(TESTS) $(TOOLS)
+# libuvc is only needed by the live-capture tools; the byte-verified
+# pipeline and its tests build with just a C compiler, so $(UVC_LIB) is
+# pulled in transitively via capture_demo (see below) and not listed here.
+all: $(LIB) $(TESTS) $(TOOLS)
 
 $(BUILD):
 	mkdir -p $(BUILD)

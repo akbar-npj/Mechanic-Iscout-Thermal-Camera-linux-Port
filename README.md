@@ -33,8 +33,11 @@ make clean
 byte-compares the frame pipeline against frozen vendor ground truth for all four sensor
 widths in both `fix_mode` configurations.
 
-Requires `cc`, `make`, `ar`, and `libusb-1.0` including its `pkg-config` file. No network
-access is needed — libuvc is vendored and built from source.
+Requires `cc`, `make`, and `ar`. `libusb-1.0` is **optional**: with it, the live-capture
+tools `capture_demo` and `probe` (and the vendored libuvc they build on) are included;
+without it, the byte-verified pipeline and its unit tests build and `make check` still
+passes — only the live-capture tools are omitted. No network access is needed — libuvc is
+vendored and built from source when libusb is present.
 
 ## Where to start reading
 

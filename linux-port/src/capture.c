@@ -19,6 +19,13 @@
  * The flag is guarded by a mutex + condvar so dyt_capture_request_shutter()
  * is safe to call from the callback.
  *
+ * The live UVC stack needs libusb (libuvc is built on it), so when this
+ * file is compiled without -DDYT_HAVE_LIBUSB every entry point returns
+ * "not supported" — see the #else at the bottom.  That keeps the
+ * byte-verified pipeline and its tests buildable on a machine with just a
+ * C compiler; only capture_demo and probe (which talk to real hardware)
+ * are omitted in that configuration.
+ *
  * build:  via the Makefile (make)
  */
 #include <stdio.h>
@@ -26,11 +33,12 @@
 #include <string.h>
 #include <pthread.h>
 
-#include <libusb.h>
-#include <libuvc/libuvc.h>
-
 #include "capture.h"
 #include "control.h"
+
+#ifdef DYT_HAVE_LIBUSB
+#include <libusb.h>
+#include <libuvc/libuvc.h>
 
 /* RE Docs 04 §4.5.5 writes uvc_set_zoom_abs(cam, 0xffff8000).  Upstream
  * libuvc's signature takes uint16_t, so that value truncates to 0x8000. */
@@ -77,14 +85,6 @@ struct dyt_capture {
 };
 
 /* ------------------------------------------------------------------ helpers */
-
-void dyt_capture_opts_default(dyt_capture_opts *o)
-{
-    memset(o, 0, sizeof *o);
-    o->t_amb       = 25.0f;
-    o->sensor_mode = 0x82;   /* vendor default (RE Docs 09 §7.2) */
-    o->fix_mode    = 0;      /* 0x78 enables GetFix */
-}
 
 /* Find the VideoStreaming interface number (class 0x0e, subclass 0x02)
  * from the libusb config descriptor.  Needed only for the manual ctrl
@@ -533,4 +533,76 @@ void dyt_capture_print_diag(dyt_capture_t *c)
 {
     if (c && c->devh)
         uvc_print_diag(c->devh, stderr);
+}
+
+#else /* !DYT_HAVE_LIBUSB — no live UVC stack, so every entry point declines. */
+
+struct dyt_capture { int dummy; };
+
+int dyt_capture_open(dyt_capture_t **out, const dyt_capture_opts *o)
+{
+    (void)o;
+    if (out) *out = NULL;
+    fprintf(stderr, "capture: built without libusb — live capture unavailable "
+                    "(rebuild with -DDYT_HAVE_LIBUSB)\n");
+    return -1;
+}
+
+int dyt_capture_start(dyt_capture_t *c, dyt_frame_cb_t cb, void *user)
+{
+    (void)c; (void)cb; (void)user;
+    return -1;
+}
+
+int dyt_capture_request_shutter(dyt_capture_t *c)
+{
+    (void)c;
+    return -1;
+}
+
+void dyt_capture_stop(dyt_capture_t *c)
+{
+    (void)c;
+}
+
+void dyt_capture_close(dyt_capture_t *c)
+{
+    (void)c;
+}
+
+dyt_mode_t dyt_capture_mode(const dyt_capture_t *c)
+{
+    (void)c;
+    return DYT_MODE_0;
+}
+
+void dyt_capture_geometry(const dyt_capture_t *c, int *width, int *active_height)
+{
+    (void)c;
+    if (width) *width = 0;
+    if (active_height) *active_height = 0;
+}
+
+const uint16_t *dyt_capture_last_raw(const dyt_capture_t *c, int *n_samples)
+{
+    (void)c;
+    if (n_samples) *n_samples = 0;
+    return NULL;
+}
+
+void dyt_capture_print_diag(dyt_capture_t *c)
+{
+    (void)c;
+    fprintf(stderr, "capture: built without libusb — live capture unavailable\n");
+}
+
+#endif /* DYT_HAVE_LIBUSB */
+
+/* Fill *o with the defaults.  libusb-independent, so it is always present. */
+void dyt_capture_opts_default(dyt_capture_opts *o)
+{
+    memset(o, 0, sizeof *o);
+    o->t_amb       = 25.0f;
+    o->sensor_mode = 0x82;   /* vendor default (RE Docs 09 §7.2) */
+    o->fix_mode    = 0;      /* 0x78 enables GetFix */
 }
