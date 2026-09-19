@@ -33,9 +33,8 @@ make clean
 byte-compares the frame pipeline against frozen vendor ground truth for all four sensor
 widths in both `fix_mode` configurations.
 
-Requires `cc`, `make`, `ar`, and `libusb-1.0` (`pkg-config`). libusb is optional: without
-it the real control-transfer backend and the `probe` tool are omitted, but everything
-else still builds. No network access is needed — libuvc is vendored.
+Requires `cc`, `make`, `ar`, and `libusb-1.0` including its `pkg-config` file. No network
+access is needed — libuvc is vendored and built from source.
 
 ## Where to start reading
 
@@ -52,8 +51,9 @@ do not treat **[I]** or **[?]** as established fact.
 | `RE Docs/09-open-questions-and-next-steps.md` | What is still unproven |
 | `RE Docs/10-calibration-tables.md` | The Windows calibration tables |
 
-`RE Docs/02-toolchain-and-reproduction.md` is the recipe for regenerating everything in
-`RE Workspace/` from the two vendor originals.
+`RE Docs/02-toolchain-and-reproduction.md` is the recipe for regenerating `RE Workspace/`
+from the two vendor originals; `RE Docs/07` and `RE Docs/10` cover the Windows DLLs and
+the calibration tables in more detail.
 
 ## Safety
 
