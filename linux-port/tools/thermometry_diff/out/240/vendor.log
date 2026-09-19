@@ -1,0 +1,2 @@
+[prio=6 tag=libUVCCamera] [653173*thermometry.c:281:thermometryT4Line]:orgData+userArea[0]:1A3,orgData+userArea[1]:FAA6
+[prio=6 tag=libUVCCamera] [653173*thermometry.c:282:thermometryT4Line]:correction:-1.583236, Refltmp:29.798769,Airtmp:27.925001 ,humi:0.500000,emiss:0.901972,distance:419
