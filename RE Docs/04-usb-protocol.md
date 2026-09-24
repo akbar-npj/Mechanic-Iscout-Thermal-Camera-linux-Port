@@ -131,6 +131,22 @@ for (i = 0; i < 1000; i++) {
 | 1 | **PENDING/READY** — result available; loop exits when clear |
 | 2–7 | **ERROR** — any set bit aborts |
 
+> **Correction (2026-09-24, live device).** The `[V]` above is *static* verification — the bit
+> layout is a faithful decompilation of `doTinyCOrder` — and it does **not** reproduce against
+> hardware. Two independent observations:
+>
+> * The Windows vendor capture (`MechaniscoutPcap/3.pcapng`, 356 s of normal operation, 689 status
+>   polls) shows **only** `0x01` (busy) and `0x00` (done). Bits 2..7 are never set. The `0xfc`
+>   abort branch is therefore a decompiled branch of **unconfirmed meaning**, not a hardware-verified
+>   error path.
+> * This unit (`0bda:5840`) answers `setTinyCOutputADValue` with `0x01`, then latches **`0x0e`** —
+>   which the loop above would treat as ERROR and abort on. `0x0e` is a device state, not a
+>   transient error (see §4.10's correction).
+>
+> Treat **`0x01` = busy / `0x00` = done** as the only verified semantics. The port's live bring-up
+> deliberately does not abort on the documented error bits: `capture.c:order_trace()` logs the raw
+> status progression instead.
+
 ### Canonical command transaction **[V]**
 
 ```
@@ -138,6 +154,17 @@ for (i = 0; i < 1000; i++) {
 2. poll wIndex=0x0200, 1 byte    -> until (b & 1)==0 && (b & 2)==0, max 1000 tries
 3. IN   wIndex=0x1d08, 15 bytes  -> the result
 ```
+
+> **Correction (2026-09-24) — the `0x1d08` "echo register" model was a wrong turn.**
+> An intermediate session concluded from a latched device that `0x1d08` "echoes the last write" and
+> that this transaction was therefore wrong or incomplete. **Both claims are false.** `0x1d08` *is*
+> a command-result register: the Windows capture shows `14 85 00 03` (getTinyCParams) returning
+> **16 bytes = ASCII `202605575259` + 4 zero bytes** — the module serial — and another order
+> returning 15 bytes of encrypted SN. The "echo" was an artifact of the port writing 9 bytes
+> (`tinyStartStream2`'s payload) to `0x1d08` while the device sat in the latched `0x0e` state
+> (§4.10), after which every read returned those stale bytes. The transaction shape above is
+> byte-identical to the vendor's (`linux-port/src/control.c:dyt_transaction_ex`) and needs no
+> change. It was also what made three different commands appear to return identical data.
 
 Observed command payloads **[V]** (from `UVCPreviewIR::doTinyCOrder`, the `switch` on the
 JNI order id):
@@ -502,6 +529,11 @@ i.e. the raw sample is **Kelvin × 64 (Q6 fixed point)**. This is
 > **Porting consequence:** the simple path is trivially reproducible and makes an excellent
 > bring-up target — if a device reports mode `1000`, `raw/64 - 273.15` is the entire thermometry.
 
+> **Correction (2026-09-24, live device).** "the entire thermometry" is right; "the entire bring-up"
+> is not. A mode-`1000` device does **not** emit real data until the host sends
+> `setTinyCOutputADValue` *after* the UVC stream is running. Until then it streams a flat `0x8000`
+> placeholder that decodes to `238.85 C`. See §4.10's correction for the full sequence.
+
 ### 4.5.5 Auto-shutter (flat-field) trigger — **must be replicated**
 
 `do_preview` monitors the **second sample of the reference band** and fires a shutter command when
@@ -565,6 +597,22 @@ device (they cannot be resolved statically):
 > Everything needed to *parse* a frame is now known. What remains is only *how to subscribe* to
 > the right stream, which one `lsusb -v` answers in seconds.
 
+> **Resolved (2026-09-24, live device).** `lsusb -v` and `probe --descriptors` on the `0bda:5840`
+> unit answer all three, so this section is closed:
+>
+> * **Thermal stream = `bFormatIndex 1`** — the *only* format on interface 1: `UNCOMPRESSED`
+>   (`YUY2`, 16 bpp), with two frame descriptors, **256×192** (`bFrameIndex 1`, the default) and
+>   256×384 (`bFrameIndex 2`). There is no second, visible format.
+> * **No visible/thermal demux.** One VideoStreaming interface, one format; the "dual vision" is an
+>   app-side composite. The vendor runs it on **`bAlternateSetting 7`** — probe/commit is
+>   `bFormatIndex 1`, `bFrameIndex 1`, `dwFrameInterval 400000` (25 fps),
+>   `dwMaxVideoFrameSize 98304`, `dwMaxPayloadTransferSize 3072`.
+> * **`bFrameIndex 2` (256×384) is a decoy — always select frame 1.** Captured live with AD output
+>   enabled, its whole 196,608-byte payload is synthetic filler: **one distinct row** (all 384 rows
+>   byte-identical) and only 3 distinct values in a strict 4-pixel cycle. The AD pipeline emits
+>   256×192 (98,304 B); asking for 384 gets the 192-row image padded with a pattern.
+> * The `+0x20` format tag stays a host-side struct field; it does not affect subscribing.
+
 ---
 
 ## 4.6 Minimal Linux proof-of-concept sketch
@@ -606,6 +654,12 @@ static int send_order(uvc_device_handle_t *devh, const uint8_t cmd[8],
 
 Then the order sequence needed to bring the thermal stream up must be lifted from
 `UVCPreviewIR::do_tinyC_order` / `tinyStartStream` / `tinyStartStream2`. **[?]**
+
+> **Resolved (2026-09-24, live device).** The sequence is much shorter than this line assumed, and
+> it does not involve `tinyStartStream` / `tinyStartStream2` at all — the vendor's startup sends
+> exactly **one** order, `setTinyCOutputADValue`, *after* the stream is running. Full sequence and
+> the latch to avoid are in §4.10's correction; the tested implementation is
+> `linux-port/src/capture.c` (`send_ad_order`).
 
 ---
 
@@ -761,3 +815,32 @@ else                                                           mode = 0;
 > **Bring-up order for the port:** identify VID/PID → derive mode → if `0x44c`, complete the SN
 > handshake before expecting thermal frames; if `1000`, frames flow immediately and thermometry
 > is `raw/64 − 273.15`.
+
+> **Correction (2026-09-24, live device) — this unit is `0bda:5840` / mode `1000`, and mode `1000`
+> does *not* flow frames immediately.**
+>
+> The 256×192 camera in this repository enumerates as **`0bda:5840`** (Realtek "USB Camera",
+> manufacturer `Generic`, serial `200901010001`) — **not** the `1514:0001` inferred above — so its
+> mode is **`1000` (direct AD)**, not `0x44c`. The reasoning above was wrong: the 256-wide
+> calibration table in `thermometryT4Line` and the `256 × 192 × 2` reference-band offset in
+> `do_preview` are both mode-`0x44c` *code* paths, but they do not imply that a 256×192 *device* is
+> `0x44c`. `probe --descriptors` and `lsusb -v` agree on the VID/PID.
+>
+> The bring-up is also longer than "frames flow immediately". Verified against
+> `MechaniscoutPcap/4.pcapng` (a capture that starts *before* the Windows app connects) and then
+> reproduced on Linux:
+>
+> 1. Enumerate; negotiate UVC on interface 1 and `SET_INTERFACE` alt 7.
+> 2. The stream runs but delivers a **flat `0x8000` placeholder** (`238.85 C` under
+>    `raw/64 − 273.15`) — every sample identical, no sensor noise.
+> 3. The host sends **one** order — `setTinyCOutputADValue`,
+>    `0x41/0x45 wValue=0x0078 wIndex=0x1D00  0a 01 00 00 00 00 00 00`.
+> 4. Real thermal data appears **~2–3 s later**, after a settle transient.
+>
+> **The ordering is the whole point.** Sent *before* the stream exists, that order makes the device
+> return `0x01` and then **latch `0x0e` permanently** — every later command returns `0x0e`, and
+> every `0x1d08` read returns stale bytes (this is the `0x1d08` "echo" of §4.2). The latch survives
+> handle close/open; **only a USB replug clears it.** `tinyStartStream`, `tinyStartStream2` and
+> `getTinyCParams` do **not** appear in the vendor's startup at all — sending them is what poisoned
+> earlier sessions. The port now sends only `setTinyCOutputADValue`, after streaming starts
+> (`linux-port/src/capture.c:send_ad_order`, `capture_demo --start-orders`).

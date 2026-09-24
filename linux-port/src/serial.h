@@ -25,6 +25,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* DecryptSNE — in[15] is the raw device blob, out[15] the decoded
  * serial.  out and in may alias.  The transform is applied in place
  * and is not an involution (it is not its own inverse). */
@@ -38,5 +42,9 @@ int dyt_serial_variant(const uint8_t sn[15]);
  * first non-printable byte.  dst must hold at least 16 bytes.  Returns
  * the number of characters written (excluding the NUL). */
 int dyt_serial_str(char *dst, const uint8_t sn[15]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DYT_SERIAL_H */

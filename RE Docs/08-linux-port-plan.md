@@ -104,9 +104,19 @@ tells you which row applies. **[V]**/**[?]**
 > `0x44c` (i.e. VID/PID `1514:0001`). See `04-usb-protocol.md` §4.10 — this is the single most
 > likely cause of a "device works but no thermal data" dead end.
 
+> **Correction (2026-09-24, live device).** This phase is done for the unit in hand, and both
+> expectations above were wrong for it. The device is **`0bda:5840` → mode `1000`**, so no serial
+> handshake is involved; and mode `1000` does **not** emit real frames on its own — it streams a
+> flat `0x8000` placeholder until `setTinyCOutputADValue` is sent *after* streaming starts. See
+> `04-usb-protocol.md` §4.10 for the full sequence and the `0x0e` latch to avoid.
+
 **Deliverable:** a shell transcript showing the device's VID/PID, interfaces, endpoints and
 supported UVC formats — plus the `bFormatIndex` of the thermal stream, which is the only
 frame-related fact still outstanding.
+
+> **Correction (2026-09-24).** The `bFormatIndex` is no longer outstanding: it is **`1`**, the only
+> format on interface 1 (UNCOMPRESSED YUY2, 16 bpp, 256×192 @ 25 fps). See
+> `04-usb-protocol.md` §4.5.6.
 
 ---
 

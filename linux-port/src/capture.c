@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #include "capture.h"
 #include "control.h"
@@ -56,9 +57,10 @@ struct dyt_capture {
     /* negotiated stream format */
     int fmt_index, frame_index, fmt_w, fmt_h;
 
-    /* resolved geometry (first frame) */
-    int width, active, total, rec_base, n_pix, out_n;
-    int ready, lut_built, err;
+    /* device-independent per-frame pipeline (geometry + LUT policy +
+     * conversion) — see frame.h / dyt_pipeline_* */
+    dyt_pipeline_t pipe;
+    int err;
 
     /* pipeline buffers */
     uint16_t *staging;
@@ -66,8 +68,7 @@ struct dyt_capture {
     float    *out;
 
     /* params */
-    float t_amb;
-    int sensor_mode, fix_mode;
+    int send_start_orders;
 
     /* auto-shutter state */
     uint16_t last_ref;
@@ -154,10 +155,13 @@ static int pick_format(uvc_device_handle_t *devh, const dyt_capture_opts *o,
     if (!best)
         return -1;
 
-    /* Frame: explicit size, else the default frame, else the first. */
+    /* Frame: explicit size, else the default frame, else the first.  Either
+     * axis may be given alone, so `--height 384` selects by height without
+     * also needing `--width`. */
     for (fr = best->frame_descs; fr; fr = fr->next) {
-        if (o->width && o->height) {
-            if (fr->wWidth == o->width && fr->wHeight == o->height) { bestfr = fr; break; }
+        if (o->width || o->height) {
+            if ((!o->width  || fr->wWidth  == o->width) &&
+                (!o->height || fr->wHeight == o->height)) { bestfr = fr; break; }
         } else if (fr->bFrameIndex == best->bDefaultFrameIndex) {
             bestfr = fr;
             break;
@@ -198,11 +202,44 @@ int dyt_capture_open(dyt_capture_t **out, const dyt_capture_opts *o)
         goto fail;
     }
 
-    err = uvc_find_device(c->ctx, &c->dev, o->vid, o->pid, NULL);
+    /* No VID/PID given: choose the first enumerated device that is actually
+     * one of ours, not merely the first UVC device libuvc returns.  A machine
+     * that also has a webcam or the 4K microscope camera attached would
+     * otherwise hand us that device and fail with a confusing "not a
+     * supported device".  Supported IDs are the RE Docs 04 §4.10 table. */
+    vid = o->vid;
+    pid = o->pid;
+    if (!vid && !pid) {
+        uvc_device_t **list = NULL;
+
+        if (uvc_get_device_list(c->ctx, &list) == UVC_SUCCESS && list) {
+            int i;
+            for (i = 0; list[i]; i++) {
+                uvc_device_descriptor_t *d = NULL;
+
+                if (uvc_get_device_descriptor(list[i], &d) != UVC_SUCCESS)
+                    continue;
+                if (dyt_mode_for_vidpid(d->idVendor, d->idProduct) != DYT_MODE_0) {
+                    vid = d->idVendor;
+                    pid = d->idProduct;
+                    uvc_free_device_descriptor(d);
+                    break;
+                }
+                uvc_free_device_descriptor(d);
+            }
+            uvc_free_device_list(list, 1);
+        }
+
+        if (!vid && !pid)
+            fprintf(stderr, "capture: no supported DYT device attached — "
+                            "run the probe tool to list devices\n");
+    }
+
+    err = uvc_find_device(c->ctx, &c->dev, vid, pid, NULL);
     if (err != UVC_SUCCESS) {
         fprintf(stderr, "capture: no device found (%04x:%04x): %s\n"
                         "         run the probe tool to list devices\n",
-                o->vid, o->pid, uvc_strerror(err));
+                vid, pid, uvc_strerror(err));
         goto fail;
     }
 
@@ -292,9 +329,17 @@ int dyt_capture_open(dyt_capture_t **out, const dyt_capture_opts *o)
         }
     }
 
-    c->t_amb       = o->t_amb;
-    c->sensor_mode = o->sensor_mode;
-    c->fix_mode    = o->fix_mode;
+    c->send_start_orders = o->send_start_orders;
+
+    /* The LUT is 64 KiB; allocate it once and hand it to the pipeline, which
+     * fills it lazily from the first valid 0x44c frame. */
+    c->lut = malloc(LUT_N * sizeof(float));
+    if (!c->lut) {
+        fprintf(stderr, "capture: out of memory\n");
+        goto fail;
+    }
+    dyt_pipeline_init(&c->pipe, c->mode, o->t_amb, o->sensor_mode,
+                      o->fix_mode, c->lut);
 
     fprintf(stderr, "capture: %04x:%04x mode %s, format %d frame %d, %dx%d\n",
             vid, pid,
@@ -310,6 +355,9 @@ fail:
     if (c->devh) uvc_close(c->devh);
     if (c->dev)  uvc_unref_device(c->dev);
     if (c->ctx)  uvc_exit(c->ctx);
+    free(c->staging);
+    free(c->lut);
+    free(c->out);
     pthread_cond_destroy(&c->cv);
     pthread_mutex_destroy(&c->m);
     free(c);
@@ -321,78 +369,64 @@ fail:
 static void frame_cb(struct uvc_frame *f, void *user)
 {
     dyt_capture_t *c = user;
-    frame_t ft;
-    uint16_t cur = 0;
+    size_t bytes;
 
     if (c->err || !f->data || !f->data_bytes || !f->width)
         return;
 
-    if (!c->ready) {
-        int w = f->width;
-        int active, tot, rec_base;
-
-        if (dyt_frame_resolve(c->mode, w, f->data_bytes,
-                              &active, &tot, &rec_base) != 0) {
+    if (!c->pipe.ready) {
+        if (dyt_pipeline_resolve(&c->pipe, f->width, f->data_bytes / 2) != 0) {
             fprintf(stderr, "capture: cannot resolve frame geometry from "
                             "%d B at width %d (mode %s)\n",
-                    (int)f->data_bytes, w,
+                    (int)f->data_bytes, f->width,
                     c->mode == DYT_MODE_44C ? "0x44c" : "1000");
             c->err = 1;
             return;
         }
 
-        c->width = w;
-        c->active = active;
-        c->total = tot;
-        c->rec_base = rec_base;
-        c->n_pix = w * (c->mode == DYT_MODE_44C ? active : tot);
-        c->out_n = c->n_pix + (c->mode == DYT_MODE_44C ? 10 : 0);
-
-        c->staging = malloc((size_t)w * tot * 2);
-        c->lut     = malloc(LUT_N * sizeof(float));
-        c->out     = malloc((size_t)c->out_n * sizeof(float));
-        if (!c->staging || !c->lut || !c->out) {
+        bytes = (size_t)c->pipe.width * c->pipe.total * 2;
+        c->staging = malloc(bytes);
+        c->out     = malloc((size_t)c->pipe.out_n * sizeof(float));
+        if (!c->staging || !c->out) {
             fprintf(stderr, "capture: out of memory\n");
             c->err = 1;
             return;
         }
-        c->ready = 1;
         fprintf(stderr, "capture: frame %dx%d (active %d, %d ref rows)\n",
-                w, tot, active, tot - active);
+                c->pipe.width, c->pipe.total, c->pipe.active,
+                c->pipe.total - c->pipe.active);
     }
 
-    if (f->data_bytes < (size_t)c->width * c->total * 2)
+    bytes = (size_t)c->pipe.width * c->pipe.total * 2;
+    if (f->data_bytes < bytes)
         return;                           /* short frame */
 
     /* Copy: libuvc reuses the buffer for the next frame. */
-    memcpy(c->staging, f->data, (size_t)c->width * c->total * 2);
+    memcpy(c->staging, f->data, bytes);
 
-    ft.width = c->width;
-    ft.total_height = c->total;
-    ft.rec_base = c->rec_base;
-    ft.raw = c->staging;
-
-    /* The calibration record is per-unit and static, so the LUT is built
-     * once from the first frame and reused.  `corr` is re-read from each
-     * frame inside thermometrySearch. */
-    if (!c->lut_built) {
-        dyt_frame_build_lut(&ft, c->t_amb, c->sensor_mode, c->fix_mode, c->lut);
-        c->lut_built = 1;
-    }
-
-    /* Auto-shutter (FFC) trigger — mode 0x44c only (RE Docs 04 §4.5.5). */
-    if (c->mode == DYT_MODE_44C &&
-        dyt_frame_needs_shutter(&ft, c->last_ref, &cur))
-        dyt_capture_request_shutter(c);
-    if (c->mode == DYT_MODE_44C)
-        c->last_ref = cur;
-
-    /* Saturated/corrupt frame: skip it rather than clamp (RE Docs 08 §8.5). */
-    if (dyt_frame_convert_mode(c->mode, &ft, c->lut, c->out) != 0)
+    /* Device-independent step (frame.c): LUT policy + conversion.  The LUT
+     * is built from the first frame that actually carries calibration data,
+     * so the pre-bring-up 0x8000 filler cannot seed it. */
+    if (dyt_pipeline_frame(&c->pipe, c->staging, f->data_bytes / 2,
+                           c->out) != 0)
         return;
 
+    /* Auto-shutter (FFC) trigger — mode 0x44c only (RE Docs 04 §4.5.5). */
+    if (c->mode == DYT_MODE_44C) {
+        frame_t ft;
+        uint16_t cur = 0;
+
+        ft.width        = c->pipe.width;
+        ft.total_height = c->pipe.total;
+        ft.rec_base     = c->pipe.rec_base;
+        ft.raw          = c->staging;
+        if (dyt_frame_needs_shutter(&ft, c->last_ref, &cur))
+            dyt_capture_request_shutter(c);
+        c->last_ref = cur;
+    }
+
     if (c->cb)
-        c->cb(c->out, c->out_n, c->width, c->active, c->user);
+        c->cb(c->out, c->pipe.out_n, c->pipe.width, c->pipe.active, c->user);
 }
 
 /* ---------------------------------------------------------- control thread */
@@ -430,6 +464,84 @@ int dyt_capture_request_shutter(dyt_capture_t *c)
 
 /* -------------------------------------------------------------- lifecycle */
 
+/* ---------------------------------------------------------------- bring-up */
+
+/* Send one 8-byte order to `reg`, then trace the raw status byte from
+ * 0x0200 and the 15-byte result from 0x1d08 — WITHOUT aborting on the
+ * documented ERROR bits.
+ *
+ * Why not just call dyt_transaction_ex: its poll loop treats status bits
+ * 2..7 as an error and aborts (RE Docs 04 §4.2).  That bit layout is
+ * decompiled, and this unit answers setTinyCOutputADValue with 0x0e, so
+ * observe the real progression rather than trusting the decode. */
+static void order_trace(dyt_capture_t *c, const char *name,
+                        const uint8_t cmd[8], uint16_t reg)
+{
+    dyt_transfer_fn xfer = dyt_libusb_transfer(NULL);
+    uint8_t out[8], status = 0, result[15];
+    int rc, i, last = -1;
+
+    if (!xfer)
+        return;
+    memcpy(out, cmd, sizeof out);
+
+    rc = dyt_diy_communicate(xfer, c->usb, 0x41, 0x45, 0x0078, reg, out, 8);
+    fprintf(stderr, "order %-22s reg=0x%04x OUT rc=%d\n", name, reg, rc);
+
+    fprintf(stderr, "      status:");
+    for (i = 0; i < 40; i++) {
+        if (dyt_diy_communicate(xfer, c->usb, 0xC1, 0x44, 0x0078, 0x0200,
+                                &status, 1) != 1)
+            break;
+        if ((int)status != last) {
+            fprintf(stderr, " [%d]=0x%02x", i, status);
+            last = status;
+        }
+        if (status == 0)
+            break;
+        usleep(1000);
+    }
+    fprintf(stderr, "\n");
+
+    memset(result, 0, sizeof result);
+    rc = dyt_diy_communicate(xfer, c->usb, 0xC1, 0x44, 0x0078, 0x1d08,
+                             result, 15);
+    fprintf(stderr, "      result 0x1d08 rc=%d :", rc);
+    for (i = 0; i < 15; i++)
+        fprintf(stderr, " %02x", result[i]);
+    fprintf(stderr, "\n");
+}
+
+/* The one bring-up order that matters (MechaniscoutPcap/4.pcapng).
+ *
+ * The Windows vendor app sends exactly one TinyC order while bringing the
+ * device up:
+ *
+ *     OUT  0x41/0x45  wValue=0x0078  wIndex=0x1D00
+ *     data 0a 01 00 00 00 00 00 00        (setTinyCOutputADValue)
+ *
+ * and it sends it *after* the UVC stream is committed and running.  The
+ * capture shows the whole startup: SET_INTERFACE (interface 1, alt 7) at
+ * t=62.56 s, isochronous data flowing on EP 0x81, and this order at
+ * t=65.69 s — followed by the app polling 0x0200, which returns 0x01.
+ *
+ * The ordering is the entire point.  Sent *before* a stream exists — as
+ * this port originally did — the device answers 0x01 and then latches
+ * status 0x0e permanently, after which every order and every 0x1d08 read
+ * returns stale bytes.  That self-inflicted latch is what produced the
+ * earlier "three commands return identical data" and "0x1d08 echoes the
+ * last write" observations.
+ *
+ * It is not a WRITE-classified opcode, so it cannot touch factory
+ * calibration (RE Docs 04 §4.8).  The other orders the old sequence sent
+ * (tinyStartStream, tinyStartStream2, getTinyCParams) do not appear in the
+ * vendor's startup at all; they remain available through `probe --op`. */
+static void send_ad_order(dyt_capture_t *c)
+{
+    static const uint8_t cmd[8] = { 0x0a, 0x01, 0, 0, 0, 0, 0, 0 };
+    order_trace(c, "setTinyCOutputADValue", cmd, 0x1d00);
+}
+
 int dyt_capture_start(dyt_capture_t *c, dyt_frame_cb_t cb, void *user)
 {
     uvc_error_t err;
@@ -463,6 +575,20 @@ int dyt_capture_start(dyt_capture_t *c, dyt_frame_cb_t cb, void *user)
     }
 
     c->streaming = 1;
+
+    if (c->send_start_orders) {
+        int i;
+
+        /* The vendor issues this order only once the stream is running
+         * (see send_ad_order).  Wait for the first assembled frame so the
+         * order cannot land before the device is streaming, then give the
+         * stream a moment to settle. */
+        for (i = 0; i < 300 && !c->pipe.ready; i++)
+            usleep(10000);
+        usleep(200000);
+        send_ad_order(c);
+    }
+
     return 0;
 }
 
@@ -515,17 +641,17 @@ dyt_mode_t dyt_capture_mode(const dyt_capture_t *c)
 
 void dyt_capture_geometry(const dyt_capture_t *c, int *width, int *active_height)
 {
-    if (width)        *width = c->ready ? c->width : 0;
-    if (active_height) *active_height = c->ready ? c->active : 0;
+    if (width)        *width = c->pipe.ready ? c->pipe.width : 0;
+    if (active_height) *active_height = c->pipe.ready ? c->pipe.active : 0;
 }
 
 const uint16_t *dyt_capture_last_raw(const dyt_capture_t *c, int *n_samples)
 {
-    if (!c->ready || !c->staging) {
+    if (!c->pipe.ready || !c->staging) {
         if (n_samples) *n_samples = 0;
         return NULL;
     }
-    if (n_samples) *n_samples = c->width * c->total;
+    if (n_samples) *n_samples = c->pipe.width * c->pipe.total;
     return c->staging;
 }
 

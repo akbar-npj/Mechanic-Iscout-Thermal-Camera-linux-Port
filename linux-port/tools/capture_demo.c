@@ -25,6 +25,7 @@ typedef struct {
     volatile int frames_seen;   /* written by the libuvc callback thread */
     char   out_prefix[512];
     int    wrote;
+    int    save_last;        /* dump the final frame instead of the first */
     dyt_capture_t *cap;      /* for the raw-frame accessor */
 } demo_state;
 
@@ -35,6 +36,23 @@ static int write_file(const char *path, const void *p, size_t n)
     if (n && fwrite(p, 1, n, f) != n) { perror("fwrite"); fclose(f); return -1; }
     fclose(f);
     return 0;
+}
+
+static void save_frame(demo_state *s, const float *temps, int n)
+{
+    char path[600];
+    int nraw = 0;
+    const uint16_t *raw = dyt_capture_last_raw(s->cap, &nraw);
+
+    snprintf(path, sizeof path, "%s_temps.bin", s->out_prefix);
+    if (write_file(path, temps, (size_t)n * sizeof(float)) == 0)
+        printf("           wrote %s (%d floats)\n", path, n);
+
+    if (raw && nraw) {
+        snprintf(path, sizeof path, "%s_raw.bin", s->out_prefix);
+        if (write_file(path, raw, (size_t)nraw * sizeof(uint16_t)) == 0)
+            printf("           wrote %s (%d uint16 samples)\n", path, nraw);
+    }
 }
 
 static void on_frame(const float *temps, int n, int width, int active_height,
@@ -58,21 +76,17 @@ static void on_frame(const float *temps, int n, int width, int active_height,
            s->frames_seen, width, active_height, tmin, tmax,
            npix ? tsum / npix : 0.0);
 
+    /* Dump either the first frame or, with --save-last, the final one.  The
+     * final one matters here: the device streams a flat 0x8000 placeholder
+     * for several seconds after setTinyCOutputADValue before real data
+     * appears (see send_ad_order in src/capture.c), so the first frame is
+     * almost always the placeholder. */
     if (s->out_prefix[0] && !s->wrote) {
-        char path[600];
-        int nraw = 0;
-        const uint16_t *raw = dyt_capture_last_raw(s->cap, &nraw);
-
-        snprintf(path, sizeof path, "%s_temps.bin", s->out_prefix);
-        if (write_file(path, temps, (size_t)n * sizeof(float)) == 0)
-            printf("           wrote %s (%d floats)\n", path, n);
-
-        if (raw && nraw) {
-            snprintf(path, sizeof path, "%s_raw.bin", s->out_prefix);
-            if (write_file(path, raw, (size_t)nraw * sizeof(uint16_t)) == 0)
-                printf("           wrote %s (%d uint16 samples)\n", path, nraw);
+        int last = s->frames_seen + 1 >= s->frames_wanted;
+        if (!s->save_last || last) {
+            save_frame(s, temps, n);
+            s->wrote = 1;
         }
-        s->wrote = 1;
     }
 
     s->frames_seen++;
@@ -114,12 +128,20 @@ int main(int argc, char **argv)
             o.sensor_mode = (int)strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--fix-mode") && i + 1 < argc)
             o.fix_mode = (int)strtol(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--start-orders"))
+            o.send_start_orders = 1;
+        else if (!strcmp(argv[i], "--save-last"))
+            st.save_last = 1;
         else {
             fprintf(stderr,
-                "usage: %s [--frames N] [--out PREFIX] [--diag]\n"
+                "usage: %s [--frames N] [--out PREFIX] [--diag] [--save-last]\n"
                 "          [--vid 0xXXXX] [--pid 0xXXXX]\n"
                 "          [--format-index N] [--width W] [--height H] [--fps F]\n"
-                "          [--t-amb C] [--sensor-mode 0x82] [--fix-mode 0x78]\n",
+                "          [--t-amb C] [--sensor-mode 0x82] [--fix-mode 0x78]\n"
+                "          [--start-orders]   send setTinyCOutputADValue once the\n"
+                "                             stream is running — required on\n"
+                "                             0bda:5840, which otherwise streams a\n"
+                "                             flat 0x8000 placeholder\n",
                 argv[0]);
             return 2;
         }

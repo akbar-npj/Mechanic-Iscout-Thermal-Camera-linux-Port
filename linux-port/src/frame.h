@@ -24,6 +24,10 @@
 
 #include "thermometry.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* device mode, derived from VID/PID (RE Docs 04 §4.10) */
 typedef enum {
     DYT_MODE_0    = 0,
@@ -112,5 +116,68 @@ int dyt_frame_convert_mode(dyt_mode_t mode, const frame_t *f,
  * A last_ref of 0 means "first frame" — initialises without triggering. */
 int dyt_frame_needs_shutter(const frame_t *f, uint16_t last_ref,
                             uint16_t *cur_ref_out);
+
+/* The mode-0x44c validity gate: true when no image sample and none of the
+ * six reference pixels thermometrySearch inspects sits at/above the 0x4000
+ * sentinel.  dyt_frame_convert applies it before converting.
+ *
+ * This is also what keeps calibration out of the device's pre-bring-up
+ * filler.  Until the AD-output order lands the stream is a flat 0x8000
+ * (MechaniscoutPcap/4.pcapng), which fails this gate — so a LUT built only
+ * from valid frames can never be seeded from the filler.  Mode 1000 has no
+ * sentinel (0x4000 decodes to a legitimate -17.15 C), so it never consults
+ * this. */
+int dyt_frame_is_valid(const frame_t *f);
+
+/* -------------------------------------------------------------------------
+ * Live capture pipeline
+ *
+ * This is the device-independent glue the capture layer runs per frame:
+ * resolve the geometry from the first payload, build the calibration LUT
+ * from the first frame that actually carries calibration data, then convert.
+ * It lives here rather than inside capture.c so that the exact sequence the
+ * live path executes can be regression-tested without hardware — see
+ * src/pipeline_test.c.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    dyt_mode_t mode;
+    float      t_amb;
+    int        sensor_mode, fix_mode;
+
+    int        width;      /* sensor width in pixels */
+    int        active;     /* active rows */
+    int        total;      /* rows in the payload (active+REF_ROWS for 0x44c) */
+    int        rec_base;   /* calibration-record offset in the reference band */
+    int        n_pix;      /* samples converted */
+    int        out_n;      /* floats dyt_pipeline_frame writes to out */
+    int        ready;      /* geometry resolved */
+    int        lut_built;  /* LUT built from a valid 0x44c frame */
+
+    float     *lut;        /* LUT_N floats, caller-owned */
+} dyt_pipeline_t;
+
+/* Initialise.  `lut` must hold LUT_N floats and outlive the pipeline. */
+void dyt_pipeline_init(dyt_pipeline_t *p, dyt_mode_t mode, float t_amb,
+                       int sensor_mode, int fix_mode, float *lut);
+
+/* Resolve the geometry from the first payload: `width` pixels wide,
+ * `n_samples` uint16 samples.  Returns 0 on success (p->ready set), -1 if
+ * the geometry is unusable — unknown width, not a whole number of rows, or
+ * inconsistent with the mode's reference band. */
+int dyt_pipeline_resolve(dyt_pipeline_t *p, int width, size_t n_samples);
+
+/* Run one frame.  raw holds n_samples uint16 samples; out holds at least
+ * p->out_n floats.  Requires a prior successful dyt_pipeline_resolve().
+ * Builds the LUT lazily from the first valid frame (mode 0x44c only) and
+ * then converts.  Returns 0 when out holds a temperature image, -1 when the
+ * frame was skipped (unresolved geometry, short payload, or rejected by the
+ * mode's validity gate). */
+int dyt_pipeline_frame(dyt_pipeline_t *p, const uint16_t *raw,
+                       size_t n_samples, float *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DYT_FRAME_H */

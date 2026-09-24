@@ -64,6 +64,14 @@ hardware, no USB capture. Full detail in `04-usb-protocol.md` §4.5. Summary:
 * How the visible and thermal streams are demultiplexed at the UVC level.
 * The meaning of the frame struct's `+0x20` format tag (`3` = raw16 frame, `8` = RGBA preview).
 
+> **Correction (2026-09-24, live device) — all three are answered; §1 is now fully closed.**
+> See `04-usb-protocol.md` §4.5.6 for the detail. In short: the thermal stream is
+> **`bFormatIndex 1`** (the only format — `UNCOMPRESSED` YUY2, 16 bpp), 256×192 on `bFrameIndex 1`
+> at 25 fps; there is **no** visible/thermal demux at the UVC level (one VideoStreaming interface,
+> one format — the "dual vision" is an app-side composite); and the `+0x20` tag stays a host-side
+> struct field. Note `bFrameIndex 2` (256×384) is a **synthetic decoy** — one distinct row and 3
+> values in a 4-pixel cycle — so always select frame 1.
+
 ### How it was resolved — reproducible static chain **[V]**
 
 1. `libthermometry.so` `thermometrySearch @ 0x101bf0` — computes `n = (height - 4) * width` and
@@ -98,6 +106,20 @@ partly inferred.
 | `0d 8b …` / `0d c1 …` | unknown; `0d c1` also used by `getTinyCUserData` | **low** |
 | `00 00 00 00 00 00 00 02` | not a command — a receive-buffer pre-fill | high |
 | 9-byte `00 00 01 00 01 80 19 00 02` | second stream-start step, written to `0x1d08` | high (function name) |
+
+> **Correction (2026-09-24, live device + Windows capture) — one row is wrong, one is sharper.**
+>
+> * **`0a 01 …` (`setTinyCOutputADValue`) is *the* bring-up order**, not just "output raw AD
+>   values". It is the one command that switches the device from its flat `0x8000` placeholder to
+>   real thermal output, and it must be sent **after** streaming starts. It is also the only order
+>   the Windows app sends during bring-up (`MechaniscoutPcap/4.pcapng`). Sent *before* streaming it
+>   latches the device at status `0x0e` until a replug.
+> * **`0f c1 …` (`tinyStartStream`) is not part of the vendor's startup at all** — nor is
+>   `tinyStartStream2` or `getTinyCParams`. Their *meaning* is unchanged, but nothing in the port's
+>   capture path sends them any more; sending them is what poisoned earlier sessions.
+> * The `0x1d08` result-read model is **confirmed**, not doubted: the capture shows `14 85 00 03`
+>   returning 16 bytes = ASCII `202605575259` + 4 zeros — the module serial. See
+>   `04-usb-protocol.md` §4.2.
 
 **Next step:** the parameter block layout. Read the 15-byte and 28-byte results returned by
 `getTinyCParams` / `getTinyCUserSnCoefficient` on real hardware and match them against the
@@ -166,7 +188,7 @@ port's critical path.
 
 ---
 
-## §4 — Which VID/PID is this unit? — **mostly RESOLVED [V]**, one command left
+## §4 — Which VID/PID is this unit? — **RESOLVED [V] (2026-09-24)**
 
 **Priority: high but trivial to answer.** The five VID/PID pairs in `device_filter.xml` are no
 longer just a filter list — `UVCCamera::connect` (`libUVCCamera.so @ 0x15c28c`) **maps each pair to
@@ -187,6 +209,14 @@ radiometric path — it is the only one with a dedicated 256-wide calibration ta
 > `isVerifySN` must succeed against the `configs_maintenanceguy.txt` allow-list before the device
 > emits thermal frames. If this unit is `1514:0001`, the Linux port must complete that handshake
 > first, or it will appear to receive nothing. See `04-usb-protocol.md` §4.10.
+
+> **Correction (2026-09-24, live device) — the inference above is wrong; §4 is closed.**
+> `lsusb` answers it: the unit enumerates as **`0bda:5840`** → mode **`1000`**, *not*
+> `1514:0001`/`0x44C`. So the serial handshake above **does not apply** — `isVerifySN` is gated on
+> the radiometric modes only. What *does* apply is the mode-`1000` bring-up: the device streams a
+> flat `0x8000` placeholder until `setTinyCOutputADValue` is sent after streaming starts. Full
+> sequence in `04-usb-protocol.md` §4.10; the same `1514:0001` reasoning was corrected in
+> `01-target-and-hardware.md` §1.3.
 
 Also worth noting: `device_filter.xml` lists `31DA:5846` but `connect` tests `VID 0x5846 / PID
 0x31DA` — the transpose. Four of five entries match; this one does not. **[V]**

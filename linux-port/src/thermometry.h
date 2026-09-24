@@ -27,6 +27,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define LUT_N     16384   /* entries in the radiometric LUT (float) */
 #define REF_ROWS  4       /* reference/shutter band rows at frame bottom */
 
@@ -70,5 +74,9 @@ void thermometryT4Line(float t_amb_in, int width, int height,
 void thermometrySearch(int width, int height, const float *lut,
                        const uint16_t *raw, float *out,
                        void *unused, int ref_rows);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DYT_THERMOMETRY_H */

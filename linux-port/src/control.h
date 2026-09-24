@@ -24,6 +24,10 @@
 #include <stdint.h>
 #include "frame.h"   /* for dyt_mode_t */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Transfer callback.  Mirrors libusb_control_transfer's signature with a
  * void* handle so the state machine is testable without libusb.  Returns
  * the number of bytes transferred (>=0) or a negative libusb error. */
@@ -121,5 +125,9 @@ dyt_transfer_fn dyt_libusb_transfer(void *unused);
  * answer the read. */
 int dyt_verify_serial(dyt_transfer_fn xfer, void *handle,
                       const char *allowlist_path, uint8_t sn_out[15]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DYT_CONTROL_H */

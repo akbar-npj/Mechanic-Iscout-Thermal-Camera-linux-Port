@@ -80,18 +80,31 @@ static uint32_t le32(const uint8_t *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* GUID -> printable fourcc (first 4 bytes are the format code).  out
- * must hold at least 48 bytes: fourcc + space + 36-char GUID + NUL. */
-static void guid_str(const uint8_t g[16], char out[48])
+/* GUID -> the canonical Windows form.  A UVC GUID is stored with its first
+ * three fields little-endian, so those bytes must be swapped back before
+ * printing (UVC 1.1 §3.9.2 — the standard GUID wire format).  Getting this
+ * wrong is easy to miss: the raw bytes still look plausible.  out must hold
+ * at least 37 bytes. */
+static void guid_str(const uint8_t g[16], char out[40])
+{
+    snprintf(out, 40,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+             "%02x%02x%02x%02x%02x%02x",
+             g[3], g[2], g[1], g[0],          /* Data1, stored LE */
+             g[5], g[4],                      /* Data2, stored LE */
+             g[7], g[6],                      /* Data3, stored LE */
+             g[8], g[9],                      /* Data4, stored BE */
+             g[10], g[11], g[12], g[13], g[14], g[15]);
+}
+
+/* Printable fourcc from the first 4 GUID bytes (e.g. "YUY2", "MJPG").
+ * out must hold at least 5 bytes. */
+static void fourcc_str(const uint8_t g[4], char out[5])
 {
     int i;
     for (i = 0; i < 4; i++)
         out[i] = (g[i] >= 0x20 && g[i] < 0x7f) ? (char)g[i] : '.';
-    out[4] = ' ';
-    snprintf(out + 5, 42, "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
-                          "%02x%02x-%02x%02x%02x%02x%02x%02x",
-             g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11],
-             g[12], g[13], g[14], g[15], g[0], g[1], g[2], g[3]);
+    out[4] = '\0';
 }
 
 /* ------------------------------------------------------------------ --list */
@@ -163,6 +176,99 @@ static void print_frame_mjpeg(const uint8_t *p, int len)
            interval ? 1.0e7 / (double)interval : 0.0);
 }
 
+/* VideoControl (interface subclass 0x01) class-specific descriptors.
+ *
+ * These reuse the same subtype *numbers* as VideoStreaming but mean
+ * completely different things — subtype 0x06 is EXTENSION_UNIT here and
+ * VS_FORMAT_MJPEG there.  Decoding them with the VS meanings is what made
+ * this tool report a bogus "FORMAT[4] MJPEG frames=140" on interface 0:
+ * that descriptor is the EXTENSION_UNIT, and the 4 / 140 came from its
+ * bUnitID and the first byte of its GUID.  (UVC 1.1 §3.7.) */
+static void print_vc_descriptor(const uint8_t *p, int len, int subtype)
+{
+    switch (subtype) {
+      case 0x01:   /* VC_HEADER */
+        if (len < 12) break;
+        printf("      VC header: bcdUVC=%u.%02u  %u interface(s)  clock=%.1f MHz\n",
+               le16(p + 3) >> 8, le16(p + 3) & 0xff, p[11],
+               le32(p + 7) / 1.0e6);
+        break;
+
+      case 0x02:   /* INPUT_TERMINAL */
+        if (len < 8) break;
+        printf("      INPUT_TERMINAL id=%u  type=0x%04x\n", p[3], le16(p + 4));
+        break;
+
+      case 0x03:   /* OUTPUT_TERMINAL */
+        if (len < 8) break;
+        printf("      OUTPUT_TERMINAL id=%u  type=0x%04x  source=%u\n",
+               p[3], le16(p + 4), p[7]);
+        break;
+
+      case 0x04:   /* SELECTOR_UNIT */
+        if (len < 6) break;
+        printf("      SELECTOR_UNIT id=%u  %u input(s)\n", p[3], p[4]);
+        break;
+
+      case 0x05:   /* PROCESSING_UNIT */
+        if (len < 9) break;
+        printf("      PROCESSING_UNIT id=%u  source=%u  bControlSize=%u\n",
+               p[3], p[4], p[7]);
+        break;
+
+      case 0x06: { /* EXTENSION_UNIT — byte order is bUnitID, GUID(16),
+                    * bNumControls, bNrInPins, baSourceID, bControlSize,
+                    * bmControls, iExtension */
+        char g[40];
+        if (len < 24) break;
+        guid_str(p + 4, g);
+        printf("      EXTENSION_UNIT id=%u  controls=%u  guid=%s\n",
+               p[3], p[20], g);
+        break;
+      }
+
+      default:
+        break;
+    }
+}
+
+/* VideoStreaming (interface subclass 0x02) class-specific descriptors. */
+static void print_vs_descriptor(const uint8_t *p, int len, int subtype)
+{
+    switch (subtype) {
+      case 0x01:   /* VS input header */
+        if (len < 4) break;
+        printf("      VS input header: %u format(s)\n", p[3]);
+        break;
+
+      case 0x04: { /* VS_FORMAT_UNCOMPRESSED */
+        char fc[5], g[40];
+        if (len < 27) break;
+        fourcc_str(p + 5, fc);
+        guid_str(p + 5, g);
+        printf("      FORMAT[%u] UNCOMPRESSED  fourcc=%s  guid=%s  bpp=%u  frames=%u\n",
+               p[3], fc, g, p[21], p[4]);
+        break;
+      }
+
+      case 0x05:   /* VS_FRAME_UNCOMPRESSED */
+        print_frame_uncompressed(p, len);
+        break;
+
+      case 0x06:   /* VS_FORMAT_MJPEG */
+        if (len < 11) break;
+        printf("      FORMAT[%u] MJPEG  frames=%u\n", p[3], p[4]);
+        break;
+
+      case 0x07:   /* VS_FRAME_MJPEG */
+        print_frame_mjpeg(p, len);
+        break;
+
+      default:
+        break;
+    }
+}
+
 static void walk_uvc_extra(const uint8_t *extra, int extra_len, int subclass)
 {
     const uint8_t *p = extra;
@@ -177,40 +283,10 @@ static void walk_uvc_extra(const uint8_t *extra, int extra_len, int subclass)
             break;
 
         if (type == 0x24) {   /* class-specific (CS_INTERFACE) */
-            switch (subtype) {
-              case 0x01:
-                if (subclass == 0x02)   /* VS input header */
-                    printf("      VS input header: %u format(s)\n", p[3]);
-                else                    /* VC header */
-                    printf("      VC header: bcdUVC=%u.%02u\n",
-                           p[3], p[4]);
-                break;
-
-              case 0x04: {   /* VS format uncompressed */
-                char g[48];
-                if (len < 27) break;
-                guid_str(p + 5, g);
-                printf("      FORMAT[%u] UNCOMPRESSED  guid=%s  bpp=%u  frames=%u\n",
-                       p[3], g, p[21], p[4]);
-                break;
-              }
-
-              case 0x06:     /* VS format MJPEG */
-                if (len < 11) break;
-                printf("      FORMAT[%u] MJPEG  frames=%u\n", p[3], p[4]);
-                break;
-
-              case 0x05:
-                print_frame_uncompressed(p, len);
-                break;
-
-              case 0x07:
-                print_frame_mjpeg(p, len);
-                break;
-
-              default:
-                break;
-            }
+            if (subclass == 0x01)
+                print_vc_descriptor(p, len, subtype);
+            else if (subclass == 0x02)
+                print_vs_descriptor(p, len, subtype);
         }
         p += len;
         rem -= len;
@@ -388,6 +464,81 @@ static int cmd_read(libusb_device_handle *h, int iface)
     return fails ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------ --uvc */
+
+/* UVC class-specific GET requests against an extension unit (USB Device Class
+ * Definition for Video Devices §6.4).  Strictly read-only: GET_LEN, GET_INFO,
+ * GET_CUR only — there is no SET_CUR here.
+ *
+ *   bmRequestType 0xA1 (IN, class, interface)
+ *   bRequest      0x85 GET_LEN | 0x86 GET_INFO | 0x81 GET_CUR
+ *   wValue        selector << 8
+ *   wIndex        (bUnitID << 8) | bInterfaceNumber
+ *
+ * Why this matters: the module is dual-vision class, and those commonly select
+ * the active sensor through an extension-unit control.  On this unit the
+ * EXTENSION_UNIT is bUnitID 4, bNumControls 2, with bmControls 0x00,0x06 — i.e.
+ * selectors 10 and 11 — so the "which sensor" switch may live here rather than
+ * in the TinyC orders (RE Docs 04 §4.2). */
+static int cmd_uvc(libusb_device_handle *h, int unit, int iface)
+{
+    int sel;
+
+    libusb_set_auto_detach_kernel_driver(h, 1);
+    if (libusb_claim_interface(h, iface) != 0)
+        fprintf(stderr, "probe: claim_interface %d failed — control transfers "
+                        "may still work\n", iface);
+
+    printf("UVC extension unit %d on interface %d — read-only queries:\n",
+           unit, iface);
+    printf("  %-4s %-5s %-5s %-12s %s\n", "sel", "len", "info", "caps", "cur");
+
+    for (sel = 1; sel <= 16; sel++) {
+        uint8_t lenbuf[2] = { 0, 0 };
+        uint8_t info[1] = { 0 };
+        uint8_t cur[64];
+        int len, ri, rc2, j;
+
+        len = libusb_control_transfer(h, 0xA1, 0x85, (uint16_t)(sel << 8),
+                                      (uint16_t)((unit << 8) | iface),
+                                      lenbuf, 2, 1000);
+        if (len != 2)
+            continue;                    /* selector absent (typically STALLs) */
+        len = lenbuf[0] | (lenbuf[1] << 8);
+
+        ri = libusb_control_transfer(h, 0xA1, 0x86, (uint16_t)(sel << 8),
+                                     (uint16_t)((unit << 8) | iface),
+                                     info, 1, 1000);
+
+        memset(cur, 0, sizeof cur);
+        if (len > (int)sizeof cur)
+            len = (int)sizeof cur;
+        rc2 = libusb_control_transfer(h, 0xA1, 0x81, (uint16_t)(sel << 8),
+                                      (uint16_t)((unit << 8) | iface),
+                                      cur, (uint16_t)len, 1000);
+
+        printf("  %-4d %-5d 0x%02x  ", sel, len, ri == 1 ? info[0] : 0);
+        if (ri == 1) {
+            /* GET_INFO bit0 GET, bit1 SET, bit2 DISABLED (UVC §6.4.3). */
+            printf("%s%s%s ", (info[0] & 0x01) ? "GET" : "---",
+                   (info[0] & 0x02) ? "SET" : "---",
+                   (info[0] & 0x04) ? " DISABLED" : "");
+        } else {
+            printf("(GET_INFO rc=%d) ", ri);
+        }
+        if (rc2 == len) {
+            for (j = 0; j < len; j++)
+                printf("%02x ", cur[j]);
+        } else {
+            printf("(GET_CUR rc=%d)", rc2);
+        }
+        printf("\n");
+    }
+
+    libusb_release_interface(h, iface);
+    return 0;
+}
+
 /* -------------------------------------------------------------------- main */
 
 static uint16_t parse_u16(const char *s)
@@ -397,16 +548,19 @@ static uint16_t parse_u16(const char *s)
 
 int main(int argc, char **argv)
 {
-    enum { M_LIST, M_DESC, M_READ, M_OP, M_SELFTEST } mode = M_LIST;
+    enum { M_LIST, M_DESC, M_READ, M_OP, M_SELFTEST, M_UVC } mode = M_LIST;
     const char *op_name = NULL;
     uint16_t want_vid = 0, want_pid = 0;
-    int iface = 0, i;
+    int iface = 0, unit = 4, i;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--descriptors")) mode = M_DESC;
         else if (!strcmp(argv[i], "--read"))   mode = M_READ;
         else if (!strcmp(argv[i], "--list"))   mode = M_LIST;
         else if (!strcmp(argv[i], "--selftest")) mode = M_SELFTEST;
+        else if (!strcmp(argv[i], "--uvc"))    mode = M_UVC;
+        else if (!strcmp(argv[i], "--unit") && i + 1 < argc)
+            unit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--op") && i + 1 < argc) {
             mode = M_OP;
             op_name = argv[++i];
@@ -419,8 +573,8 @@ int main(int argc, char **argv)
             iface = atoi(argv[++i]);
         else {
             fprintf(stderr,
-                "usage: %s [--list|--descriptors|--read|--op NAME|--selftest] "
-                "[--vid 0xXXXX] [--pid 0xXXXX] [--interface N]\n", argv[0]);
+                "usage: %s [--list|--descriptors|--read|--uvc|--op NAME|--selftest] "
+                "[--vid 0xXXXX] [--pid 0xXXXX] [--interface N] [--unit N]\n", argv[0]);
             return 2;
         }
     }
@@ -493,7 +647,9 @@ int main(int argc, char **argv)
         goto done;
     }
 
-    if (mode == M_OP) {
+    if (mode == M_UVC) {
+        ret = cmd_uvc(h, unit, iface);
+    } else if (mode == M_OP) {
         ret = run_op(h, op_name);
     } else {
         ret = cmd_read(h, iface);

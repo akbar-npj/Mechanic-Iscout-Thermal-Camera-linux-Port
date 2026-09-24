@@ -27,6 +27,10 @@
 
 #include "frame.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Opaque capture handle. */
 typedef struct dyt_capture dyt_capture_t;
 
@@ -46,6 +50,14 @@ typedef struct {
     float t_amb;              /* ambient for the LUT (default 25.0) */
     int  sensor_mode;         /* 0x44 or 0x82 (default 0x82) */
     int  fix_mode;            /* 0x78 enables GetFix (default 0 = off) */
+    int  send_start_orders;   /* send the vendor's one bring-up order —
+                               * setTinyCOutputADValue — AFTER streaming has
+                               * started (default 0).  Required on the
+                               * 0bda:5840 unit, which otherwise streams a
+                               * flat 0x8000 placeholder.  Ordering matters:
+                               * sent before the stream exists the device
+                               * latches status 0x0e and never recovers until
+                               * a replug.  See MechaniscoutPcap/4.pcapng. */
 } dyt_capture_opts;
 
 /* Fill *o with the defaults. */
@@ -86,5 +98,9 @@ const uint16_t *dyt_capture_last_raw(const dyt_capture_t *c, int *n_samples);
 /* Dump every format/frame/fps libuvc parsed — the on-arrival answer to
  * "which bFormatIndex is the thermal stream?". */
 void dyt_capture_print_diag(dyt_capture_t *c);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DYT_CAPTURE_H */

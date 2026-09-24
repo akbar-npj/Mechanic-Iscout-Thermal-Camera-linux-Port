@@ -14,6 +14,7 @@
  *           -I. -c frame.c -o frame.o
  */
 #include <stdlib.h>     /* abs */
+#include <string.h>     /* memset */
 #include "frame.h"
 
 /* Per-width geometry (RE Docs 04 §4.5.1 + thermometry.c switch).
@@ -123,23 +124,32 @@ void dyt_frame_build_lut(const frame_t *f, float t_amb_in,
                       &emiss, &ua, sensor_mode, fix_mode);
 }
 
-int dyt_frame_convert(const frame_t *f, const float *lut, float *out)
+int dyt_frame_is_valid(const frame_t *f)
 {
     int n = f->width * (f->total_height - REF_ROWS);
+    const uint16_t *r;
 
-    /* Pre-scan the image pixels for the 0x4000 validity gate
-     * (thermometrySearch aborts on the first offending pixel, printing
-     * "thermometrySearch err data" and returning void).  We mirror that
-     * gate here so the mode-dispatch API has a usable return value. */
-    for (int k = 0; k < n; k++) {
+    for (int k = 0; k < n; k++)
         if (f->raw[k] >= 0x4000)
-            return -1;
-    }
+            return 0;
+
     /* Also gate the six reference pixels thermometrySearch checks before
      * the image loop (disasm 0x1c78..0x1cac). */
-    const uint16_t *r = f->raw + n;
+    r = f->raw + n;
     if (r[4]  >= 0x4000 || r[7]  >= 0x4000 || r[8]  >= 0x4000 ||
         r[12] >= 0x4000 || r[13] >= 0x4000 || r[14] >= 0x4000)
+        return 0;
+
+    return 1;
+}
+
+int dyt_frame_convert(const frame_t *f, const float *lut, float *out)
+{
+    /* Pre-scan for the 0x4000 validity gate (thermometrySearch aborts on
+     * the first offending pixel, printing "thermometrySearch err data" and
+     * returning void).  Mirror it here so the mode-dispatch API has a
+     * usable return value. */
+    if (!dyt_frame_is_valid(f))
         return -1;
 
     thermometrySearch(f->width, f->total_height, lut, f->raw, out,
@@ -184,4 +194,64 @@ int dyt_frame_needs_shutter(const frame_t *f, uint16_t last_ref,
     if (cur_ref_out) *cur_ref_out = cur;
     if (last_ref == 0) return 0;   /* first frame: initialise, no trigger */
     return (abs((int)cur - (int)last_ref) >= 15) ? 1 : 0;
+}
+
+/* ------------------------------------------------------------ live pipeline */
+
+void dyt_pipeline_init(dyt_pipeline_t *p, dyt_mode_t mode, float t_amb,
+                       int sensor_mode, int fix_mode, float *lut)
+{
+    memset(p, 0, sizeof *p);
+    p->mode        = mode;
+    p->t_amb       = t_amb;
+    p->sensor_mode = sensor_mode;
+    p->fix_mode    = fix_mode;
+    p->lut         = lut;
+}
+
+int dyt_pipeline_resolve(dyt_pipeline_t *p, int width, size_t n_samples)
+{
+    int active, total, rec_base;
+
+    if (dyt_frame_resolve(p->mode, width, n_samples * 2,
+                          &active, &total, &rec_base) != 0)
+        return -1;
+
+    p->width    = width;
+    p->active   = active;
+    p->total    = total;
+    p->rec_base = rec_base;
+    p->n_pix    = width * (p->mode == DYT_MODE_44C ? active : total);
+    p->out_n    = p->n_pix + (p->mode == DYT_MODE_44C ? 10 : 0);
+    p->ready    = 1;
+    return 0;
+}
+
+int dyt_pipeline_frame(dyt_pipeline_t *p, const uint16_t *raw,
+                       size_t n_samples, float *out)
+{
+    frame_t ft;
+
+    if (!p->ready || !raw || !out)
+        return -1;
+    if (n_samples < (size_t)p->width * p->total)
+        return -1;                    /* short frame */
+
+    ft.width        = p->width;
+    ft.total_height = p->total;
+    ft.rec_base     = p->rec_base;
+    ft.raw          = (uint16_t *)raw;
+
+    /* The calibration record is per-unit and static, so the LUT is built
+     * once — but only from a frame that actually carries calibration data.
+     * Until the AD-output order lands the device streams a flat 0x8000
+     * filler (MechaniscoutPcap/4.pcapng); building the LUT from that would
+     * seed every later frame with garbage.  Only mode 0x44c consumes the
+     * LUT, so mode 1000 never builds one. */
+    if (p->mode == DYT_MODE_44C && !p->lut_built && dyt_frame_is_valid(&ft)) {
+        dyt_frame_build_lut(&ft, p->t_amb, p->sensor_mode, p->fix_mode, p->lut);
+        p->lut_built = 1;
+    }
+
+    return dyt_frame_convert_mode(p->mode, &ft, p->lut, out);
 }

@@ -103,6 +103,21 @@ radiometric path, and it is the only one with a dedicated 256-wide calibration t
 > see `04-usb-protocol.md` §4.10. If it is a `0BDA:*` part, frames flow immediately and the
 > thermometry is the trivial `raw/64 − 273.15` form.
 
+> **Correction (2026-09-24, live device).** The unit in hand is **`0bda:5840`** — Realtek
+> "USB Camera", manufacturer `Generic`, serial `200901010001` — i.e. mode **`1000`**, so the
+> `1514:0001`/`0x44C` inference above was **wrong** (see `04-usb-protocol.md` §4.10). Two further
+> corrections:
+>
+> * **"frames flow immediately" is wrong for mode `1000`.** The device streams a flat `0x8000`
+>   placeholder (`238.85 C`) until the host sends `setTinyCOutputADValue` *after* the UVC stream is
+>   running; real data follows ~2–3 s later. Sending that order before streaming latches the device
+>   at status `0x0e` until a replug.
+> * **No serial handshake is needed here.** `isVerifySN` is gated on the radiometric modes only, so
+>   a mode-`1000` device emits frames without it.
+>
+> Confirmed live: 256×192, `bFormatIndex 1`, 25 fps, and `raw/64 − 273.15` reproduces the vendor's
+> temperatures exactly.
+
 The Android manifest also declares `<uses-feature android:name="android.hardware.usb.host"
 android:required="true"/>`. **[V]**
 
