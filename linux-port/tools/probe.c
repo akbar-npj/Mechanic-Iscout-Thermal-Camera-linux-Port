@@ -246,8 +246,9 @@ static void print_vs_descriptor(const uint8_t *p, int len, int subtype)
         if (len < 27) break;
         fourcc_str(p + 5, fc);
         guid_str(p + 5, g);
-        printf("      FORMAT[%u] UNCOMPRESSED  fourcc=%s  guid=%s  bpp=%u  frames=%u\n",
-               p[3], fc, g, p[21], p[4]);
+        printf("      FORMAT[%u] UNCOMPRESSED  fourcc=%s  guid=%s  bpp=%u  frames=%u"
+               "  default_frame=%u\n",
+               p[3], fc, g, p[21], p[4], p[22]);
         break;
       }
 
