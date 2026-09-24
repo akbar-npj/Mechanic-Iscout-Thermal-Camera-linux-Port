@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Binary assets — never treat these as text.
+#
+# git's own heuristic is not reliable for this repo.  It classified
+# linux-port/palettes/03-red-hot.dat and linux-port/testdata/mode1000_256x192.raw
+# as *text*, because neither happens to contain a NUL byte in its first 8000.
+# A text-classified blob is subject to end-of-line conversion, which is
+# harmless on Linux but silently corrupts the file on a clone with
+# core.autocrlf=true (or a checkout with a text=auto rule).  That would break
+# the palette ramps — MD5-verified against RE Docs 06 §1.3 — and the raw
+# frames and frozen ground truth that `make check` compares byte-for-byte.
+#
+# These are tracked for the same reason the calibration blobs and the frozen
+# vendor ground truth are: small, needed to build and test, and re-extractable.
+# See .gitignore and the per-directory READMEs (palettes/, testdata/, calib/).
+# ---------------------------------------------------------------------------
+*.bin     binary
+*.dat     binary
+*.raw     binary
+*.ppm     binary
+
+# Packet captures live in MechaniscoutPcap/, which is untracked today.  Listed
+# so that tracking them later cannot go wrong.
+*.pcapng  binary
