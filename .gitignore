@@ -41,6 +41,13 @@ __pycache__/
 /linux-port/tools/thermometry_diff/out/*/port_lut.bin
 /linux-port/tools/thermometry_diff/out/*/port_out.bin
 
+# Viewer snapshots.  dytview's `s` key writes a timestamped PNG
+# (dytview_YYYYmmdd-HHMMSS.png) into the *current working directory*, so
+# launching it from the repo root would otherwise leave an untracked image
+# beside the sources.  Deliberately not anchored to a directory: the snapshot
+# lands wherever dytview was started from.
+dytview_*.png
+
 # ---------------------------------------------------------------------------
 # Vendored libuvc
 #
