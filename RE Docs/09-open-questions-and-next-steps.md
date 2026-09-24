@@ -50,6 +50,14 @@ hardware, no USB capture. Full detail in `04-usb-protocol.md` §4.5. Summary:
   `uvc_set_zoom_abs(cam, 0xffff8000)` when it drifts by ≥ 15 counts. A port that omits this will
   drift and band within minutes. See `04-usb-protocol.md` §4.5.5.
 
+> **Scope note (2026-09-24).** Everything above describes the **mode `0x44c`** frame — the reference
+> band, the calibration record and the LUT all belong to that path. This unit is mode `1000`, whose
+> payload has no reference band at all: `out[k] = raw[k]/64 - 273.15` over the whole plane. Mode
+> `1000` also has two *output modes* that differ in geometry, and the port's default is the
+> order-free one — a `256 × 384` frame whose top half is the device's grayscale visible image and
+> whose bottom `256 × 192` is the thermal plane. See `04-usb-protocol.md` §4.10 and
+> `linux-port/testdata/README.md`.
+
 > **Correction to an earlier draft of this section.** It previously asserted that there was *no*
 > user area inside the pixel plane, and that the thermometry parameters therefore lived in one of
 > the *other* allocated buffers. **That was wrong.** The parameters *are* inside the frame buffer —
@@ -213,10 +221,18 @@ radiometric path — it is the only one with a dedicated 256-wide calibration ta
 > **Correction (2026-09-24, live device) — the inference above is wrong; §4 is closed.**
 > `lsusb` answers it: the unit enumerates as **`0bda:5840`** → mode **`1000`**, *not*
 > `1514:0001`/`0x44C`. So the serial handshake above **does not apply** — `isVerifySN` is gated on
-> the radiometric modes only. What *does* apply is the mode-`1000` bring-up: the device streams a
-> flat `0x8000` placeholder until `setTinyCOutputADValue` is sent after streaming starts. Full
-> sequence in `04-usb-protocol.md` §4.10; the same `1514:0001` reasoning was corrected in
-> `01-target-and-hardware.md` §1.3.
+> the radiometric modes only. Full sequence in `04-usb-protocol.md` §4.10; the same `1514:0001`
+> reasoning was corrected in `01-target-and-hardware.md` §1.3.
+>
+> **Correction (2026-09-24, later the same day) — the `setTinyCOutputADValue` claim above is also
+> wrong.** It is not a bring-up step the device needs; it is a **mode switch**. In the device's
+> default mode the 256x384 frame already carries real data — top half a grayscale visible image,
+> bottom half the thermal plane — and it needs no vendor order at all. Sending the order *replaces*
+> that with a flat 256x192 raw-AD frame and turns the 256x384 frame into a placeholder. Both modes
+> carry the same thermal data (A-B-A interleave: cross-mode correlation 0.94 vs a 0.93 same-mode
+> noise floor), so the port now defaults to the order-free dual-half mode and keeps AD behind
+> `--ad-output`. This is why Thermal-Camera-Redux works unmodified on this unit. See
+> `04-usb-protocol.md` §4.10 and `linux-port/testdata/README.md`.
 
 Also worth noting: `device_filter.xml` lists `31DA:5846` but `connect` tests `VID 0x5846 / PID
 0x31DA` — the transpose. Four of five entries match; this one does not. **[V]**

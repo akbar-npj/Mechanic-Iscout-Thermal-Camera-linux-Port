@@ -8,8 +8,13 @@
  *   capture_demo                          # 10 frames, first matching device
  *   capture_demo --frames 100
  *   capture_demo --diag                   # dump every format libuvc parsed
- *   capture_demo --format-index 1 --width 256 --height 192 --fps 30
+ *   capture_demo --ad-output --frames 400 --save-last
+ *                                         # the 256x192 raw-AD mode
  *   capture_demo --out /tmp/frame0        # writes frame0_raw.bin + frame0_temps.bin
+ *
+ * By default it reads the device's own 256x384 dual-half frame and reports
+ * the bottom-half thermal plane.  --ad-output switches to the 256x192 raw-AD
+ * frame instead, which needs the setTinyCOutputADValue vendor order.
  *
  * build:  via the Makefile (make)
  */
@@ -128,8 +133,8 @@ int main(int argc, char **argv)
             o.sensor_mode = (int)strtol(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--fix-mode") && i + 1 < argc)
             o.fix_mode = (int)strtol(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--start-orders"))
-            o.send_start_orders = 1;
+        else if (!strcmp(argv[i], "--ad-output"))
+            o.output = DYT_OUTPUT_AD;
         else if (!strcmp(argv[i], "--save-last"))
             st.save_last = 1;
         else {
@@ -138,10 +143,11 @@ int main(int argc, char **argv)
                 "          [--vid 0xXXXX] [--pid 0xXXXX]\n"
                 "          [--format-index N] [--width W] [--height H] [--fps F]\n"
                 "          [--t-amb C] [--sensor-mode 0x82] [--fix-mode 0x78]\n"
-                "          [--start-orders]   send setTinyCOutputADValue once the\n"
-                "                             stream is running — required on\n"
-                "                             0bda:5840, which otherwise streams a\n"
-                "                             flat 0x8000 placeholder\n",
+                "          [--ad-output]      send setTinyCOutputADValue once the\n"
+                "                             stream is running and read the flat\n"
+                "                             256x192 raw-AD frame.  Default is the\n"
+                "                             device's own 256x384 dual-half frame,\n"
+                "                             which needs no vendor order\n",
                 argv[0]);
             return 2;
         }

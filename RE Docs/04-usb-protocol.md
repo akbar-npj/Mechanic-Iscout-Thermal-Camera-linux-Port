@@ -842,5 +842,16 @@ else                                                           mode = 0;
 > every `0x1d08` read returns stale bytes (this is the `0x1d08` "echo" of §4.2). The latch survives
 > handle close/open; **only a USB replug clears it.** `tinyStartStream`, `tinyStartStream2` and
 > `getTinyCParams` do **not** appear in the vendor's startup at all — sending them is what poisoned
-> earlier sessions. The port now sends only `setTinyCOutputADValue`, after streaming starts
-> (`linux-port/src/capture.c:send_ad_order`, `capture_demo --start-orders`).
+> earlier sessions. When the port does send it, it sends only `setTinyCOutputADValue`, after
+> streaming starts (`linux-port/src/capture.c:send_ad_order`, `capture_demo --ad-output`).
+>
+> **Correction (2026-09-24, later the same day) — that order is a *mode switch*, not a bring-up
+> step, and it is not required at all.** In the device's default mode the 256x384 frame is a real
+> dual-half image: the top half is a grayscale visible picture (YUYV with U = V = 0x80) and the
+> bottom half is the thermal plane, present as soon as the ~6 s `0x8000` filler clears. After
+> `setTinyCOutputADValue` that same 256x384 frame degenerates to a flat 4-sample-cycle placeholder
+> while 256x192 becomes the real raw-AD frame. Both modes carry the same thermal data (A-B-A
+> interleave: cross-mode correlation 0.94 against a 0.93 same-mode noise floor), so the port now
+> **defaults to the order-free dual-half mode** (`DYT_OUTPUT_DEFAULT`) and keeps the AD path behind
+> `--ad-output`. This is also why Thermal-Camera-Redux works unmodified on this unit.
+> See `linux-port/src/capture.h` and `linux-port/testdata/README.md`.

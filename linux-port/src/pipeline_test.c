@@ -8,18 +8,24 @@
  *
  *   mode 1000, real     testdata/mode1000_256x192.raw
  *                       — captured from the 0bda:5840 unit (see testdata/README.md)
+ *   mode 1000, real     testdata/mode1000_256x384_default.raw
+ *                       — the same unit's 256x384 dual-half frame, the port's
+ *                         default output mode
  *   mode 0x44c, real    tools/thermometry_diff/out/256/in_frame.bin
  *                       — the vendor ground-truth frame already in the tree
  *
  * What it pins:
  *   1. geometry resolution for both modes;
  *   2. the mode-1000 arithmetic (raw/64 - 273.15) over a real 256x192 frame;
- *   3. the LUT policy.  This is the latent bug the test exists for: the port
+ *   3. the thermal plane: a DYT_PLANE_BOTTOM_HALF payload must yield exactly
+ *      the bottom half, and a payload that is not twice the sensor's active
+ *      height must be refused;
+ *   4. the LUT policy.  This is the latent bug the test exists for: the port
  *      used to build the calibration LUT from the very first frame, which on
  *      a real 0x44c unit is the flat 0x8000 placeholder.  A filler frame must
  *      leave the LUT unbuilt; the first valid frame must build it.
  *
- * usage:  ./pipeline_test <mode1000.raw> <0x44c-in_frame.bin>
+ * usage:  ./pipeline_test <mode1000.raw> <0x44c-in_frame.bin> <dual-half.raw>
  * build:  via the Makefile (make pipeline-test)
  */
 #include <stdio.h>
@@ -28,7 +34,7 @@
 
 #include "frame.h"
 
-#define PLACEHOLDER 0x8000   /* the device's pre-bring-up filler sample */
+#define PLACEHOLDER 0x8000   /* the device's start-up filler sample */
 
 static int fails;
 
@@ -97,7 +103,7 @@ static void test_mode1000_live(const char *path)
     printf("\n-- mode 1000, real frame (%s) --\n", path);
     if (!raw || !lut) { printf("  FAIL cannot load fixture\n"); fails++; goto out; }
 
-    dyt_pipeline_init(&p, DYT_MODE_1000, 25.0f, 0x82, 0, lut);
+    dyt_pipeline_init(&p, DYT_MODE_1000, DYT_PLANE_FULL, 25.0f, 0x82, 0, lut);
     check_int("resolve rc", dyt_pipeline_resolve(&p, 256, n), 0);
     check_int("width",      p.width,    256);
     check_int("active",     p.active,   192);
@@ -125,7 +131,7 @@ static void test_mode1000_live(const char *path)
     }
     check_int("samples == raw/64-273.15", bad, 0);
 
-    /* The fixture must be real data, not the pre-bring-up filler — a fixture
+    /* The fixture must be real data, not the start-up filler — a fixture
      * that silently regressed to the filler would make the test above pass
      * vacuously. */
     {
@@ -169,7 +175,7 @@ static void test_mode1000_filler(void)
     printf("\n-- mode 1000, all-0x8000 filler --\n");
     if (!filler || !lut || !out) { printf("  FAIL out of memory\n"); fails++; goto out; }
 
-    dyt_pipeline_init(&p, DYT_MODE_1000, 25.0f, 0x82, 0, lut);
+    dyt_pipeline_init(&p, DYT_MODE_1000, DYT_PLANE_FULL, 25.0f, 0x82, 0, lut);
     if (dyt_pipeline_resolve(&p, 256, n) != 0) {
         printf("  FAIL resolve\n"); fails++; goto out;
     }
@@ -213,7 +219,7 @@ static void test_mode44c_lut_policy(const char *path)
         goto out;
     }
 
-    dyt_pipeline_init(&p, DYT_MODE_44C, 25.0f, 0x82, 0, lut);
+    dyt_pipeline_init(&p, DYT_MODE_44C, DYT_PLANE_FULL, 25.0f, 0x82, 0, lut);
     check_int("resolve rc", dyt_pipeline_resolve(&p, 256, n), 0);
     check_int("width",      p.width,    256);
     check_int("active",     p.active,   192);
@@ -258,6 +264,83 @@ out:
     free(real);
 }
 
+/* ------------------------------------- mode 1000, dual-half (default mode) */
+
+/* The device's own 256x384 frame, whose bottom half is the thermal plane and
+ * whose top half is its grayscale visible image.  This is the port's default
+ * output mode: it needs no vendor order, so the whole slice has to be right
+ * or the port silently reports the visible half as ~240 C scenery. */
+static void test_mode1000_dual_half(const char *path)
+{
+    size_t n = 0;
+    uint16_t *raw = load(path, &n);
+    float *lut = malloc(LUT_N * sizeof(float));
+    float *out = NULL;
+    dyt_pipeline_t p;
+    int bad = 0, i;
+
+    printf("\n-- mode 1000, dual-half default frame (%s) --\n", path);
+    if (!raw || !lut) { printf("  FAIL cannot load fixture\n"); fails++; goto out; }
+
+    check_int("payload is 256x384", (int)n, 256 * 384);
+
+    dyt_pipeline_init(&p, DYT_MODE_1000, DYT_PLANE_BOTTOM_HALF,
+                      25.0f, 0x82, 0, lut);
+    check_int("resolve rc", dyt_pipeline_resolve(&p, 256, n), 0);
+    check_int("width",      p.width,    256);
+    check_int("total",      p.total,    384);   /* the whole payload */
+    check_int("plane_y",    p.plane_y,  192);
+    check_int("plane_h",    p.plane_h,  192);
+    check_int("active",     p.active,   192);   /* the thermal plane only */
+    check_int("n_pix",      p.n_pix,    256 * 192);
+    check_int("out_n",      p.out_n,    256 * 192);
+
+    out = malloc((size_t)p.out_n * sizeof(float));
+    if (!out) { printf("  FAIL out of memory\n"); fails++; goto out; }
+
+    check_int("frame rc", dyt_pipeline_frame(&p, raw, n, out), 0);
+
+    /* Every output sample must come from the *bottom* half of the payload. */
+    for (i = 0; i < p.n_pix; i++) {
+        float want = (float)raw[256 * 192 + i] / 64.0f - 273.15f;
+        if (out[i] != want) {
+            if (!bad)
+                printf("  FAIL out[%d]=%.6f want %.6f (raw[%d]=0x%04x)\n",
+                       i, out[i], want, 256 * 192 + i, raw[256 * 192 + i]);
+            bad++;
+        }
+    }
+    check_int("samples == bottom half, raw/64-273.15", bad, 0);
+
+    /* Prove the slice really happened rather than the arithmetic happening to
+     * match.  The top half is the visible image, which decodes to ~240 C. */
+    {
+        float lo = out[0], hi = out[0];
+        for (i = 1; i < p.n_pix; i++) {
+            if (out[i] < lo) lo = out[i];
+            if (out[i] > hi) hi = out[i];
+        }
+        printf("       thermal plane range: %.2f .. %.2f C\n", lo, hi);
+        check_true("plane is not the visible half (max < 100 C)", hi < 100.0f);
+        check_true("plane is plausible (10..60 C)", lo > 10.0f && hi < 60.0f);
+    }
+    check_true("out[0] is not the visible half's first sample",
+               out[0] != (float)raw[0] / 64.0f - 273.15f);
+
+    /* The bottom half must itself be real data, not the filler. */
+    {
+        int filler = 1;
+        for (i = 0; i < p.n_pix; i++)
+            if (raw[256 * 192 + i] != PLACEHOLDER) { filler = 0; break; }
+        check_int("bottom half is real data (not filler)", filler, 0);
+    }
+
+out:
+    free(out);
+    free(lut);
+    free(raw);
+}
+
 /* --------------------------------------------------------------- geometry */
 
 static void test_resolve_rejects(void)
@@ -267,7 +350,7 @@ static void test_resolve_rejects(void)
 
     printf("\n-- resolve rejects malformed geometry --\n");
 
-    dyt_pipeline_init(&p, DYT_MODE_1000, 25.0f, 0x82, 0, lut);
+    dyt_pipeline_init(&p, DYT_MODE_1000, DYT_PLANE_FULL, 25.0f, 0x82, 0, lut);
     /* Mode 1000 is width-agnostic: no reference band, so no per-width
      * geometry (scale/rec_base) is needed and any whole-row payload
      * resolves.  frame_test covers the same property via dyt_frame_resolve. */
@@ -275,15 +358,26 @@ static void test_resolve_rejects(void)
     check_int("1000 partial row",       dyt_pipeline_resolve(&p, 256, 256u * 192u - 1u), -1);
     check_int("1000 zero samples",      dyt_pipeline_resolve(&p, 256, 0), -1);
 
-    dyt_pipeline_init(&p, DYT_MODE_44C, 25.0f, 0x82, 0, lut);
+    dyt_pipeline_init(&p, DYT_MODE_44C, DYT_PLANE_FULL, 25.0f, 0x82, 0, lut);
     check_int("0x44c unknown width 320",
               dyt_pipeline_resolve(&p, 320, 320u * 244u), -1);
     check_int("0x44c missing ref band",
               dyt_pipeline_resolve(&p, 256, 256u * 192u), -1);
 
+    /* A DYT_PLANE_BOTTOM_HALF payload must be exactly twice the sensor's
+     * active height.  An AD-mode 256x192 frame is not, so it must be refused
+     * rather than silently sliced into 96 rows. */
+    dyt_pipeline_init(&p, DYT_MODE_1000, DYT_PLANE_BOTTOM_HALF, 25.0f, 0x82, 0, lut);
+    check_int("dual-half on a 256x192 payload",
+              dyt_pipeline_resolve(&p, 256, 256u * 192u), -1);
+    check_int("dual-half on a 256x384 payload",
+              dyt_pipeline_resolve(&p, 256, 256u * 384u), 0);
+    check_int("dual-half on a 256x193 payload",
+              dyt_pipeline_resolve(&p, 256, 256u * 193u), -1);
+
     /* Feeding a frame before resolve must be refused, not read past the
      * (unallocated) geometry. */
-    dyt_pipeline_init(&p, DYT_MODE_1000, 25.0f, 0x82, 0, lut);
+    dyt_pipeline_init(&p, DYT_MODE_1000, DYT_PLANE_FULL, 25.0f, 0x82, 0, lut);
     {
         uint16_t one = 0;
         float o = 0;
@@ -296,10 +390,13 @@ int main(int argc, char **argv)
     const char *f1000 = argc > 1 ? argv[1] : "testdata/mode1000_256x192.raw";
     const char *f44c  = argc > 2 ? argv[2]
                                  : "tools/thermometry_diff/out/256/in_frame.bin";
+    const char *f384  = argc > 3 ? argv[3]
+                                 : "testdata/mode1000_256x384_default.raw";
 
     printf("=== pipeline_test (live capture pipeline) ===\n");
 
     test_mode1000_live(f1000);
+    test_mode1000_dual_half(f384);
     test_mode1000_filler();
     test_mode44c_lut_policy(f44c);
     test_resolve_rejects();

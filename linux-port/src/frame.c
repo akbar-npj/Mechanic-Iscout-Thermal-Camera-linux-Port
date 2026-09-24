@@ -198,11 +198,12 @@ int dyt_frame_needs_shutter(const frame_t *f, uint16_t last_ref,
 
 /* ------------------------------------------------------------ live pipeline */
 
-void dyt_pipeline_init(dyt_pipeline_t *p, dyt_mode_t mode, float t_amb,
-                       int sensor_mode, int fix_mode, float *lut)
+void dyt_pipeline_init(dyt_pipeline_t *p, dyt_mode_t mode, dyt_plane_t plane,
+                       float t_amb, int sensor_mode, int fix_mode, float *lut)
 {
     memset(p, 0, sizeof *p);
     p->mode        = mode;
+    p->plane       = plane;
     p->t_amb       = t_amb;
     p->sensor_mode = sensor_mode;
     p->fix_mode    = fix_mode;
@@ -217,11 +218,30 @@ int dyt_pipeline_resolve(dyt_pipeline_t *p, int width, size_t n_samples)
                           &active, &total, &rec_base) != 0)
         return -1;
 
+    if (p->plane == DYT_PLANE_BOTTOM_HALF) {
+        int act;
+
+        /* The dual-half frame is exactly twice the sensor's active height,
+         * so this both locates the plane and rejects a payload that is not
+         * one (e.g. an AD-mode 256x192 frame).  Mode 0x44c has no dual-half
+         * variant, so it never gets here. */
+        if (dyt_geometry(width, &act, NULL, NULL, NULL, NULL) != 0 ||
+            total != 2 * act)
+            return -1;
+        p->plane_y = act;
+        p->plane_h = act;
+    } else {
+        p->plane_y = 0;
+        p->plane_h = total;
+    }
+
     p->width    = width;
-    p->active   = active;
-    p->total    = total;
+    p->total    = total;                        /* the whole payload */
     p->rec_base = rec_base;
-    p->n_pix    = width * (p->mode == DYT_MODE_44C ? active : total);
+    /* `active` is what the caller receives, i.e. the thermal plane.  For
+     * mode 0x44c the plane is the whole payload minus the reference band. */
+    p->active   = (p->mode == DYT_MODE_44C) ? active : p->plane_h;
+    p->n_pix    = width * p->active;
     p->out_n    = p->n_pix + (p->mode == DYT_MODE_44C ? 10 : 0);
     p->ready    = 1;
     return 0;
@@ -237,17 +257,20 @@ int dyt_pipeline_frame(dyt_pipeline_t *p, const uint16_t *raw,
     if (n_samples < (size_t)p->width * p->total)
         return -1;                    /* short frame */
 
+    /* Present the thermal plane as the frame.  Slicing here is what keeps
+     * frame_t's meaning ("the thermal frame") and the conversion unchanged
+     * for both planes. */
     ft.width        = p->width;
-    ft.total_height = p->total;
+    ft.total_height = p->plane_h;
     ft.rec_base     = p->rec_base;
-    ft.raw          = (uint16_t *)raw;
+    ft.raw          = (uint16_t *)raw + (size_t)p->plane_y * p->width;
 
     /* The calibration record is per-unit and static, so the LUT is built
      * once — but only from a frame that actually carries calibration data.
-     * Until the AD-output order lands the device streams a flat 0x8000
-     * filler (MechaniscoutPcap/4.pcapng); building the LUT from that would
-     * seed every later frame with garbage.  Only mode 0x44c consumes the
-     * LUT, so mode 1000 never builds one. */
+     * Until the device leaves its flat 0x8000 filler the stream is
+     * meaningless; building the LUT from that would seed every later frame
+     * with garbage.  Only mode 0x44c consumes the LUT, so mode 1000 never
+     * builds one. */
     if (p->mode == DYT_MODE_44C && !p->lut_built && dyt_frame_is_valid(&ft)) {
         dyt_frame_build_lut(&ft, p->t_amb, p->sensor_mode, p->fix_mode, p->lut);
         p->lut_built = 1;

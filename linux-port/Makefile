@@ -192,7 +192,8 @@ check: all
 	@$(BUILD)/frame_test
 	@$(BUILD)/calib_test calib
 	@$(BUILD)/pipeline_test testdata/mode1000_256x192.raw \
-	                       tools/thermometry_diff/out/256/in_frame.bin
+	                       tools/thermometry_diff/out/256/in_frame.bin \
+	                       testdata/mode1000_256x384_default.raw
 	@$(BUILD)/palette_test palettes testdata/mode1000_256x192.raw \
 	                       testdata/golden/mode1000_iron_30-31.2.ppm
 ifdef HAVE_LIBUSB

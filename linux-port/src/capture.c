@@ -68,7 +68,7 @@ struct dyt_capture {
     float    *out;
 
     /* params */
-    int send_start_orders;
+    dyt_output_t output;
 
     /* auto-shutter state */
     uint16_t last_ref;
@@ -155,17 +155,24 @@ static int pick_format(uvc_device_handle_t *devh, const dyt_capture_opts *o,
     if (!best)
         return -1;
 
-    /* Frame: explicit size, else the default frame, else the first.  Either
-     * axis may be given alone, so `--height 384` selects by height without
-     * also needing `--width`. */
-    for (fr = best->frame_descs; fr; fr = fr->next) {
-        if (o->width || o->height) {
+    /* Frame selection.  An explicit size always wins, and either axis may be
+     * given alone, so `--height 384` selects by height without also needing
+     * `--width`. */
+    if (o->width || o->height) {
+        for (fr = best->frame_descs; fr; fr = fr->next)
             if ((!o->width  || fr->wWidth  == o->width) &&
                 (!o->height || fr->wHeight == o->height)) { bestfr = fr; break; }
-        } else if (fr->bFrameIndex == best->bDefaultFrameIndex) {
-            bestfr = fr;
-            break;
-        }
+    } else if (o->output == DYT_OUTPUT_DEFAULT) {
+        /* The dual-half frame is the *taller* of the pair the device
+         * advertises — on this unit the descriptor offers the sensor's
+         * active 256x192 and its 256x384 dual-half twin, and bDefaultFrameIndex
+         * points at the 192 one (which is only meaningful in AD mode).  Pick
+         * the tallest; the plane logic then takes the bottom half of it. */
+        for (fr = best->frame_descs; fr; fr = fr->next)
+            if (!bestfr || fr->wHeight > bestfr->wHeight) bestfr = fr;
+    } else {
+        for (fr = best->frame_descs; fr; fr = fr->next)
+            if (fr->bFrameIndex == best->bDefaultFrameIndex) { bestfr = fr; break; }
     }
     if (!bestfr)
         bestfr = best->frame_descs;
@@ -329,7 +336,7 @@ int dyt_capture_open(dyt_capture_t **out, const dyt_capture_opts *o)
         }
     }
 
-    c->send_start_orders = o->send_start_orders;
+    c->output = o->output;
 
     /* The LUT is 64 KiB; allocate it once and hand it to the pipeline, which
      * fills it lazily from the first valid 0x44c frame. */
@@ -338,13 +345,16 @@ int dyt_capture_open(dyt_capture_t **out, const dyt_capture_opts *o)
         fprintf(stderr, "capture: out of memory\n");
         goto fail;
     }
-    dyt_pipeline_init(&c->pipe, c->mode, o->t_amb, o->sensor_mode,
-                      o->fix_mode, c->lut);
+    dyt_pipeline_init(&c->pipe, c->mode,
+                      o->output == DYT_OUTPUT_DEFAULT ? DYT_PLANE_BOTTOM_HALF
+                                                      : DYT_PLANE_FULL,
+                      o->t_amb, o->sensor_mode, o->fix_mode, c->lut);
 
-    fprintf(stderr, "capture: %04x:%04x mode %s, format %d frame %d, %dx%d\n",
+    fprintf(stderr, "capture: %04x:%04x mode %s, output %s, format %d frame %d, %dx%d\n",
             vid, pid,
             c->mode == DYT_MODE_44C ? "0x44c" :
             c->mode == DYT_MODE_1000 ? "1000" : "?",
+            o->output == DYT_OUTPUT_DEFAULT ? "default (dual-half)" : "AD",
             c->fmt_index, c->frame_index, c->fmt_w, c->fmt_h);
 
     *out = c;
@@ -377,9 +387,12 @@ static void frame_cb(struct uvc_frame *f, void *user)
     if (!c->pipe.ready) {
         if (dyt_pipeline_resolve(&c->pipe, f->width, f->data_bytes / 2) != 0) {
             fprintf(stderr, "capture: cannot resolve frame geometry from "
-                            "%d B at width %d (mode %s)\n",
+                            "%d B at width %d (mode %s, plane %s)\n",
                     (int)f->data_bytes, f->width,
-                    c->mode == DYT_MODE_44C ? "0x44c" : "1000");
+                    c->mode == DYT_MODE_44C ? "0x44c" : "1000",
+                    c->pipe.plane == DYT_PLANE_BOTTOM_HALF
+                        ? "bottom-half of a dual-half payload"
+                        : "whole payload");
             c->err = 1;
             return;
         }
@@ -392,9 +405,9 @@ static void frame_cb(struct uvc_frame *f, void *user)
             c->err = 1;
             return;
         }
-        fprintf(stderr, "capture: frame %dx%d (active %d, %d ref rows)\n",
-                c->pipe.width, c->pipe.total, c->pipe.active,
-                c->pipe.total - c->pipe.active);
+        fprintf(stderr, "capture: payload %dx%d, thermal plane %dx%d at row %d\n",
+                c->pipe.width, c->pipe.total,
+                c->pipe.width, c->pipe.plane_h, c->pipe.plane_y);
     }
 
     bytes = (size_t)c->pipe.width * c->pipe.total * 2;
@@ -406,20 +419,21 @@ static void frame_cb(struct uvc_frame *f, void *user)
 
     /* Device-independent step (frame.c): LUT policy + conversion.  The LUT
      * is built from the first frame that actually carries calibration data,
-     * so the pre-bring-up 0x8000 filler cannot seed it. */
+     * so the start-up 0x8000 filler cannot seed it. */
     if (dyt_pipeline_frame(&c->pipe, c->staging, f->data_bytes / 2,
                            c->out) != 0)
         return;
 
-    /* Auto-shutter (FFC) trigger — mode 0x44c only (RE Docs 04 §4.5.5). */
+    /* Auto-shutter (FFC) trigger — mode 0x44c only (RE Docs 04 §4.5.5).
+     * 0x44c always runs DYT_PLANE_FULL, so the plane is the whole payload. */
     if (c->mode == DYT_MODE_44C) {
         frame_t ft;
         uint16_t cur = 0;
 
         ft.width        = c->pipe.width;
-        ft.total_height = c->pipe.total;
+        ft.total_height = c->pipe.plane_h;
         ft.rec_base     = c->pipe.rec_base;
-        ft.raw          = c->staging;
+        ft.raw          = c->staging + (size_t)c->pipe.plane_y * c->pipe.width;
         if (dyt_frame_needs_shutter(&ft, c->last_ref, &cur))
             dyt_capture_request_shutter(c);
         c->last_ref = cur;
@@ -464,7 +478,7 @@ int dyt_capture_request_shutter(dyt_capture_t *c)
 
 /* -------------------------------------------------------------- lifecycle */
 
-/* ---------------------------------------------------------------- bring-up */
+/* ------------------------------------------------------------ vendor orders */
 
 /* Send one 8-byte order to `reg`, then trace the raw status byte from
  * 0x0200 and the 15-byte result from 0x1d08 — WITHOUT aborting on the
@@ -512,7 +526,7 @@ static void order_trace(dyt_capture_t *c, const char *name,
     fprintf(stderr, "\n");
 }
 
-/* The one bring-up order that matters (MechaniscoutPcap/4.pcapng).
+/* The one vendor order that matters (MechaniscoutPcap/4.pcapng).
  *
  * The Windows vendor app sends exactly one TinyC order while bringing the
  * device up:
@@ -531,6 +545,14 @@ static void order_trace(dyt_capture_t *c, const char *name,
  * returns stale bytes.  That self-inflicted latch is what produced the
  * earlier "three commands return identical data" and "0x1d08 echoes the
  * last write" observations.
+ *
+ * It is also a *mode switch*, not a bring-up step (measured 2026-09-24): in
+ * the default mode the 256x384 frame is a real dual-half image, and after
+ * this order that same frame degenerates to a flat placeholder while
+ * 256x192 becomes the real raw-AD frame.  The port therefore does not send
+ * it by default — DYT_OUTPUT_DEFAULT reads the thermal plane straight out of
+ * the dual-half frame and needs no vendor order at all.  Only
+ * DYT_OUTPUT_AD sends it.
  *
  * It is not a WRITE-classified opcode, so it cannot touch factory
  * calibration (RE Docs 04 §4.8).  The other orders the old sequence sent
@@ -576,7 +598,7 @@ int dyt_capture_start(dyt_capture_t *c, dyt_frame_cb_t cb, void *user)
 
     c->streaming = 1;
 
-    if (c->send_start_orders) {
+    if (c->output == DYT_OUTPUT_AD) {
         int i;
 
         /* The vendor issues this order only once the stream is running
@@ -731,4 +753,5 @@ void dyt_capture_opts_default(dyt_capture_opts *o)
     o->t_amb       = 25.0f;
     o->sensor_mode = 0x82;   /* vendor default (RE Docs 09 §7.2) */
     o->fix_mode    = 0;      /* 0x78 enables GetFix */
+    o->output      = DYT_OUTPUT_DEFAULT;  /* explicit: no vendor order needed */
 }

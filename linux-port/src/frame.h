@@ -36,6 +36,24 @@ typedef enum {
     DYT_MODE_3EB  = 0x3eb    /* third variant — TODO */
 } dyt_mode_t;
 
+/* Where the thermal plane sits inside the streamed payload.
+ *
+ * The 0bda:5840 unit has two output modes, and they differ in geometry as
+ * well as in content (RE Docs 04, measured 2026-09-24):
+ *
+ *   default mode  256x384 — the top half is the device's grayscale visible
+ *                 image and the bottom half is the thermal plane.  Selected
+ *                 without sending any vendor order.
+ *   AD mode       256x192 — the whole payload is thermal.  Requires
+ *                 setTinyCOutputADValue once the stream is running.
+ *
+ * The two modes carry the *same* thermal data (A-B-A interleave, 2026-09-24),
+ * so this is purely a sub-rectangle selection — the conversion is identical. */
+typedef enum {
+    DYT_PLANE_FULL = 0,      /* whole payload is thermal (AD mode) */
+    DYT_PLANE_BOTTOM_HALF    /* bottom half is thermal, top half is visible */
+} dyt_plane_t;
+
 /* A raw thermal frame.  raw is width*total_height uint16 samples,
  * caller-owned.  For mode 0x44c, total_height = active + REF_ROWS;
  * for mode 1000, total_height == active (no reference band). */
@@ -121,12 +139,11 @@ int dyt_frame_needs_shutter(const frame_t *f, uint16_t last_ref,
  * six reference pixels thermometrySearch inspects sits at/above the 0x4000
  * sentinel.  dyt_frame_convert applies it before converting.
  *
- * This is also what keeps calibration out of the device's pre-bring-up
- * filler.  Until the AD-output order lands the stream is a flat 0x8000
- * (MechaniscoutPcap/4.pcapng), which fails this gate — so a LUT built only
- * from valid frames can never be seeded from the filler.  Mode 1000 has no
- * sentinel (0x4000 decodes to a legitimate -17.15 C), so it never consults
- * this. */
+ * This is also what keeps calibration out of the device's start-up filler.
+ * The device streams a flat 0x8000 for its first ~6 s, which fails this
+ * gate — so a LUT built only from valid frames can never be seeded from the
+ * filler.  Mode 1000 has no sentinel (0x4000 decodes to a legitimate
+ * -17.15 C), so it never consults this. */
 int dyt_frame_is_valid(const frame_t *f);
 
 /* -------------------------------------------------------------------------
@@ -141,13 +158,20 @@ int dyt_frame_is_valid(const frame_t *f);
  * ------------------------------------------------------------------------- */
 
 typedef struct {
-    dyt_mode_t mode;
-    float      t_amb;
-    int        sensor_mode, fix_mode;
+    dyt_mode_t  mode;
+    dyt_plane_t plane;     /* configured at init; where the thermal rows are */
+    float       t_amb;
+    int         sensor_mode, fix_mode;
 
     int        width;      /* sensor width in pixels */
-    int        active;     /* active rows */
-    int        total;      /* rows in the payload (active+REF_ROWS for 0x44c) */
+    int        active;     /* rows the caller receives: the thermal plane
+                            * (active == plane_h for mode 1000, and
+                            * total - REF_ROWS for mode 0x44c) */
+    int        total;      /* rows in the *payload* (the whole streamed
+                            * frame, including the visible half and, for
+                            * mode 0x44c, the reference band) */
+    int        plane_y;    /* first thermal row within the payload */
+    int        plane_h;    /* number of thermal rows in the payload */
     int        rec_base;   /* calibration-record offset in the reference band */
     int        n_pix;      /* samples converted */
     int        out_n;      /* floats dyt_pipeline_frame writes to out */
@@ -157,14 +181,18 @@ typedef struct {
     float     *lut;        /* LUT_N floats, caller-owned */
 } dyt_pipeline_t;
 
-/* Initialise.  `lut` must hold LUT_N floats and outlive the pipeline. */
-void dyt_pipeline_init(dyt_pipeline_t *p, dyt_mode_t mode, float t_amb,
-                       int sensor_mode, int fix_mode, float *lut);
+/* Initialise.  `lut` must hold LUT_N floats and outlive the pipeline.
+ * `plane` selects where the thermal rows are inside the payload; mode 0x44c
+ * always uses DYT_PLANE_FULL. */
+void dyt_pipeline_init(dyt_pipeline_t *p, dyt_mode_t mode, dyt_plane_t plane,
+                       float t_amb, int sensor_mode, int fix_mode, float *lut);
 
 /* Resolve the geometry from the first payload: `width` pixels wide,
  * `n_samples` uint16 samples.  Returns 0 on success (p->ready set), -1 if
  * the geometry is unusable — unknown width, not a whole number of rows, or
- * inconsistent with the mode's reference band. */
+ * inconsistent with the mode's reference band or the requested plane (a
+ * DYT_PLANE_BOTTOM_HALF payload must be exactly twice the sensor's active
+ * height). */
 int dyt_pipeline_resolve(dyt_pipeline_t *p, int width, size_t n_samples);
 
 /* Run one frame.  raw holds n_samples uint16 samples; out holds at least

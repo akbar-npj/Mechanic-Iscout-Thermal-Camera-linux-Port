@@ -25,11 +25,18 @@
  *
  * Usage
  * -----
- *   dytview --start-orders                 # live window (this unit)
- *   dytview --start-orders --zoom 3
- *   dytview --start-orders --palette 2     # 1..6 = vendor ramp
- *   dytview --start-orders --lo 20 --hi 40 # lock the display range
- *   dytview --start-orders --png shot.png  # headless: render one frame, exit
+ *   dytview                        # live window (this unit)
+ *   dytview --zoom 3
+ *   dytview --palette 2            # 1..6 = vendor ramp
+ *   dytview --lo 20 --hi 40        # lock the display range
+ *   dytview --png shot.png         # headless: render one frame, exit
+ *   dytview --ad-output            # the 256x192 raw-AD mode instead
+ *
+ * By default this reads the device's own 256x384 dual-half frame and renders
+ * its bottom-half thermal plane — no vendor order, so the device is left in
+ * the mode its own apps (and Thermal-Camera-Redux) expect.  --ad-output
+ * switches to the 256x192 raw-AD frame, which requires sending
+ * setTinyCOutputADValue once streaming has started.
  *
  * Keys: 1-6 palette · r toggle auto/locked range · s snapshot PNG · q/ESC quit
  *
@@ -73,7 +80,7 @@ static const int         kStatusH   = 22;   /* status strip height, px */
  * pipeline's 0x4000 gate rejects the filler outright — so the viewer has to
  * recognise it.  Real scenes are nowhere near this: this unit's room view
  * reads ~30 C, so a frame whose every sample sits within kFillerTol of
- * 238.85 C is the pre-bring-up output, not a measurement.  The window is
+ * 238.85 C is the start-up output, not a measurement.  The window is
  * deliberately narrow; the filler->live transition only overshoots it by a
  * few degrees for a handful of frames. */
 static const float kFillerC   = 32768.0f / 64.0f - 273.15f;   /* 238.85 */
@@ -177,7 +184,7 @@ static const char *short_pal_name(int id)
     return n ? n : "?";
 }
 
-/* True while the frame is still the device's pre-bring-up output (see
+/* True while the frame is still the device's start-up output (see
  * kFillerC).  An all-NaN frame counts as filler too, so it is never mistaken
  * for a reading. */
 static bool frame_is_filler(const std::vector<float> &t)
@@ -204,7 +211,7 @@ static bool frame_mean(const std::vector<float> &t, float *out)
 }
 
 /* A placeholder shown before the first frame, or while the device is still
- * streaming its pre-bring-up filler. */
+ * streaming its start-up filler. */
 static cv::Mat waiting_canvas(viewer *v, const char *msg)
 {
     cv::Mat m(300, 460, CV_8UC3, cv::Scalar(24, 24, 24));
@@ -439,9 +446,11 @@ static void usage(const char *prog)
 {
     std::fprintf(stderr,
         "usage: %s [options]\n"
-        "  --start-orders        send setTinyCOutputADValue once streaming —\n"
-        "                        required on 0bda:5840, which otherwise streams\n"
-        "                        a flat 0x8000 placeholder (238.85 C)\n"
+        "  --ad-output           send setTinyCOutputADValue once streaming and\n"
+        "                        read the flat 256x192 raw-AD frame.  Default\n"
+        "                        is the device's own 256x384 dual-half frame,\n"
+        "                        whose bottom half is the thermal plane and which\n"
+        "                        needs no vendor order\n"
         "  --zoom N              integer upscale for the window (default 2)\n"
         "  --palette N           vendor ramp 1..6 (default 1 = iron red)\n"
         "  --lo C --hi C         lock the display range instead of auto-fitting\n"
@@ -482,8 +491,8 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 0;
         }
-        if (!std::strcmp(a, "--start-orders"))
-            o.send_start_orders = 1;
+        if (!std::strcmp(a, "--ad-output"))
+            o.output = DYT_OUTPUT_AD;
         else if (!std::strcmp(a, "--zoom") && i + 1 < argc)
             zoom = std::atoi(argv[++i]);
         else if (!std::strcmp(a, "--palette") && i + 1 < argc)
@@ -550,13 +559,14 @@ int main(int argc, char **argv)
     if (dyt_capture_open(&cap, &o) != 0)
         return 1;
     v.mode = dyt_capture_mode(cap);
-    v.note = o.send_start_orders
+    /* Both output modes stream a flat 0x8000 filler for ~6 s, and both then
+     * drift for a few more as the sensor settles. */
+    v.note = o.output == DYT_OUTPUT_AD
                  ? "setTinyCOutputADValue sent — the sensor drifts for ~8 s "
                    "after it takes effect"
-                 : "hint: 0bda:5840 needs --start-orders or it never leaves "
-                   "the filler";
+                 : "dual-half mode — no vendor order sent";
 
-    /* Headless: stream, wait for the device to leave its pre-bring-up filler,
+    /* Headless: stream, wait for the device to leave its filler,
      * give the sensor a fixed settle, render one frame, save it, exit.  The
      * settle wait matters: once the AD-output order takes effect the sensor
      * drifts for ~8 s (this unit reads ~40 C and falls to ~30 C), and the
