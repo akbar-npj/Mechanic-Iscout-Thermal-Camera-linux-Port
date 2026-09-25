@@ -30,13 +30,16 @@ MainWindow : QWidget
 └── QHBoxLayout (margins 0, spacing 0)
     ├── IconRail    (stretch 0)   left rail: Palette / Mark / Rotate / Compare /
     │                             Reset, then Tutorials / Contact / Setting
-    └── centre column (stretch 1, QVBoxLayout)
-        ├── QMenuBar    (stretch 0)   File / View / Measure / Device / Help  (retiring)
-        ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide (retiring)
-        ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery (retiring)
-        ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
-        │   └── GalleryPanel          the saved-items list, an overlay child widget
-        └── StatusStrip (stretch 0)   three left-aligned lines
+    ├── centre column (stretch 1, QVBoxLayout)
+    │   ├── QMenuBar    (stretch 0)   File / View / Measure / Device / Help  (retiring)
+    │   ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide (retiring)
+    │   ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery (retiring)
+    │   ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
+    │   │   └── GalleryPanel          the saved-items list, an overlay child widget
+    │   └── StatusStrip (stretch 0)   three left-aligned lines
+    └── ControlPanel (stretch 0)  right panel: QTabWidget
+        └── "Troubleshoot"        Temperature Measurement / High Temperature /
+                                  Image Enhancement / Capture
 ```
 
 The menu bar and the two toolbar rows are still present while the rail and the
@@ -45,6 +48,36 @@ do. Every rail button runs the same `handle_key` the keyboard does, so the rail
 is a second route to the same actions — never a second set — and every rail
 button is `Qt::NoFocus`, because a focused button would swallow the keys before
 `keyPressEvent` sees them (assertion 53b pins it).
+
+### The control panel
+
+`ControlPanel` is the Windows counterpart's right column: a `QTabWidget` whose
+**Troubleshoot** tab holds four checkable `QGroupBox`es — Temperature
+Measurement (Spot / Line / Rectangle / None), High Temperature (Tracking /
+Alarm / Highlight), Image Enhancement (the two flips and Fixed range) and
+Capture (Still / Record / Gallery). Only groups the engine backs are present:
+the reference's Polygon, Chart and 3D rows are absent rather than
+present-and-dead, so nothing on screen is a control that does nothing.
+
+Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
+the same one-dispatch rule the menus followed), so a panel button and a key
+cannot drift — assertion 50b triggers the Line button and requires the session
+to move exactly as `l` does. The checkmarks come from the snapshot in
+`sync()`, never from the button's own toggle, for the same reason
+`sync_actions()` does it: a key the session refused must not leave a button lit.
+No control takes focus, for the reason above.
+
+**Tracking** is a new binding: `m` hides and shows the frame's hottest/coldest
+markers (`FrameView::toggle_hot()`), which the reference viewer always draws.
+The flag is a canvas one, not a session one — it changes what is painted, not
+what is measured. Assertion 50c pins that the key reaches it and that the
+drawing actually changes.
+
+`FrameView::render_canvas()` draws the canvas's content at the canvas's own
+size, in canvas coordinates, and is what the overlay assertions sample. A
+widget `grab()` would be cropped once the rail and panel take their columns —
+the offscreen test window is wider than its screen — so an assertion about an
+overlay is written against the canvas, not the window (assertions 33 and 34).
 
 `FrameView` is the only class that knows about pixels, and `StatusStrip` the only
 one that knows about text layout. Everything above them deals in the session and
@@ -305,6 +338,7 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 | `n` | no tool, and forget the placed points |
 | `a` | arm the alarm, or disarm it if already armed |
 | `i` | toggle the isotherm |
+| `m` | show or hide the hottest/coldest markers |
 | `d` | show or hide the device panel |
 
 The runtime-parameter keys and `r` (retry) and `q` (quit) are routed *before*
@@ -836,6 +870,8 @@ $ ./build/dytqt --selftest
   ok   a 2x render maps a click back to the native pixel (both corners)
   ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 660x533 yes)
   ok   a menu action reaches the session like its key (palette 0 -> 2)
+  ok   a panel button reaches the session like its key (line yes, clear yes)
+  ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
   ok   the Help item opens the guide (1)
   ok   neither bar can take the keyboard (menubar no focus, 2 toolbar row(s), 0 that would)

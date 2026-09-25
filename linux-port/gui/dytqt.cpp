@@ -33,12 +33,14 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
+#include <QButtonGroup>
 #include <QCloseEvent>
 #include <QColor>
 #include <QDialog>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFrame>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QImage>
@@ -54,10 +56,12 @@
 #include <QPixmap>
 #include <QPolygon>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSize>
 #include <QString>
+#include <QTabWidget>
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
@@ -132,6 +136,8 @@ static const char kDarkQss[] =
     "QPushButton#rail { border: none; border-radius: 0; text-align: center; "
         "padding: 6px 2px; font-size: 9px; }"
     "QPushButton#rail:checked { background: #003644; }"
+    "QPushButton#row { text-align: left; padding: 4px 6px; font-size: 9px; }"
+    "QPushButton#row:checked { background: #003644; border-color: #00b4d8; }"
     "QLineEdit, QSpinBox, QDoubleSpinBox { background: #2b2b2b; color: #e6e6e6; "
         "border: 1px solid #3a3a3a; padding: 2px; }"
     "QListWidget { background: #1e1e1e; color: #e6e6e6; border: 1px solid "
@@ -147,6 +153,11 @@ static const char kDarkQss[] =
  * at ~45 px).  The Windows rail is a slim vertical strip; this matches it
  * without crowding the picture. */
 static const int kRailW = 72;
+
+/* The right panel's width.  The Windows panel is a narrow column of grouped
+ * controls; wide enough for the longest label ("Highlight High TEMP. Area") at
+ * the panel font, narrow enough that it does not take the canvas's room. */
+static const int kPanelW = 224;
 
 /* ---------------------------------------------------------------- options */
 
@@ -1291,6 +1302,18 @@ public:
         update();
     }
 
+    /* The hottest/coldest markers.  On by default, which is the reference
+     * viewer's behaviour (it always marks the extremes); the Windows panel
+     * exposes a Tracking switch, so this is what that switch drives.  A canvas
+     * flag rather than a session one: it changes what is drawn, not what is
+     * measured, and the frame's extremes are recomputed every frame anyway. */
+    void toggle_hot()
+    {
+        show_hot_ = !show_hot_;
+        update();
+    }
+    bool hot_shown() const { return show_hot_; }
+
     /* The device identity the worker read at bring-up.  `have` is false when
      * the read did not run, which is also how a failed bring-up clears it. */
     void set_info(const dyt_device_info_t &d, bool have)
@@ -1612,8 +1635,9 @@ protected:
         };
 
         /* The frame's own extremes, marked as the reference viewer does:
-         * H red for the hottest pixel, L blue for the coldest. */
-        {
+         * H red for the hottest pixel, L blue for the coldest.  The Tracking
+         * switch hides them; the measurement they report is unaffected. */
+        if (show_hot_) {
             auto mark = [&](int sx, int sy, float c, const QColor &col,
                             const char *tag) {
                 QPoint q;
@@ -1822,6 +1846,9 @@ private:
     dyt_device_info_t   info_{};
     int                 have_info_   = 0;
     bool                show_info_   = true;
+    /* The hottest/coldest markers, on by default (the reference viewer always
+     * marks them).  The Windows panel's Tracking switch drives this. */
+    bool                show_hot_    = true;
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 
@@ -2380,6 +2407,293 @@ private:
     QPushButton *btn_[N_RailItems] = {};
 };
 
+/* ---------------------------------------------------------- the control panel
+ *
+ * The Windows counterpart's right panel (manual p.5, /tmp/pdfx/w-08.png): a
+ * narrow tabbed column of grouped controls.  Only the groups the engine backs
+ * are present — the reference's Polygon/Chart/3D rows are absent rather than
+ * present-and-dead, so nothing on screen is a control that does nothing.
+ *
+ * Every row runs the same handle_key the keyboard does (through on_key), so a
+ * button is a second route to the same action, never a second implementation.
+ * The checked state comes from the snapshot in sync(), never from the button's
+ * own toggle, for the same reason MainWindow::sync_actions() does it: a key the
+ * session refused must not leave a button lit.
+ *
+ * No control takes focus (Qt::NoFocus): a focused button swallows the keys
+ * before keyPressEvent sees them, which would break every binding the moment
+ * someone clicked one — including the armed-parameter swallow.
+ *
+ * The row glyphs are QPainter vectors, like the rail's: the package ships no
+ * icon assets.
+ */
+class ControlPanel : public QWidget {
+public:
+    enum Id {
+        Spot = 0, Line, Rect, ToolNone,
+        Tracking, Alarm, Highlight,
+        FlipH, FlipV, FixedRange,
+        Still, Record, Gallery,
+        N_Ids
+    };
+
+    explicit ControlPanel(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setFixedWidth(kPanelW);
+        auto *outer = new QVBoxLayout(this);
+        outer->setContentsMargins(0, 0, 0, 0);
+        outer->setSpacing(0);
+
+        tabs_ = new QTabWidget(this);
+        tabs_->setFocusPolicy(Qt::NoFocus);
+        outer->addWidget(tabs_);
+        tabs_->addTab(build_troubleshoot(), QStringLiteral("Troubleshoot"));
+    }
+
+    /* A click on the control whose key is `key`.  Set by MainWindow, which owns
+     * the session and the one handle_key dispatch. */
+    std::function<void(int)> on_key;
+
+    QPushButton *button(Id i) const
+    {
+        return (i >= 0 && i < N_Ids) ? btn_[i] : nullptr;
+    }
+    QTabWidget *tabs() const { return tabs_; }
+
+    /* Bring every checkmark up to date with the frame just painted.  The
+     * session-derived states come from `snap`; the three that live on the
+     * canvas or the window (the marker toggle, a running clip, an open gallery)
+     * are passed in, because they are not in the snapshot. */
+    void sync(const dyt_snapshot_t &snap, bool hot_shown, bool recording,
+              bool gallery_open)
+    {
+        auto set = [](QPushButton *b, bool on) {
+            if (!b)
+                return;
+            const QSignalBlocker block(b);
+            b->setChecked(on);
+        };
+        set(btn_[Spot],      snap.tool == DYT_TOOL_POINT);
+        set(btn_[Line],      snap.tool == DYT_TOOL_LINE);
+        set(btn_[Rect],      snap.tool == DYT_TOOL_BOX);
+        set(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE);
+        set(btn_[Tracking],  hot_shown);
+        set(btn_[Alarm],     snap.alarm_on != 0);
+        set(btn_[Highlight], snap.iso_on != 0);
+        set(btn_[FlipH],     snap.xform.flip_h != 0);
+        set(btn_[FlipV],     snap.xform.flip_v != 0);
+        set(btn_[FixedRange], snap.range_mode != DYT_RANGE_AUTO);
+        set(btn_[Record],    recording);
+        set(btn_[Gallery],   gallery_open);
+    }
+
+private:
+    QGroupBox *group(const QString &title)
+    {
+        auto *g = new QGroupBox(title, this);
+        auto *lay = new QVBoxLayout(g);
+        lay->setContentsMargins(6, 4, 6, 6);
+        lay->setSpacing(3);
+        return g;
+    }
+
+    QPushButton *row(QGroupBox *g, Id id, const QString &text, int key,
+                     bool checkable)
+    {
+        auto *b = new QPushButton(text, g);
+        b->setObjectName(QStringLiteral("row"));
+        b->setFocusPolicy(Qt::NoFocus);
+        b->setCheckable(checkable);
+        b->setIconSize(QSize(18, 18));
+        QPixmap pm(18, 18);
+        pm.fill(Qt::transparent);
+        {   QPainter p(&pm);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            paint_icon(p, id, QRect(0, 0, 18, 18)); }
+        b->setIcon(QIcon(pm));
+        b->setToolTip(QStringLiteral("key: %1")
+                          .arg(QChar((char)key).toUpper()));
+        connect(b, &QPushButton::clicked, [this, key]() {
+            if (on_key)
+                on_key(key);
+        });
+        qobject_cast<QVBoxLayout *>(g->layout())->addWidget(b);
+        btn_[id] = b;
+        return b;
+    }
+
+    QWidget *build_troubleshoot()
+    {
+        auto *page = new QWidget;
+        auto *lay  = new QVBoxLayout(page);
+        lay->setContentsMargins(6, 6, 6, 6);
+        lay->setSpacing(8);
+
+        /* Temperature Measurement — one tool at a time, so an exclusive group
+         * keeps the checkmarks consistent with the session's single `tool`. */
+        QGroupBox *meas = group(QStringLiteral("Temperature Measurement"));
+        auto *mgrp = new QButtonGroup(this);
+        mgrp->setExclusive(true);
+        for (Id i : { Spot, Line, Rect, ToolNone })
+            mgrp->addButton(row(meas, i, tool_label(i), tool_key(i), true));
+        lay->addWidget(meas);
+
+        QGroupBox *hot = group(QStringLiteral("High Temperature"));
+        row(hot, Tracking,  QStringLiteral("High TEMP. Tracking"), 'm', true);
+        row(hot, Alarm,     QStringLiteral("High TEMP. Alarm"),    'a', true);
+        row(hot, Highlight, QStringLiteral("Highlight High TEMP. Area"),
+            'i', true);
+        lay->addWidget(hot);
+
+        QGroupBox *enh = group(QStringLiteral("Image Enhancement"));
+        row(enh, FlipH,      QStringLiteral("Flip horizontally"), 'h', true);
+        row(enh, FlipV,      QStringLiteral("Flip vertically"),   'H', true);
+        row(enh, FixedRange, QStringLiteral("Fixed range"),       't', true);
+        lay->addWidget(enh);
+
+        QGroupBox *cap = group(QStringLiteral("Capture"));
+        row(cap, Still,   QStringLiteral("Still"),       's', false);
+        row(cap, Record,  QStringLiteral("Record clip"), 'v', true);
+        row(cap, Gallery, QStringLiteral("Gallery"),     'g', true);
+        lay->addWidget(cap);
+
+        lay->addStretch(1);
+
+        /* Scrollable: the panel is taller than a short window, and a control
+         * the user cannot reach is the failure the whole on-screen-controls
+         * rule exists to prevent. */
+        auto *scroll = new QScrollArea(this);
+        scroll->setWidget(page);
+        scroll->setWidgetResizable(true);
+        scroll->setFocusPolicy(Qt::NoFocus);
+        scroll->setFrameShape(QFrame::NoFrame);
+        return scroll;
+    }
+
+    static QString tool_label(Id i)
+    {
+        switch (i) {
+        case Spot:     return QStringLiteral("Spot");
+        case Line:     return QStringLiteral("Line");
+        case Rect:     return QStringLiteral("Rectangle");
+        case ToolNone: return QStringLiteral("None");
+        default:       return QString();
+        }
+    }
+    static int tool_key(Id i)
+    {
+        switch (i) {
+        case Spot:     return 'p';
+        case Line:     return 'l';
+        case Rect:     return 'b';
+        case ToolNone: return 'n';
+        default:       return 0;
+        }
+    }
+
+    /* The row glyphs, 18x18.  Cyan strokes, the same accent as the rail. */
+    static void paint_icon(QPainter &p, Id id, const QRect &r)
+    {
+        const QColor cyan(QStringLiteral("#00b4d8"));
+        const QColor white(QStringLiteral("#e6e6e6"));
+        p.setPen(QPen(cyan, 1.3));
+        p.setBrush(Qt::NoBrush);
+        const int cx = r.center().x(), cy = r.center().y();
+
+        switch (id) {
+        case Spot:
+            /* a thermometer */
+            p.drawRoundedRect(cx - 2, cy - 7, 4, 9, 2, 2);
+            p.setBrush(cyan);
+            p.drawEllipse(QRectF(cx - 3.5, cy + 1, 7, 7));
+            break;
+        case Line:
+            p.drawLine(cx - 6, cy + 5, cx + 6, cy - 5);
+            p.setBrush(cyan);
+            p.drawEllipse(QPointF(cx - 6, cy + 5), 2, 2);
+            p.drawEllipse(QPointF(cx + 6, cy - 5), 2, 2);
+            break;
+        case Rect:
+            p.drawRect(cx - 6, cy - 5, 12, 10);
+            break;
+        case ToolNone:
+            p.drawEllipse(QPointF(cx, cy), 6, 6);
+            p.drawLine(cx - 5, cy + 5, cx + 5, cy - 5);
+            break;
+        case Tracking:
+            p.drawEllipse(QPointF(cx, cy), 4, 4);
+            p.drawLine(cx - 7, cy, cx - 2, cy);
+            p.drawLine(cx + 2, cy, cx + 7, cy);
+            p.drawLine(cx, cy - 7, cx, cy - 2);
+            p.drawLine(cx, cy + 2, cx, cy + 7);
+            break;
+        case Alarm:
+            /* a bell */
+            p.drawArc(QRectF(cx - 5, cy - 6, 10, 10), 0, 180 * 16);
+            p.drawLine(cx - 5, cy, cx - 5, cy + 3);
+            p.drawLine(cx + 5, cy, cx + 5, cy + 3);
+            p.drawLine(cx - 7, cy + 3, cx + 7, cy + 3);
+            p.setBrush(cyan);
+            p.drawEllipse(QPointF(cx, cy + 5), 1.6, 1.6);
+            break;
+        case Highlight:
+            /* a filled band inside a rectangle */
+            p.drawRect(cx - 7, cy - 5, 14, 10);
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawRect(cx - 7, cy - 1, 14, 3);
+            break;
+        case FlipH:
+            p.drawLine(cx, cy - 6, cx, cy + 6);
+            p.drawLine(cx - 7, cy - 3, cx - 2, cy);
+            p.drawLine(cx - 7, cy + 3, cx - 2, cy);
+            p.drawLine(cx + 7, cy - 3, cx + 2, cy);
+            p.drawLine(cx + 7, cy + 3, cx + 2, cy);
+            break;
+        case FlipV:
+            p.drawLine(cx - 6, cy, cx + 6, cy);
+            p.drawLine(cx - 3, cy - 7, cx, cy - 2);
+            p.drawLine(cx + 3, cy - 7, cx, cy - 2);
+            p.drawLine(cx - 3, cy + 7, cx, cy + 2);
+            p.drawLine(cx + 3, cy + 7, cx, cy + 2);
+            break;
+        case FixedRange:
+            p.drawLine(cx - 5, cy - 6, cx - 5, cy + 6);
+            p.drawLine(cx - 5, cy - 6, cx - 2, cy - 6);
+            p.drawLine(cx - 5, cy + 6, cx - 2, cy + 6);
+            p.drawLine(cx + 5, cy - 6, cx + 5, cy + 6);
+            p.drawLine(cx + 5, cy - 6, cx + 2, cy - 6);
+            p.drawLine(cx + 5, cy + 6, cx + 2, cy + 6);
+            break;
+        case Still:
+            /* a camera */
+            p.drawRect(cx - 7, cy - 4, 14, 9);
+            p.drawRect(cx - 3, cy - 6, 6, 3);
+            p.drawEllipse(QPointF(cx, cy + 0.5), 3, 3);
+            break;
+        case Record: {
+            /* a video camera */
+            p.drawRect(cx - 7, cy - 4, 9, 8);
+            QPolygon tri;
+            tri << QPoint(cx + 3, cy - 2) << QPoint(cx + 7, cy - 4)
+                << QPoint(cx + 7, cy + 4) << QPoint(cx + 3, cy + 2);
+            p.drawPolygon(tri);
+            break;
+        }
+        case Gallery:
+            /* stacked frames */
+            p.drawRect(cx - 7, cy - 5, 10, 8);
+            p.drawRect(cx - 4, cy - 7, 10, 8);
+            break;
+        case N_Ids:
+            break;
+        }
+    }
+
+    QTabWidget  *tabs_ = nullptr;
+    QPushButton *btn_[N_Ids] = {};
+};
+
 /* --------------------------------------------------------------- the window */
 
 class MainWindow : public QWidget {
@@ -2391,13 +2705,9 @@ public:
 
         /* The shell is the three-column Windows layout: a left icon rail, a
          * centre column holding the canvas and its status bar, and a right
-         * tabbed control panel.  Only the rail lands here; the panel is a
-         * QTabWidget that arrives with the Troubleshoot tab in a later step, so
-         * the window stays small enough for the offscreen test screen (800x800)
-         * to show the whole canvas — the pixel assertions are calibrated to an
-         * uncropped canvas, and 660 px of canvas + 260 px of panel does not fit.
-         * The menu bar and two toolbar rows still live in the centre column for
-         * now; they are retired once the rail and panel carry every action.
+         * tabbed control panel.  The menu bar and two toolbar rows still live
+         * in the centre column for now; they are retired once the rail and
+         * panel carry every action they expose.
          *
          * MainWindow stays a plain QWidget rather than becoming a QMainWindow.
          * QMainWindow::sizeHint() does not account for its menu and tool bar
@@ -2405,9 +2715,14 @@ public:
          * for the central widget alone and let the bars steal rows from the
          * canvas — clipping the picture.  As rows of the centre column's
          * QVBoxLayout they count towards QWidget::sizeHint() automatically, and
-         * the outer QHBoxLayout that holds rail | centre is itself a row of
-         * that same QWidget::sizeHint(). */
+         * the outer QHBoxLayout that holds rail | centre | panel is itself a
+         * row of that same QWidget::sizeHint(). */
         rail_  = new IconRail(this);
+        panel_ = new ControlPanel(this);
+        /* Every panel control runs the one dispatch, exactly as the rail does
+         * and as the menu items did. */
+        panel_->on_key = [this](int k) { handle_key(k); };
+
         auto *centre = new QWidget(this);
         auto *clay = new QVBoxLayout(centre);
         clay->setContentsMargins(0, 0, 0, 0);
@@ -2423,6 +2738,7 @@ public:
         lay->setSpacing(0);
         lay->addWidget(rail_, 0);
         lay->addWidget(centre, 1);
+        lay->addWidget(panel_, 0);
 
         setWindowTitle(kAppName);
         /* So 'R' reaches keyPressEvent rather than being dropped. */
@@ -2448,6 +2764,7 @@ public:
     }
 
     IconRail *rail() const { return rail_; }
+    ControlPanel *panel() const { return panel_; }
 
     FrameView   *view()  const { return view_; }
     StatusStrip *strip() const { return strip_; }
@@ -2791,6 +3108,15 @@ public:
         /* The device panel. */
         if (raw == 'd' && view_) {
             view_->toggle_info();
+            return 1;
+        }
+
+        /* The hottest/coldest markers, the Windows panel's Tracking switch.
+         * 'm' is free of every other binding (the tools are p/l/b/n, capture
+         * s/v, gallery g, retry r, panel d, quit q, and the ladders e/A/R/D/y
+         * and the view keys). */
+        if (raw == 'm' && view_) {
+            view_->toggle_hot();
             return 1;
         }
 
@@ -3217,11 +3543,21 @@ private:
         set(act_record_, strip_ && !strip_->recording_label().isEmpty());
         set(act_gallery_, gal_.open);
         set(act_fullscreen_, fullscreen_);
+
+        /* The panel's checkmarks, from the same snapshot plus the three states
+         * that live on the canvas or the window.  Synced here rather than from
+         * the button's own toggle, so a key the session refused cannot leave a
+         * button lit. */
+        if (panel_)
+            panel_->sync(snap_, view_ && view_->hot_shown(),
+                         strip_ && !strip_->recording_label().isEmpty(),
+                         gal_.open != 0);
     }
 
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
     IconRail    *rail_  = nullptr;   /* the left icon rail, a child of this */
+    ControlPanel *panel_ = nullptr;  /* the right tabbed panel, a child of this */
     dyt_session_t *sess_ = nullptr;      /* borrowed */
     /* The clip playing on the canvas, if any.  Borrowed from the pump, which
      * advances it — the same pattern as sess_: the window reads and steers the
@@ -3494,6 +3830,7 @@ struct key_line_t {
 static const key_line_t kKeyLines[] = {
     { "measurement", "  p l b n       point / line / box / clear\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
+    { "measurement", "  m             hottest/coldest markers on/off\n" },
     { "the device",  "  e A R D y     emissivity / ambient / reflected / distance, send\n" },
     { "the device",  "  d r           device panel / retry\n" },
     { "capture",     "  s v           save a still / record a clip\n" },
@@ -5471,6 +5808,79 @@ static int selftest(const opts &o)
         std::printf("  %-4s a menu action reaches the session like its key "
                     "(palette %d -> %d)\n", ok ? "ok" : "FAIL", before,
                     s.palette);
+        if (!ok)
+            fails++;
+    }
+
+    /* 50b. A control-panel button does what its key does.  The same rule as
+     * 50, one layer out: the panel is the Windows shell's second route to the
+     * same actions and must not become a second implementation.  The Line
+     * button must move the session exactly as 'l' does, and None must clear
+     * exactly as 'n' does. */
+    {
+        dyt_snapshot_t s{};
+        send_char('p');                         /* start somewhere to move from */
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool start = s.tool == DYT_TOOL_POINT;
+
+        QPushButton *line = win.panel()
+            ? win.panel()->button(ControlPanel::Line) : nullptr;
+        if (line)
+            line->click();
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool moved = s.tool == DYT_TOOL_LINE;
+
+        QPushButton *none = win.panel()
+            ? win.panel()->button(ControlPanel::ToolNone) : nullptr;
+        if (none)
+            none->click();
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool cleared = s.tool == DYT_TOOL_NONE;
+
+        const bool ok = start && line && moved && none && cleared;
+        std::printf("  %-4s a panel button reaches the session like its key "
+                    "(line %s, clear %s)\n", ok ? "ok" : "FAIL",
+                    moved ? "yes" : "NO", cleared ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 50c. The tracking key hides and shows the extremes markers.  'm' is a
+     * new binding for the Windows panel's Tracking switch; the markers were
+     * always drawn before, so this pins both that the key reaches the canvas
+     * flag and that the flag changes what is painted.  The two renders are
+     * compared as images rather than sampled at a coordinate: the marker's
+     * position depends on the transform the *painted* frame was rendered with,
+     * which the session's current snapshot need not still match, but "the
+     * drawing changed" holds regardless. */
+    {
+        /* Re-sync the canvas with the session first.  An earlier assertion
+         * changed the transform (super-resolution) without a frame being
+         * painted, and the marker projection is against the snapshot the
+         * *painted* frame was rendered with — so a stale frame would project
+         * the hot pixel off the image and the marker would silently not draw.
+         * In real use the pump repaints every tick and the two never diverge;
+         * here the pump is only stepped deliberately. */
+        pm.step();
+        QApplication::processEvents();
+
+        if (!fv->hot_shown())                   /* make sure they start on */
+            send_char('m');
+        const QImage on_img = fv->render_canvas();
+
+        send_char('m');
+        const bool   hid = !fv->hot_shown();
+        const QImage off_img = fv->render_canvas();
+
+        send_char('m');
+        const bool shown = fv->hot_shown();
+
+        const bool differ = on_img != off_img;
+        const bool ok = hid && shown && differ;
+        std::printf("  %-4s the tracking key hides and shows the extremes "
+                    "(hidden %s, back %s, drawing changed %s)\n",
+                    ok ? "ok" : "FAIL", hid ? "yes" : "NO",
+                    shown ? "yes" : "NO", differ ? "yes" : "NO");
         if (!ok)
             fails++;
     }
