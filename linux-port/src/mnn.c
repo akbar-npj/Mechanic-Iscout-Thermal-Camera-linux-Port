@@ -1,11 +1,11 @@
 /*
  * mnn.c — the super-resolution seam.  See mnn.h.
  *
- * What is here is real and tested: the shape contract, and a structural
- * validator for the extracted model.  What is deliberately *not* here is a call
- * into an MNN runtime — because this host has none, and code that cannot be
- * compiled or run is worse than an honest gap.  The exact integration is
- * recorded at the bottom of this file so that adding it is a local change.
+ * This file is plain C and runtime-free: the shape contract, the structural
+ * validator for the extracted model, and the dispatch to the runtime.  The
+ * runtime itself is C++ and lives in mnn_runtime.cpp, compiled only under
+ * DYT_HAVE_MNN; without it the entry points below refuse rather than invent a
+ * result (see the #else branch further down).
  *
  * The model itself is real and in the tree: models/zoom2.mnn, recovered from
  * libmnnmodel.so by RE Workspace/tools/extract_mnn_model.py.

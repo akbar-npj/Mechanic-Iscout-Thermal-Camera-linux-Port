@@ -385,7 +385,6 @@ static void test_differential(const char *model_path, const char *refdir)
 int main(int argc, char **argv)
 {
     const char *path   = argc > 1 ? argv[1] : "models/zoom2.mnn";
-    const char *refdir = argc > 2 ? argv[2] : REF_DIR_DEFAULT;
     uint8_t    *model = NULL;
     size_t      n = 0;
 
@@ -400,7 +399,12 @@ int main(int argc, char **argv)
     test_validator(model, n);
     test_bad_args();
 #ifdef DYT_HAVE_MNN
-    test_differential(model ? path : NULL, refdir);
+    /* The reference directory is only read by the differential, so it is scoped
+     * here: the no-runtime build has no use for it and must not warn about it. */
+    {
+        const char *refdir = argc > 2 ? argv[2] : REF_DIR_DEFAULT;
+        test_differential(model ? path : NULL, refdir);
+    }
 #else
     test_refusal();
 #endif

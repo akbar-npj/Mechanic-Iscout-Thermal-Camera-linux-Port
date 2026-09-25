@@ -3,25 +3,25 @@
  *
  * The vendor ships a 2x zoom model, recovered into models/zoom2.mnn (see
  * models/README.md for the mechanism and the shape contract).  Running it needs
- * an MNN runtime.  This port does not require one and the development host has
- * none, so this module is deliberately three things and nothing more:
+ * an MNN runtime, which this port does not require.  The module is three things:
  *
  *   1. the shape contract, as data — so the geometry is pinned in one place and
  *      asserted by a test rather than repeated as literals;
  *   2. a validator for the extracted model file, which needs no runtime at all
  *      (a flatbuffer's structure and names can be checked by hand);
- *   3. an upscale call that reports "unavailable" when no runtime is linked.
+ *   3. an upscale call that runs the model when a runtime is linked, and
+ *      reports DYT_MNN_UNAVAILABLE when it is not.
  *
  * It is **optional and non-default**.  Nothing in the engine calls it unless a
  * front-end asks, so a build that never touches this module behaves exactly the
  * same — which is the plan's requirement for Phase 8.
  *
- * The runtime call is the one piece deliberately left out: this host has no MNN
- * runtime, and unbuildable code is worse than a documented gap.  mnn.c records
- * the exact sequence to add (it is six calls, taken from the vendor's own sr1).
- *
- * Note what this module does *not* claim: the model has never been executed
- * here, so its numeric behaviour is unverified (models/README.md says so).
+ * The runtime half is C++ and lives in mnn_runtime.cpp, which the Makefile
+ * compiles only when an MNN runtime is present (DYT_HAVE_MNN).  Without it the
+ * entry points below fall back to the refusal described at each one.  With it,
+ * the model runs, and its output is pinned against the vendor's own mnn_run_2 to
+ * within one LSB (src/mnn_test.c, tools/mnn_diff/out/meta.txt) — including the
+ * NC4HW4 layout trap that a naive write into the session tensor falls into.
  *
  * build:  cc -O2 -g -Wall -Wextra -ffp-contract=off -I. -c mnn.c
  */
@@ -60,8 +60,8 @@ typedef struct {
 /* The contract above.  Never NULL. */
 const dyt_mnn_contract_t *dyt_mnn_contract(void);
 
-/* 1 when this build can actually run the model, 0 otherwise.  Always 0 in this
- * configuration, since no MNN runtime is linked. */
+/* 1 when this build can actually run the model — a runtime is linked and a
+ * model is loaded — 0 otherwise. */
 int dyt_mnn_available(void);
 
 /* Validate an image of the extracted model (models/zoom2.mnn).
@@ -76,10 +76,12 @@ int dyt_mnn_available(void);
  * -2 on a NULL argument or a buffer too short to be anything. */
 int dyt_mnn_model_check(const uint8_t *data, size_t n);
 
-/* Load the model from `path` and release it.  Both are no-ops here: without a
- * runtime there is nothing to load into, so dyt_mnn_load() reports
- * DYT_MNN_UNAVAILABLE rather than pretending.  Safe to call repeatedly;
- * unload is safe when nothing is loaded. */
+/* Load the model from `path` and release it.  With a runtime linked this
+ * validates the file, builds the session and resizes the tensors, returning 0
+ * on success; without one there is nothing to load into, so dyt_mnn_load()
+ * reports DYT_MNN_UNAVAILABLE rather than pretending.  Safe to call repeatedly
+ * (a second load while one is loaded is a no-op); unload is safe when nothing
+ * is loaded. */
 int  dyt_mnn_load(const char *path);
 void dyt_mnn_unload(void);
 
@@ -87,8 +89,9 @@ void dyt_mnn_unload(void);
  *
  * `in` is the contract's in_bytes; `out` must hold at least out_bytes, and
  * `out_cap` is how many bytes it really has.  Returns 0 and writes *out_n on
- * success, DYT_MNN_UNAVAILABLE when this build has no runtime (nothing is
- * written), -1 on a bad argument or an out_cap smaller than out_bytes.
+ * success, DYT_MNN_UNAVAILABLE when this build has no runtime or no model is
+ * loaded (nothing is written), -1 on a bad argument or an out_cap smaller than
+ * out_bytes.
  *
  * It never writes a partial or plausible-looking result when it cannot run the
  * model: the caller either gets the real upscale or a refusal. */
