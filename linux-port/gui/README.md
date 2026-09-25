@@ -25,6 +25,7 @@ MainWindow : QWidget
     ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide
     ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery
     ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
+    │   └── GalleryPanel          the saved-items list, an overlay child widget
     └── StatusStrip (stretch 0)   three left-aligned lines
 ```
 
@@ -59,7 +60,9 @@ The key's name therefore goes in the item's tooltip, not in its `shortcut`.
 Two menus are the exception, because they select an *absolute* value that no key
 can express: **Unit** (the `u` key cycles) and **Fusion** (the `f` key cycles).
 Each item is a single `dyt_session_set_*` call, so there is no rule for the two
-to disagree about.
+to disagree about. **File → Choose folder…** is the same kind of exception — it
+opens the directory dialog the panel's **Folder…** button opens, since no key
+can name a path — and it sets the one directory that browsing and saving share.
 
 The checkmarks come from the snapshot, not from the item's own toggle:
 `sync_actions()` runs after every painted frame and sets each action's state from
@@ -468,11 +471,11 @@ device's own reading changes, which is exactly what the read-back confirms.
 | `s` | save the current frame — a `.dyt.jpg` container and a `.png` |
 | `v` | start a clip; press it again to stop and finalise |
 
-Files land in `--capture-dir` (default `.`), named `dyt_<timestamp>.<ext>` by
-`dyt_vm_capture_name()` so a still and the clip started in the same second do not
-collide. `s` is a few milliseconds of work with nothing to keep between
-keypresses, so it writes straight away; `v` toggles the one clip, which the pump
-then feeds a frame per tick.
+Files land in `--capture-dir` (default the Pictures folder — see "The gallery"),
+named `dyt_<timestamp>.<ext>` by `dyt_vm_capture_name()` so a still and the clip
+started in the same second do not collide. `s` is a few milliseconds of work
+with nothing to keep between keypresses, so it writes straight away; `v` toggles
+the one clip, which the pump then feeds a frame per tick.
 
 **The still is the container, not just a picture.** `dyt_vm_write_still()` (which
 predates the window — `dytrec --still` uses it too) writes the DYT container: the
@@ -519,13 +522,36 @@ temporary directory and looks at the files that land.
 | `↑` / `k`, `↓` / `j` | move the highlight (wraps at both ends) |
 | `Return` / `o` | open the highlighted entry |
 | `x` | export the highlighted still as a PNG |
-| `Esc` | close the list and return to the live view |
+| `space` | pause or resume a playing clip |
+| `Esc` | close the list, or stop a playing clip, and return to the live view |
 
 The list is scanned from the same directory `s` and `v` write to, newest first,
 so it shows what this session and earlier ones saved. While it is up it has the
 keyboard: any key it does not bind is swallowed rather than reaching the tool,
 alarm or parameter bindings — a key that moved the highlight must not also
-change the tool.
+change the tool. A playing clip is the one state where the list is *not* up
+(opening an entry hides it), and `space`/`Esc` reach it there.
+
+**The panel is a real widget, not paint inside the canvas.** It used to be drawn
+in `FrameView::paintEvent`, *under* the display transform, from a code path the
+no-frame and degenerate-geometry early returns skipped — so it scaled with the
+picture and could fail to appear at all, which is what a fullscreen window
+showed. `GalleryPanel` is now a child widget composited in *widget* space: the
+transform cannot move it and no paint path can skip it. It also brought mouse
+selection with it. A click selects a row, a double-click opens it. Everything in
+the panel is `Qt::NoFocus`, because the keys belong to the window's single
+dispatch and a focusable list would swallow them the moment it was clicked;
+mouse events need no focus, so clicks work while the keys stay routed.
+
+**The header names the folder.** The one place a user can see where the files
+they are looking at actually are, and the button beside it (**Folder…**, or
+File → Choose folder…) changes it. One directory serves both browsing and
+saving, so what was saved is what the list shows; the choice sets the same
+`capture_dir` `s`/`v` write to and rides out at exit through the preferences.
+The default is the **Pictures folder** — `$XDG_PICTURES_DIR` when it names a real
+directory, else `$HOME` when it does, else `.` (`dyt_vm_default_capture_dir()`,
+pinned in `view_model_test`). A menu launch has no meaningful working directory,
+which is why the default is not `.` any more.
 
 **Opening a still re-renders it, it does not just show a JPEG.** The entry's
 container is opened as a frame source (`dyt_frame_source_open_still`) and
@@ -537,20 +563,32 @@ unopenable rather than shown wrong. The render happens in a throwaway session,
 so the live stream (if any) is never disturbed: the still is drawn as an
 *override* over the running pump, and closing the gallery simply clears it.
 
+**Opening a clip plays it.** `tools/player.h` is the reader, the mirror of the
+recorder: the same opaque C seam, the same OpenCV-only gate, and the opposite
+BGR↔RGB swap — `player_test` writes a colour-skewed frame through the writer and
+reads it back, so the two swaps cannot silently drift into a red/blue exchange.
+The window's half is a `PlaybackCtl` beside `CaptureCtl`: the pump advances it at
+its per-tick hook, so a clip keeps moving on the WAIT and no-frame ticks — which
+is exactly when a live stream has nothing to show and a recorded clip does — and
+each frame goes through the same `set_viewing()` override a still uses. The
+strip carries an amber `playing <name> 12/50` / `paused` badge on its middle
+line. `space` pauses without losing the position; `Esc`, or closing the list,
+stops the clip and returns to the live view. Opening an entry that fails (a
+truncated clip, a file that is not a clip) keeps the list up and says why on the
+strip, rather than hiding the panel over nothing.
+
 **Export writes the pixels you are looking at.** `x` renders the highlighted
 still the same way `o` does — the two share one `render_still()` so they cannot
 disagree — and writes it as a `dyt_<ts>.png` in the capture directory. That is
 the "same still, different palette" case the container exists to make possible.
-
-**A clip is listed but not played.** The port has no mp4 decoder wired into the
-window, so opening one says so rather than pretending. Export refuses a clip the
-same way. Both are honest gaps, not silent no-ops.
+A clip is refused: a PNG of one frame of it is not what the key means.
 
 The browsing state — the entries, the highlight, whether the list is up — is
 `dyt_vm_gallery_t` in the view model, because the rules that matter (wrap at the
 ends, keep the highlight on the same *file* across a rescan rather than the same
 index) are decisions a front end should not make twice, and they are pinned in
-`view_model_test`. The canvas only decides where the rows go.
+`view_model_test`. The panel is a view of that state, so the keyboard and the
+mouse cannot disagree about which row is selected.
 
 ## The toolkit decision — Qt6 Widgets
 
@@ -671,7 +709,7 @@ is unaffected.
 | `--frames N` | stop after N frames (default: run until closed) |
 | `--fps N` | timer rate (default 25) |
 | `--png PATH` | write the canvas here and exit |
-| `--capture-dir D` | where `s` (still) and `v` (clip) write (default `.`) |
+| `--capture-dir D` | where `s` (still), `v` (clip) and the gallery write/read (default the Pictures folder: `$XDG_PICTURES_DIR`, else `$HOME`, else `.`) |
 | `--prefs PATH` | preferences file (default `$DYT_PREFS`, else Qt's config location) |
 | `--no-prefs` | neither read nor write saved preferences |
 | `--selftest` | headless check over the fixture; needs no display |
@@ -700,11 +738,12 @@ only there because the port's super-resolution model was recovered against it.
 
 Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
 alarm and `i` shows the isotherm, `z`/`Z` turn on super-resolution, `s` saves a
-still and `v` records a clip, `g` browses what has been saved, `d` shows the
-device panel, and with `--live` the window reconnects on its own while `R`
-retries immediately — see "Measurement and alarm", "Super-resolution", "Capture:
-stills and clips" and "The gallery". `F11` is full screen, and the picture scales
-up to fill a window enlarged by hand — see "Fit to window and full screen".
+still and `v` records a clip, `g` browses what has been saved (and opens a still
+or plays a clip; `space` pauses it), `d` shows the device panel, and with
+`--live` the window reconnects on its own while `R` retries immediately — see
+"Measurement and alarm", "Super-resolution", "Capture: stills and clips" and
+"The gallery". `F11` is full screen, and the picture scales up to fill a window
+enlarged by hand — see "Fit to window and full screen".
 
 Everything the keys do is also on the **menu bar and toolbar**, and **Help →
 Keyboard shortcuts** opens a scrollable guide (`F1` and `?` open About instead).
@@ -763,7 +802,10 @@ $ ./build/dytqt --selftest
   ok   a clip starts, takes frames, and stops (start yes, label yes, fed yes, 5 frames, 1 file, gone yes)
   ok   a clip is refused where there is no disk (refused yes, says why yes)
   ok   the capture keys route (still 1, record 1)
-  ok   the gallery keys browse and open (open yes, move yes, swallow yes, opened 1, exported 1, closed yes, back to live yes)
+  ok   the gallery keys browse, open and export (open yes, move yes, swallow yes, opened 1, hid yes, exported 1, closed yes, back to live yes)
+  ok   the gallery is a real widget: up on 'g', painted and still up in fullscreen, names the folder (shown yes, folder yes, fullscreen yes, painted 9800 px, back yes, hidden yes)
+  ok   the gallery takes the mouse (rows 2, click selects yes, double-click opens yes)
+  ok   a clip plays, pauses and stops (open yes, 8 frames, moved yes, sized yes, magenta 49152 vs 0/0, badge yes, paused yes, resumed yes, stopped yes, refused a still yes)
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
@@ -861,9 +903,23 @@ refuses *and* says why; 41 pins that `s` and `v` reach
 `on_still_`/`on_record_` at all; 42 drives the real gallery keys and pins that
 `g` opens the list and rescans, the arrows move the highlight, `Return` and `x`
 reach their callbacks, a key the list does not bind is swallowed rather than
-reaching the tool, and closing returns to the live view. What they cannot pin is
-the mp4's playability and the container's parse — those were checked by hand
-against a real run (below).
+reaching the tool, opening hides the list, and closing returns to the live view.
+
+57–59 cover the gallery as it is now, and each pins a defect the painted version
+had. 57 requires the panel to be a real widget — visible on `g`, still visible
+and actually *painted* in fullscreen (a pixel diff, because `isVisible()` alone
+would not catch a widget that is up but never drawn), naming the folder, and
+hidden on close. 58 synthesizes a click and a double-click on a row and requires
+them to select and to open, because the painted list had no mouse handling at
+all: a click fell through to the canvas and placed a measurement tool. 59 writes
+a clip from a solid magenta frame and requires the canvas to show it — no
+thermal palette produces magenta, so counting those pixels in a canvas grab
+decides that the clip reached the screen, where a diff against the live frame
+would prove nothing, because a clip recorded from this session *is* the live
+frame. It also pins that `space` pauses without losing the position and that
+`Esc` stops and returns to live. The mp4's playability is pinned twice over:
+here, and by `tools/player_test.c` in `make check`, which round-trips a
+colour-skewed frame through the writer and back.
 
 43–48 cover the view keys, the preferences, the About box and
 super-resolution. 43 drives the
@@ -929,6 +985,13 @@ of three saved items, driven with `g`/`o`/`x`/`g`/`q`, drew the list (the
 screenshots show `gallery 1/3` with the highlight on the newest), opened the
 still (line 3 read `viewing dyt_20260925-192004.dyt.jpg`) and exported a fresh
 70 KB `256x192` PNG.
+
+Clip playback was checked the same way, through the real window under the
+offscreen platform (assertion 59) and a saved window grab: opening a clip put it
+on the canvas and the strip's middle line carried the amber `playing
+dyt_…-001916.mp4 2/8` badge, with line 2 elided to stop before it. The folder
+header showed the directory the list was scanned from, and the Pictures default
+is pinned in `view_model_test` rather than by eye.
 
 What these cannot pin is the write's real return code, the worker's `SetParam`
 branch, and the read-back itself, because all three need a live `dyt_capture_t`.
@@ -1259,15 +1322,16 @@ only when the session wrote a parameter — then abandons it the same way.
   the session cannot allocate the 2× buffers it renders plain for that frame
   while the status line still says `x2`. It takes a failed `realloc` on a
   512×384 frame to reach, and is not reachable from a test.
-* **No clip playback.** The gallery lists `.mp4` clips and reports their size,
-  but the window has no mp4 decoder wired in, so opening one says so instead of
-  playing it. Export refuses a clip for the same reason. A recorded clip is
-  still playable by anything that reads mp4 (`ffplay`, `dytrec`'s output is a
-  normal h264 file) — what is missing is playback *inside* the app.
-* **A still being viewed has no colour bar and no measurement.** The override
-  draws the image and names it, but the bar and the tool overlays belong to the
-  live session's snapshot and range, which a still's render does not share.
-  Measuring a saved still is a later task.
+* **Playback is tick-paced, not time-based, and cannot seek.** A clip advances
+  one frame per pump tick, so it plays at the window's `--fps` regardless of the
+  rate it was recorded at — a 25 fps clip is right at the default, and a clip
+  recorded at another rate plays at the wrong speed. There is no seeking, no
+  loop counter beyond the reader's own wrap, and no audio (the clips carry
+  none). The decoder is OpenCV's ffmpeg backend, so it reads what that reads.
+* **A still or a playing clip has no colour bar and no measurement.** The
+  override draws the image and names it, but the bar and the tool overlays
+  belong to the live session's snapshot and range, which a still's render does
+  not share. Measuring a saved still is a later task.
 * **High-DPI and scaling.** The window paints at 1:1 device pixels, and the
   pointer math assumes it: at a device pixel ratio above 1 Qt scales the drawn
   image, so a widget coordinate would no longer be an image pixel and a click
