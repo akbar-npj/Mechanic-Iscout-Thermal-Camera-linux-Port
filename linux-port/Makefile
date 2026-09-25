@@ -154,14 +154,15 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/alarm.o $(BUILD)/session.o $(BUILD)/params.o \
             $(BUILD)/visible.o $(BUILD)/fusion.o $(BUILD)/session_capture.o \
             $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
-            $(BUILD)/mnn.o
+            $(BUILD)/mnn.o $(BUILD)/view_model.o
 
 TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/calib_test $(BUILD)/pipeline_test $(BUILD)/palette_test \
          $(BUILD)/units_test $(BUILD)/display_test $(BUILD)/measure_test \
          $(BUILD)/alarm_test $(BUILD)/session_test $(BUILD)/params_test \
          $(BUILD)/visible_test $(BUILD)/fusion_test $(BUILD)/jpeg_test \
-         $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test
+         $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test \
+         $(BUILD)/view_model_test
 TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
 # capture_demo and probe talk to the device directly through libusb — only
 # buildable with it.  capture_demo's prereq on $(UVC_LIB) is what pulls the
@@ -276,6 +277,15 @@ $(BUILD)/alarm_test: src/alarm_test.c $(LIB) | $(BUILD)
 $(BUILD)/session_test: src/session_test.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+# view_model_test pins the toolkit-independent layer lifted out of
+# tools/dytview.cpp: the status and readout wording, the colour-bar ticks, the
+# device panel's rows, the runtime-parameter arm/confirm machine, and the
+# pointer-to-tool mapping.  It exists so the OpenCV viewer and the Qt6 app
+# cannot drift apart, so the assertions are exact strings and exact
+# transitions.  No hardware, no window.
+$(BUILD)/view_model_test: src/view_model_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 # params_test pins the device's stored-parameter encodings against the
 # literals in MechaniscoutPcap/4.pcapng and the live read-back.  No hardware.
 $(BUILD)/params_test: src/params_test.c $(LIB) | $(BUILD)
@@ -379,6 +389,7 @@ check: all
 	@$(BUILD)/measure_test
 	@$(BUILD)/alarm_test
 	@$(BUILD)/session_test
+	@$(BUILD)/view_model_test
 	@$(BUILD)/params_test
 	@$(BUILD)/visible_test testdata/mode1000_256x384_default.raw
 	@$(BUILD)/fusion_test

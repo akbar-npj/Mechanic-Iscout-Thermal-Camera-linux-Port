@@ -37,12 +37,11 @@
 #include <opencv2/imgproc.hpp>
 
 #include "capture.h"
-#include "dytjpeg.h"     /* the DYT still container (Phase 6) */
 #include "imgwrite.h"    /* dyt_write_png, for the canvas snapshot */
-#include "jpeg.h"        /* dyt_jpeg_encode */
 #include "palette.h"     /* DYT_PALETTE_N, for the colour bar */
 #include "session.h"
 #include "session_capture.h"
+#include "view_model.h"  /* what to show: status text, ticks, panels, ladders */
 
 /* ------------------------------------------------------------------ config */
 
@@ -69,14 +68,18 @@ struct viewer {
     int have_info = 0;
     int show_info = 1;
 
-    std::vector<float> temps;         /* scratch for the per-frame snapshot */
-    int mouse_x = -1, mouse_y = -1;
+    /* The per-frame temperature plane, and the snapshot scratch it grows in.
+     * The grow-and-retry is the view model's now (view_model.h). */
+    dyt_vm_scratch_t scr = DYT_VM_SCRATCH_INIT;
+
+    /* The pointer, in the shape the view model wants: last position, plus
+     * whether a drag is open.  The placement rules are its too. */
+    dyt_vm_pointer_t ptr = DYT_VM_POINTER_INIT;
 
     /* Measurement.  The tool mirrors the session's, and the geometry below is
      * the *last rendered* frame, so a mouse click can be mapped from window
      * coordinates back to source pixels. */
     dyt_tool_t tool = DYT_TOOL_NONE;
-    int        dragging = 0;
     dyt_view_transform_t xform{};
     int src_w = 0, src_h = 0, dst_w = 0, dst_h = 0;
 
@@ -111,31 +114,12 @@ struct viewer {
  * than being copied into every front-end.  The viewer only creates the
  * adapter and hands it to dyt_capture_start(). */
 
-/* Take a consistent snapshot, growing the scratch buffer if the frame size
- * changed.  The session reports the new geometry on -2 precisely so this
- * retry is possible.
- *
- * The temperature plane is always requested, because the hover readout needs
- * random access to it.  Note the deliberate 1-element seed: dyt_session_
- * snapshot() only takes the too-small path when temps_out is non-NULL, and an
- * empty std::vector's data() may be NULL, which would silently skip the copy.
- * Seeding guarantees a non-NULL buffer, so the first call reports the real
- * geometry on -2 and we size it exactly. */
+/* Take a consistent snapshot.  This used to be a grow-and-retry loop here;
+ * it is now dyt_vm_grab() (view_model.h), because the Qt6 app needs exactly
+ * the same dance and the two must not drift. */
 static bool grab(viewer *v, dyt_snapshot_t &snap)
 {
-    if (v->temps.empty())
-        v->temps.resize(1);
-
-    for (int attempt = 0; attempt < 4; attempt++) {
-        int rc = dyt_session_snapshot(v->sess, &snap, v->temps.data(),
-                                      static_cast<int>(v->temps.size()));
-        if (rc == 0)
-            return true;
-        if (rc == -1)
-            return false;                       /* no frame yet */
-        v->temps.resize(static_cast<size_t>(snap.width) * snap.height);
-    }
-    return false;
+    return dyt_vm_grab(v->sess, &snap, &v->scr) != 0;
 }
 
 /* ---------------------------------------------------------------- drawing */
@@ -156,13 +140,13 @@ static cv::Scalar pal_bgr(const dyt_palette_t *p, int idx)
                       p->rgb[idx * 3 + 0]);
 }
 
-/* A temperature in the selected unit, e.g. "31.2 C".  The unit conversion is
- * the library's (units.c), so the viewer and the Qt6 app cannot disagree. */
-static std::string tstr(dyt_unit_t u, float celsius)
+/* A temperature in the selected unit, e.g. "31.2 C".  The conversion and the
+ * failure rule are the view model's, so the viewer and the Qt6 app cannot
+ * disagree about either. */
+static std::string tstr(const dyt_snapshot_t &s, float celsius)
 {
     char b[32];
-    if (dyt_temp_format(u, celsius, b, sizeof b) < 0)
-        std::snprintf(b, sizeof b, "---");
+    dyt_vm_temp(&s, celsius, b, sizeof b);
     return std::string(b);
 }
 
@@ -177,93 +161,54 @@ static std::string tstr(dyt_unit_t u, float celsius)
  * stray keypress visibly changes the reading.
  */
 
-/* The candidate values each key cycles through.  Short and widely spaced on
- * purpose: this is a proving ground for "does the write reach the device",
- * not a full parameter editor. */
-struct param_ladder {
-    int         type;               /* dyt_order_type_t */
-    const char *name;
-    int         n;
-    const float *vals;
-};
-
-static const float kEmisVals[] = { 1.00f, 0.95f, 0.90f, 0.80f, 0.50f, 0.10f };
-static const float kAmbVals[]  = { 20.f, 25.f, 30.f, 40.f, 60.f };
-static const float kReflVals[] = { 20.f, 25.f, 30.f, 40.f, 100.f };
-static const float kDistVals[] = { 0.10f, 0.50f, 1.00f, 2.00f, 5.00f, 10.00f };
-
-static const param_ladder kLadders[] = {
-    { DYT_ORDER_EMISSIVITY, "emissivity", 6, kEmisVals },
-    { DYT_ORDER_AMBIENT,    "ambient",    5, kAmbVals  },
-    { DYT_ORDER_REFLECTED,  "reflected",  5, kReflVals },
-    { DYT_ORDER_DISTANCE,   "distance",   6, kDistVals },
-};
-
-static const param_ladder *ladder_for(int type)
-{
-    for (const param_ladder &L : kLadders)
-        if (L.type == type)
-            return &L;
-    return nullptr;
-}
-
-/* A candidate value with its unit, e.g. "0.10" / "25.0 C" / "1.00 m". */
+/* The candidate values each key cycles through live in the view model
+ * (dyt_vm_ladder, view_model.h) — short and widely spaced on purpose, because
+ * this is a proving ground for "does the write reach the device", not a full
+ * parameter editor.  So do the arming rules; only the wording stays here. */
 static std::string param_value_str(int type, float v)
 {
     char b[32];
-    if (type == DYT_ORDER_EMISSIVITY)
-        std::snprintf(b, sizeof b, "%.2f", (double)v);
-    else if (type == DYT_ORDER_DISTANCE)
-        std::snprintf(b, sizeof b, "%.2f m", (double)v);
-    else
-        std::snprintf(b, sizeof b, "%.1f C", (double)v);
+    dyt_vm_param_format((dyt_order_type_t)type, v, b, sizeof b);
     return std::string(b);
 }
 
 /* The Phase-4 key handler.  A parameter key arms a candidate value; only a
- * following `y` sends it.  While something is armed every other key is
- * swallowed (except `q`), so a stray keypress cannot slip past the
- * confirmation.  Returns 1 if the key was consumed. */
+ * following `y` sends it.  The decision is the view model's
+ * (dyt_vm_param_key), since it is the same rule for any front-end; what stays
+ * here is the wording and the write itself.  Returns 1 if the key was
+ * consumed. */
 static int handle_param_key(viewer *v, dyt_capture_t *cap, int key)
 {
-    int type = (key == 'e') ? DYT_ORDER_EMISSIVITY :
-               (key == 'A') ? DYT_ORDER_AMBIENT    :
-               (key == 'R') ? DYT_ORDER_REFLECTED  :
-               (key == 'D') ? DYT_ORDER_DISTANCE   : 0;
+    dyt_vm_param_event_t ev;
 
-    if (type) {
-        const param_ladder *L = ladder_for(type);
-        /* Re-pressing the same key advances the candidate; a different key
-         * starts its own ladder at the first rung. */
-        v->pend_rung  = (v->pend_type == type) ? (v->pend_rung + 1) % L->n : 0;
-        v->pend_type  = type;
-        v->pend_value = L->vals[v->pend_rung];
+    if (!dyt_vm_param_key(key, (dyt_order_type_t)v->pend_type, v->pend_rung,
+                          &ev))
+        return 0;
+
+    if (ev.action == DYT_VM_PARAM_ARMED) {
+        v->pend_type  = ev.type;
+        v->pend_rung  = ev.rung;
+        v->pend_value = ev.value;
         return 1;
     }
 
-    if (!v->pend_type)
-        return 0;                       /* nothing armed: not ours */
-
-    if (key == 'q')
-        return 0;                       /* never swallow quit */
-
-    if (key == 'y' || key == 'Y') {
-        const param_ladder *L = ladder_for(v->pend_type);
-        int rc = dyt_capture_set_param(cap, v->pend_type, v->pend_value);
+    if (ev.action == DYT_VM_PARAM_SEND) {
+        const dyt_vm_ladder_t *L = dyt_vm_ladder(ev.type);
+        int rc = dyt_capture_set_param(cap, ev.type, ev.value);
         char b[96];
         if (rc == 0) {
-            uint16_t raw = (v->pend_type == DYT_ORDER_EMISSIVITY ||
-                            v->pend_type == DYT_ORDER_DISTANCE)
-                               ? dyt_param_encode_ratio(v->pend_value)
-                               : dyt_param_encode_kelvin(v->pend_value);
-            v->override_on[v->pend_type] = 1;
-            v->override_v[v->pend_type]  = v->pend_value;
+            uint16_t raw = (ev.type == DYT_ORDER_EMISSIVITY ||
+                            ev.type == DYT_ORDER_DISTANCE)
+                               ? dyt_param_encode_ratio(ev.value)
+                               : dyt_param_encode_kelvin(ev.value);
+            v->override_on[ev.type] = 1;
+            v->override_v[ev.type]  = ev.value;
             std::snprintf(b, sizeof b, "set %s = %s  (sent)", L->name,
-                          param_value_str(v->pend_type, v->pend_value).c_str());
+                          param_value_str(ev.type, ev.value).c_str());
             std::fprintf(stderr, "dytview: set %s = %s -> raw %u (type %d)\n",
                          L->name,
-                         param_value_str(v->pend_type, v->pend_value).c_str(),
-                         (unsigned)raw, v->pend_type);
+                         param_value_str(ev.type, ev.value).c_str(),
+                         (unsigned)raw, ev.type);
         } else {
             std::snprintf(b, sizeof b, "set %s FAILED (rc %d)", L->name, rc);
             std::fprintf(stderr, "dytview: set %s FAILED (rc %d)\n",
@@ -275,15 +220,15 @@ static int handle_param_key(viewer *v, dyt_capture_t *cap, int key)
         return 1;
     }
 
-    if (key == 'n' || key == 'N' || key == 27) {
-        v->msg = std::string("cancelled: ") + ladder_for(v->pend_type)->name;
+    if (ev.action == DYT_VM_PARAM_CANCEL) {
+        v->msg = std::string("cancelled: ") + dyt_vm_ladder(ev.type)->name;
         v->msg_ttl = 90;
         v->pend_type = 0;
         return 1;
     }
 
-    /* Any other key while armed is ignored, so a stray palette key cannot
-     * slip past a pending confirmation. */
+    /* SWALLOW: any other key while armed is ignored, so a stray palette key
+     * cannot slip past a pending confirmation. */
     return 1;
 }
 
@@ -348,7 +293,10 @@ static void draw_confirm_prompt(cv::Mat &canvas, const viewer *v)
     if (!v->pend_type)
         return;
 
-    const param_ladder *L = ladder_for(v->pend_type);
+    const dyt_vm_ladder_t *L = dyt_vm_ladder((dyt_order_type_t)v->pend_type);
+    if (!L)
+        return;
+
     std::string s = std::string("SET ") + L->name + " = " +
                     param_value_str(v->pend_type, v->pend_value) +
                     "    y = send    n / esc = cancel";
@@ -369,76 +317,27 @@ static void draw_confirm_prompt(cv::Mat &canvas, const viewer *v)
  * image and already carries the measurement state. */
 static void draw_info_panel(cv::Mat &canvas, const viewer *v)
 {
+    dyt_vm_info_t info;
+
     if (!v->have_info || !v->show_info)
         return;
 
-    const dyt_device_info_t &d = v->info;
-    std::vector<std::string> lines;
-    char b[96];
-
-    lines.push_back(std::string("serial  ") +
-                    (d.have_sn ? d.sn_str : "(read failed)"));
-
-    if (d.have_usn) {
-        if (d.usn_len >= 0) {
-            std::snprintf(b, sizeof b, "user    %s%s  (key %u)", d.usn_str,
-                          d.usn_variant ? "  (variant C)" : "",
-                          (unsigned)d.usn_key);
-        } else {
-            std::snprintf(b, sizeof b, "user    (raw read; no key)");
-        }
-        lines.push_back(b);
-    }
-
-    /* A parameter's effective value: the runtime override if this session
-     * sent one, else the value read at start-up.  A trailing `*` flags an
-     * override, so the panel never silently shows a superseded stored value
-     * (a write is volatile and cannot be re-read while streaming — §4.8). */
-    auto pv = [&](int type, float stored, const char *fmt) {
-        char t[40];
-        std::snprintf(t, sizeof t, fmt,
-                      (double)(v->override_on[type] ? v->override_v[type]
-                                                    : stored));
-        return std::string(t) + (v->override_on[type] ? "*" : "");
-    };
-    auto over = [&](int type) { return v->override_on[type] != 0; };
-
-    bool any_over = false;
-    for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++)
-        any_over = any_over || over(t);
-
-    if ((d.radio.ok & DYT_RADIO_REFLECTED) || over(DYT_ORDER_REFLECTED) ||
-        (d.radio.ok & DYT_RADIO_AMBIENT)    || over(DYT_ORDER_AMBIENT)) {
-        lines.push_back("refl " + pv(DYT_ORDER_REFLECTED,
-                                     dyt_radiometry_reflected_c(&d.radio), "%.2f") +
-                        " C   amb " +
-                        pv(DYT_ORDER_AMBIENT,
-                           dyt_radiometry_ambient_c(&d.radio), "%.2f") + " C");
-    }
-    if ((d.radio.ok & DYT_RADIO_EMISSIVITY) || over(DYT_ORDER_EMISSIVITY) ||
-        (d.radio.ok & DYT_RADIO_DISTANCE)   || over(DYT_ORDER_DISTANCE)) {
-        lines.push_back("emis " + pv(DYT_ORDER_EMISSIVITY,
-                                     dyt_radiometry_emissivity(&d.radio), "%.4f") +
-                        "   dist " +
-                        pv(DYT_ORDER_DISTANCE,
-                           dyt_radiometry_distance_m(&d.radio), "%.4f") + " m");
-    }
-    std::snprintf(b, sizeof b, "params %d/%d slots%s", d.params_read, DYT_PARAM_N,
-                  any_over ? "   (* = set this session)" : "");
-    lines.push_back(b);
+    /* The rows and their wording are the view model's; this only draws them. */
+    if (dyt_vm_info(&v->info, v->override_v, v->override_on, &info) < 0)
+        return;
 
     const int pad = 6, lh = 17;
     int wmax = 0;
-    for (const std::string &s : lines)
-        wmax = std::max(wmax, 10 + static_cast<int>(s.size()) * 8);
+    for (int i = 0; i < info.n; i++)
+        wmax = std::max(wmax,
+                        10 + static_cast<int>(std::strlen(info.line[i])) * 8);
 
-    cv::Rect box(6, 6, wmax + 2 * pad, lh * static_cast<int>(lines.size()) + 2 * pad);
+    cv::Rect box(6, 6, wmax + 2 * pad, lh * info.n + 2 * pad);
     cv::rectangle(canvas, box, cv::Scalar(16, 16, 16), cv::FILLED);
     cv::rectangle(canvas, box, cv::Scalar(120, 120, 120), 1);
 
-    for (size_t i = 0; i < lines.size(); i++)
-        put_text(canvas, lines[i], box.x + pad,
-                 box.y + pad + lh * static_cast<int>(i) + 12,
+    for (int i = 0; i < info.n; i++)
+        put_text(canvas, info.line[i], box.x + pad, box.y + pad + lh * i + 12,
                  cv::Scalar(190, 225, 255));
 }
 
@@ -497,21 +396,12 @@ static cv::Mat render(viewer *v)
     cv::cvtColor(img, bgr, cv::COLOR_RGB2BGR);
 
     /* ---- isotherm overlay: dim everything outside the alarm band, so the
-     * pixels that would trip the alarm stand out. ---- */
-    if (snap.iso_on && v->temps.size() >= static_cast<size_t>(npix)) {
-        for (int yy = 0; yy < h; yy++) {
-            uint8_t *row = bgr.ptr<uint8_t>(yy);
-            for (int xx = 0; xx < w; xx++) {
-                float t = v->temps[static_cast<size_t>(yy) * w + xx];
-                bool  inside = (t == t) && t >= snap.iso_lo && t <= snap.iso_hi;
-                if (!inside) {
-                    row[xx * 3 + 0] = static_cast<uint8_t>(row[xx * 3 + 0] / 2);
-                    row[xx * 3 + 1] = static_cast<uint8_t>(row[xx * 3 + 1] / 2);
-                    row[xx * 3 + 2] = static_cast<uint8_t>(row[xx * 3 + 2] / 2);
-                }
-            }
-        }
-    }
+     * pixels that would trip the alarm stand out.  The pass is the view
+     * model's: it is a plain buffer operation, so it needs no toolkit and
+     * there is no reason for a second copy of it. ---- */
+    if (snap.iso_on && v->scr.cap >= npix && bgr.isContinuous())
+        dyt_vm_apply_isotherm(bgr.data, w, h, v->scr.temps, v->scr.cap,
+                              snap.iso_lo, snap.iso_hi);
 
     /* Mirror and zoom are applied here, after the render, which is exactly the
      * order dyt_view_transform_map()/project() assume. */
@@ -547,8 +437,9 @@ static cv::Mat render(viewer *v)
         dyt_palette_builtin(&pal, 0);
 
     for (int j = 0; j < barH; j++) {
-        float u   = barH > 1 ? 1.f - static_cast<float>(j) / (barH - 1) : 1.f;
-        int   idx = static_cast<int>(u * (DYT_PALETTE_N - 1) + 0.5f);
+        int idx = dyt_vm_bar_index(j, barH);
+        if (idx < 0)
+            continue;
         cv::rectangle(canvas, cv::Rect(x0, j, kBarW, 1), pal_bgr(&pal, idx),
                       cv::FILLED);
     }
@@ -556,11 +447,15 @@ static cv::Mat render(viewer *v)
                   cv::Scalar(200, 200, 200), 1);
 
     const int lx = x0 + kBarW + 4;
-    put_text(canvas, tstr(snap.unit, snap.hi), lx, 12, cv::Scalar(255, 255, 255));
-    put_text(canvas, tstr(snap.unit, (snap.lo + snap.hi) * 0.5f), lx, barH / 2,
-             cv::Scalar(210, 210, 210));
-    put_text(canvas, tstr(snap.unit, snap.lo), lx, barH - 3,
-             cv::Scalar(255, 255, 255));
+    {
+        char lbl[32];
+        dyt_vm_bar_label(&snap, 0, lbl, sizeof lbl);
+        put_text(canvas, lbl, lx, 12, cv::Scalar(255, 255, 255));
+        dyt_vm_bar_label(&snap, 1, lbl, sizeof lbl);
+        put_text(canvas, lbl, lx, barH / 2, cv::Scalar(210, 210, 210));
+        dyt_vm_bar_label(&snap, 2, lbl, sizeof lbl);
+        put_text(canvas, lbl, lx, barH - 3, cv::Scalar(255, 255, 255));
+    }
 
     /* ---- hot/cold markers ---- */
     {
@@ -574,7 +469,7 @@ static cv::Mat render(viewer *v)
                 return;
             cv::circle(canvas, cv::Point(cx, cy), 5, cv::Scalar(0, 0, 0), 2);
             cv::circle(canvas, cv::Point(cx, cy), 5, col, 1);
-            put_text(canvas, std::string(tag) + " " + tstr(snap.unit, c),
+            put_text(canvas, std::string(tag) + " " + tstr(snap, c),
                      cx + 8, cy - 6, col);
         };
         mark(snap.stats.hot_x, snap.stats.hot_y, snap.stats.hi,
@@ -584,24 +479,24 @@ static cv::Mat render(viewer *v)
     }
 
     /* ---- hover readout: the temperature under the pointer ---- */
-    if (v->mouse_x >= 0 && v->mouse_y >= 0 &&
-        v->mouse_x < big.cols && v->mouse_y < big.rows) {
+    if (v->ptr.x >= 0 && v->ptr.y >= 0 &&
+        v->ptr.x < big.cols && v->ptr.y < big.rows) {
         int ix = 0, iy = 0;
         if (dyt_view_transform_map(&snap.xform, w, h, big.cols, big.rows,
-                                   v->mouse_x, v->mouse_y, &ix, &iy) == 0) {
-            float t = v->temps[static_cast<size_t>(iy) * w + ix];
+                                   v->ptr.x, v->ptr.y, &ix, &iy) == 0) {
+            float t = v->scr.temps[static_cast<size_t>(iy) * w + ix];
             std::string s = (t == t)
-                ? tstr(snap.unit, t) + "  (" + std::to_string(ix) + "," +
+                ? tstr(snap, t) + "  (" + std::to_string(ix) + "," +
                       std::to_string(iy) + ")"
                 : std::string("---  (") + std::to_string(ix) + "," +
                       std::to_string(iy) + ")";
-            put_text(canvas, s, v->mouse_x + 10, v->mouse_y - 8,
+            put_text(canvas, s, v->ptr.x + 10, v->ptr.y - 8,
                      cv::Scalar(255, 255, 255), 0.5);
-            cv::line(canvas, cv::Point(v->mouse_x - 6, v->mouse_y),
-                     cv::Point(v->mouse_x + 6, v->mouse_y),
+            cv::line(canvas, cv::Point(v->ptr.x - 6, v->ptr.y),
+                     cv::Point(v->ptr.x + 6, v->ptr.y),
                      cv::Scalar(0, 0, 0), 1);
-            cv::line(canvas, cv::Point(v->mouse_x, v->mouse_y - 6),
-                     cv::Point(v->mouse_x, v->mouse_y + 6),
+            cv::line(canvas, cv::Point(v->ptr.x, v->ptr.y - 6),
+                     cv::Point(v->ptr.x, v->ptr.y + 6),
                      cv::Scalar(0, 0, 0), 1);
         }
     }
@@ -625,7 +520,7 @@ static cv::Mat render(viewer *v)
                 cv::circle(canvas, cv::Point(cx, cy), 7, cv::Scalar(0, 0, 0), 2);
                 cv::circle(canvas, cv::Point(cx, cy), 7,
                            cv::Scalar(0, 255, 255), 1);
-                put_text(canvas, "P " + tstr(snap.unit, snap.point_c),
+                put_text(canvas, "P " + tstr(snap, snap.point_c),
                          cx + 10, cy - 8, cv::Scalar(0, 255, 255), 0.5);
             }
         }
@@ -658,10 +553,10 @@ static cv::Mat render(viewer *v)
                     char buf[160];
                     std::snprintf(buf, sizeof buf,
                                   "min %s  max %s  avg %s  med %s",
-                                  tstr(snap.unit, snap.roi.min).c_str(),
-                                  tstr(snap.unit, snap.roi.max).c_str(),
-                                  tstr(snap.unit, snap.roi.mean).c_str(),
-                                  tstr(snap.unit, snap.roi.median).c_str());
+                                  tstr(snap, snap.roi.min).c_str(),
+                                  tstr(snap, snap.roi.max).c_str(),
+                                  tstr(snap, snap.roi.mean).c_str(),
+                                  tstr(snap, snap.roi.median).c_str());
                     put_text(canvas, buf, r.x + 4, r.y - 6,
                              cv::Scalar(0, 255, 255), 0.5);
                 }
@@ -675,83 +570,17 @@ static cv::Mat render(viewer *v)
     /* ---- pending-write confirmation (Phase 4), on top of everything ---- */
     draw_confirm_prompt(canvas, v);
 
-    /* ---- status strip ---- */
+    /* ---- status strip ----
+     *
+     * Both lines are the view model's, so the Qt6 status bar shows exactly
+     * these strings rather than a re-worded copy of them (view_model.h). */
     {
-        const char *mm = snap.xform.flip_h && snap.xform.flip_v ? "HV" :
-                         snap.xform.flip_h ? "H" : snap.xform.flip_v ? "V" : "-";
+        char status[256];
+        char info[512];
 
-        /* Fusion sits on the first line because it is a view mode, like the
-         * palette.  A pattern that cannot be honoured on this frame — the AD
-         * output mode has no visible half — is called out rather than left to
-         * look like it is working. */
-        std::string fus = "fusion " + std::string(snap.fusion_name);
-        if (snap.fusion_dx || snap.fusion_dy) {
-            char fb[32];
-            std::snprintf(fb, sizeof fb, " %+d,%+d", snap.fusion_dx,
-                          snap.fusion_dy);
-            fus += fb;
-        }
-        if (!snap.fusion_active && snap.fusion != DYT_FUSION_INFRARED)
-            fus += " (no visible plane)";
-
-        std::string status =
-            std::string(v->mode == DYT_MODE_44C  ? "mode 0x44c" :
-                        v->mode == DYT_MODE_1000 ? "mode 1000" : "mode ?") +
-            " | " + fus +
-            " | " + snap.palette_name +
-            " " + std::to_string(snap.palette + 1) + "/" +
-                  std::to_string(snap.palette_n) +
-            " | " + (dyt_unit_suffix(snap.unit) ? dyt_unit_suffix(snap.unit) : "?") +
-            " | x" + std::to_string(snap.xform.zoom) + mm +
-            " | " + std::to_string(static_cast<long>(snap.seq)) + " frames";
-
-        /* Second line: the measurement and alarm state.  Kept compact — the
-         * strip is only as wide as the image, and the unit is already on the
-         * line above, so the numbers here carry no suffix. */
-        auto num = [&](float celsius) {
-            char b[24];
-            std::snprintf(b, sizeof b, "%.1f",
-                          (double)dyt_temp_convert(snap.unit, celsius));
-            return std::string(b);
-        };
-
-        std::string info;
-        switch (snap.tool) {
-        case DYT_TOOL_POINT:
-            info = "point " + (snap.point_ok ? tstr(snap.unit, snap.point_c)
-                                             : std::string("--"));
-            break;
-        case DYT_TOOL_LINE: {
-            char b[64];
-            std::snprintf(b, sizeof b, "line (%d,%d)-(%d,%d)",
-                          snap.p0.x, snap.p0.y, snap.p1.x, snap.p1.y);
-            info = b;
-            break;
-        }
-        case DYT_TOOL_BOX: {
-            char b[80];
-            std::snprintf(b, sizeof b, "box (%d,%d)-(%d,%d) n=%d",
-                          snap.p0.x, snap.p0.y, snap.p1.x, snap.p1.y,
-                          snap.roi.n);
-            info = b;
-            break;
-        }
-        case DYT_TOOL_NONE:
-        default:
-            info = "tool: none (p point, l line, b box, n clear)";
-            break;
-        }
-
-        if (snap.alarm_on)
-            info += "  |  alarm " + std::string(dyt_alarm_name(snap.alarm)) +
-                    " " + num(snap.alarm_lo) + ".." + num(snap.alarm_hi);
-        if (snap.iso_on) {
-            char b[48];
-            std::snprintf(b, sizeof b, "  |  iso %ld px", snap.iso.count);
-            info += b;
-        }
-        if (!v->msg.empty())
-            info += "  |  " + v->msg;
+        dyt_vm_status_line(&snap, v->mode, status, sizeof status);
+        dyt_vm_readout_line(&snap, v->msg.empty() ? nullptr : v->msg.c_str(),
+                            info, sizeof info);
 
         cv::rectangle(canvas, cv::Rect(0, barH - kStatusH, big.cols, kStatusH),
                       cv::Scalar(16, 16, 16), cv::FILLED);
@@ -784,77 +613,43 @@ static cv::Mat render(viewer *v)
 static void on_mouse(int event, int x, int y, int flags, void *user)
 {
     (void)flags;
-    viewer *v = static_cast<viewer *>(user);
+    viewer           *v = static_cast<viewer *>(user);
+    dyt_vm_mouse_ev_t ev;
 
-    v->mouse_x = x;
-    v->mouse_y = y;
-
-    if (v->tool == DYT_TOOL_NONE)
-        return;
-
-    int sx = 0, sy = 0;
-    bool ok = dyt_view_transform_map(&v->xform, v->src_w, v->src_h,
-                                     v->dst_w, v->dst_h, x, y, &sx, &sy) == 0;
-
-    if (event == cv::EVENT_LBUTTONDOWN) {
-        v->dragging = 1;
-        if (ok) {
-            dyt_session_set_point(v->sess, 0, sx, sy);
-            dyt_session_set_point(v->sess, 1, sx, sy);
-        }
-        return;
+    switch (event) {
+    case cv::EVENT_LBUTTONDOWN: ev = DYT_VM_MOUSE_DOWN; break;
+    case cv::EVENT_MOUSEMOVE:   ev = DYT_VM_MOUSE_MOVE; break;
+    case cv::EVENT_LBUTTONUP:   ev = DYT_VM_MOUSE_UP;   break;
+    default:                    return;
     }
-    if (event == cv::EVENT_MOUSEMOVE && v->dragging) {
-        if (ok)
-            dyt_session_set_point(v->sess, 1, sx, sy);
-        return;
-    }
-    if (event == cv::EVENT_LBUTTONUP) {
-        v->dragging = 0;
-    }
+
+    /* The placement rules — a press sets both points, a drag moves point 1, a
+     * release ends the drag — are the view model's, because a Qt widget needs
+     * exactly the same ones (view_model.h).  All that stays here is the
+     * mapping from OpenCV's event codes. */
+    dyt_vm_tool_mouse(v->sess, &v->ptr, ev, v->tool, &v->xform,
+                      v->src_w, v->src_h, v->dst_w, v->dst_h, x, y);
 }
 
-/* ------------------------------------------------------------------ palettes */
-
-static std::string exe_dir(void)
-{
-    char    buf[4096];
-    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-    if (n <= 0)
-        return "";
-    buf[n] = '\0';
-    std::string s(buf);
-    size_t p = s.rfind('/');
-    return p == std::string::npos ? "" : s.substr(0, p);
-}
-
-/* Find the palette directory: an explicit --palette-dir wins, then the usual
- * locations relative to the cwd and to the binary. */
+/* ------------------------------------------------------------------ palettes
+ *
+ * Both of these are the view model's: the Qt6 app has to find palettes/ and
+ * stamp a filename the same way, so a second copy here would be a second
+ * answer.
+ */
 static std::string find_palette_dir(const std::string &dir_opt)
 {
-    std::vector<std::string> dirs;
-    if (!dir_opt.empty())
-        dirs.push_back(dir_opt);
-    dirs.push_back("palettes");
-    dirs.push_back("../palettes");
-    std::string ed = exe_dir();
-    if (!ed.empty()) {
-        dirs.push_back(ed + "/palettes");
-        dirs.push_back(ed + "/../palettes");
-    }
-    for (size_t i = 0; i < dirs.size(); i++) {
-        if (access(dirs[i].c_str(), R_OK) == 0)
-            return dirs[i];
-    }
-    return "";
+    char b[4096];
+    if (!dyt_vm_find_palette_dir(dir_opt.empty() ? nullptr : dir_opt.c_str(),
+                                 b, sizeof b))
+        return "";
+    return std::string(b);
 }
 
 static void stamp_now(char *out, size_t n)
 {
-    std::time_t now = std::time(nullptr);
-    std::tm tm{};
-    localtime_r(&now, &tm);
-    std::strftime(out, n, "%Y%m%d-%H%M%S", &tm);
+    if (dyt_vm_timestamp(out, n) != 0 && n > 0)
+        out[0] = '\0';
 }
 
 /* Write the whole canvas (overlays, bar, status strip included) as a PNG, via
@@ -882,80 +677,30 @@ static void save_canvas_png(viewer *v, const cv::Mat &canvas)
 }
 
 /* Write a DYT still (Phase 6): the rendered picture as JPEG, with the device's
- * own raw payload and the frame geometry spliced in as APP2 segments
- * (dytjpeg.h).  A vendor tool can open it and re-render the raw data with its
- * own palette and range, which a plain PNG cannot carry.
+ * own raw payload and the frame geometry spliced in as APP2 segments, so a
+ * vendor tool can open it and re-render the raw data with its own palette and
+ * range — which a plain PNG cannot carry.
+ *
+ * The build is the view model's (dyt_vm_write_still), because the Qt6 app's
+ * capture button needs the same file; what stays here is choosing the name
+ * and reporting the outcome.
  *
  * The raw payload comes from the session, not from dyt_capture_last_raw():
  * that pointer is only valid on the frame callback thread. */
 static void save_dyt_still(viewer *v)
 {
-    dyt_snapshot_t snap;
-    std::vector<uint8_t>  rgb;
-    std::vector<uint16_t> raw;
-    uint8_t *jpg = nullptr;
-    size_t   jlen = 0;
-    int      w = 0, h = 0, n;
-    uint8_t  blob[DYT_DYT_BLOB_SIZE];
-    unsigned flags;
-    char     stamp[32], path[128];
-
-    if (dyt_session_snapshot(v->sess, &snap, nullptr, 0) != 0 || !snap.ready) {
-        v->msg = "still: no live frame yet"; v->msg_ttl = 120; return;
-    }
-    if (!snap.have_raw) {
-        v->msg = "still: no raw payload"; v->msg_ttl = 120; return;
-    }
-
-    rgb.resize((size_t)snap.width * snap.height * 3);
-    if (dyt_session_render_rgb(v->sess, rgb.data(), (int)rgb.size(),
-                               &w, &h) != 0) {
-        v->msg = "still: render failed"; v->msg_ttl = 120; return;
-    }
-
-    if (dyt_jpeg_encode(rgb.data(), w, h, 85, &jpg, &jlen) != 0) {
-        v->msg = "still: JPEG encode failed"; v->msg_ttl = 120; return;
-    }
-
-    /* The geometry the still records is the *payload's*, so a reader knows how
-     * to interpret the raw samples: the thermal plane is height rows of it,
-     * and anything above that is the visible half. */
-    flags = snap.raw_total_rows > snap.height ? DYT_DYT_FLAG_DUAL_HALF : 0u;
-    if (dyt_dyt_blob_init(blob, sizeof blob, snap.width, snap.height,
-                          snap.raw_total_rows, flags) != 0) {
-        std::free(jpg);
-        v->msg = "still: bad geometry"; v->msg_ttl = 120; return;
-    }
-
-    raw.resize((size_t)snap.raw_n);
-    n = dyt_session_raw(v->sess, raw.data(), (int)raw.size());
-    if (n != snap.raw_n) {
-        std::free(jpg);
-        v->msg = "still: raw payload changed under us"; v->msg_ttl = 120;
-        return;
-    }
+    char stamp[32], path[128], msg[256];
 
     stamp_now(stamp, sizeof stamp);
     std::snprintf(path, sizeof path, "dytview_%s.jpg", stamp);
 
-    if (dyt_dyt_write(path, jpg, jlen, blob, sizeof blob,
-                      reinterpret_cast<const uint8_t *>(raw.data()),
-                      raw.size() * sizeof(uint16_t)) != 0) {
-        std::free(jpg);
-        v->msg     = std::string("cannot write ") + path;
+    if (dyt_vm_write_still(v->sess, path, msg, sizeof msg) != 0) {
+        v->msg     = msg[0] ? msg : "still: failed";
         v->msg_ttl = 120;
         return;
     }
-    std::free(jpg);
-
-    {
-        char b[256];
-        std::snprintf(b, sizeof b, "wrote %s  (%dx%d, %zu raw bytes)",
-                      path, snap.width, snap.raw_total_rows,
-                      raw.size() * sizeof(uint16_t));
-        v->msg = b;
-    }
-    v->msg_ttl = 120;
+    v->msg     = msg;
+    v->msg_ttl = 120;               /* ~3.6 s at the 30 ms poll */
     std::printf("%s\n", v->msg.c_str());
     std::fflush(stdout);
 }
