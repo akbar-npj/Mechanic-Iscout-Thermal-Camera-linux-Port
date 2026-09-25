@@ -498,10 +498,14 @@ position-independent.
 | `--palette N` | 1-based palette index (default 1) |
 | `--palette-dir D` | where the `*.dat` ramps live (default: search) |
 | `--zoom N` | window magnification (default 2) |
+| `--unit N` | temperature unit: 0 = C, 1 = F, 2 = K (default C) |
+| `--fusion N` | fusion pattern index (default 0 = infrared only) |
 | `--frames N` | stop after N frames (default: run until closed) |
 | `--fps N` | timer rate (default 25) |
 | `--png PATH` | write the canvas here and exit |
 | `--capture-dir D` | where `s` (still) and `v` (clip) write (default `.`) |
+| `--prefs PATH` | preferences file (default `$DYT_PREFS`, else Qt's config location) |
+| `--no-prefs` | neither read nor write saved preferences |
 | `--selftest` | headless check over the fixture; needs no display |
 | `--live` | stream from the camera instead of replaying a fixture |
 | `--vid V --pid P` | USB vendor/product id (`0x0000 0x0000` = first matching device) |
@@ -514,6 +518,11 @@ position-independent.
 sources — and the contradiction is refused rather than silently resolved one way.
 `--width` is the one flag that means the same thing in both modes: the sensor's
 width, whether that width comes from a file or the camera.
+
+An explicit flag always beats a stored preference: the file is loaded first and
+the command line is applied over it, so `--unit 1` wins over a saved `unit=0`
+without touching the file. `--no-prefs` is what the selftest uses, so a test run
+cannot clobber a developer's saved state.
 
 The default live path is the device's own **dual-half** frame (256×384, payload
 order unneeded), which is the same default `dytview` and `dytrec` ship. `--ad-output`
@@ -664,6 +673,19 @@ reaching the tool, and closing returns to the live view. What they cannot pin is
 the mp4's playability and the container's parse — those were checked by hand
 against a real run (below).
 
+43–46 cover the view keys, the preferences and the About box. 43 drives the
+bindings the reference viewer's letters map to — palette digits, `.`/`,`, `u`,
+`t`, `h`/`H`, `+`/`-` — through the real window and reads the session back, and
+pins that `h` and `H` move *different* axes (an unconditional fold would make
+them the same key); the palette count is read from the snapshot rather than
+hard-coded, so a change in the ramps cannot silently invalidate the test. 44
+writes a preferences file, reads it back, and checks that a command-line value
+beats a stored one; it runs under `--no-prefs` so it cannot touch a developer's
+own file. 45 pins that `?` and F1 both reach the About action. 46 checks the
+About text names the app and the version the package carries — which is what a
+stale About box would fail, and, through `-DDYT_VERSION`, what ties the box to
+the Makefile's `VERSION`.
+
 The capture and the gallery were checked end to end through the real window as
 well: a fixture run driven with `s`/`v`/`v`/`q` wrote a `.dyt.jpg` (219 KB), a
 `.png` (70 KB, `file` says `PNG image data, 256 x 192, 8-bit/color RGB`) and an
@@ -684,6 +706,64 @@ teardown read-back, and the same line appeared on the `r` reconnect path; a
 separate `probe --read --param 3` read the slot as `128  1.0000` where it had
 been `127  0.9922`. The original value was written back afterwards, and confirmed
 by read-back.
+
+## Packaging
+
+```
+make install                          # PREFIX=/usr/local by default
+make install DESTDIR=/tmp/stage PREFIX=/usr
+make uninstall
+make deb                              # build/dytqt_<version>_<arch>.deb
+```
+
+`install` lays out the freedesktop locations under `DESTDIR`/`PREFIX`:
+
+| path | what |
+|---|---|
+| `$(BINDIR)/dytqt` | the binary |
+| `$(DATADIR)/applications/dytqt.desktop` | the desktop entry |
+| `$(DATADIR)/icons/hicolor/<N>x<N>/apps/dytqt.png` | 16, 24, 32, 48, 64, 128, 256 |
+| `$(DATADIR)/dytqt/palettes/*.dat` | the 28 vendor palettes |
+
+The palettes are not optional decoration: the engine falls back to **six**
+built-in ramps when it cannot find them, so a package that shipped none would
+silently offer 6 of 28 — which is exactly what happened before they were added
+here. `dyt_vm_find_data_dir()` searches `<datadir>/dytqt/<leaf>` under each
+`$XDG_DATA_DIRS` entry (default `/usr/local/share:/usr/share`), the location
+both `/usr` and `/usr/local` installs use, so an installed binary finds them
+from any cwd. Running from the source tree still prefers the tree's own
+`palettes/`, which the search tries first.
+
+The icon is rasterised from `packaging/dytqt.svg` at install time, at 8-bit
+RGBA (the default was 16-bit, which some icon loaders handle poorly), so
+`make install` needs ImageMagick (`magick` or `convert`).
+
+`deb` wraps that same layout with `dpkg-deb`, so the file list cannot drift
+from `install`. Two details are worth knowing:
+
+* **`Depends` is measured when it can be, and says so when it cannot.** With
+  `dpkg-shlibdeps` (from `dpkg-dev`) present it is read off the binary's
+  `NEEDED` entries; otherwise the recipe falls back to `DEB_DEPENDS` and prints
+  which path it took, so a guess is never mistaken for a measurement. The
+  default names Debian bookworm's OpenCV soname packages — override
+  `DEB_DEPENDS` for another release.
+* **The staged binary is stripped** (3.4 MB → 334 KB). `make install` keeps its
+  symbols, so a local install stays debuggable.
+
+This build host is Fedora, so the `.deb` is a cross-format artifact: `dpkg-deb`
+builds and inspects it, but nothing in the tree installs it.
+
+`make check` runs `packaging/check.sh`, which pins the cross-file invariants a
+syntax linter cannot see: that the entry's `Exec`, `Icon` and `StartupWMClass`
+name the binary the Makefile installs, the icon it ships, and the WM_CLASS the
+app actually sets — `("dytqt","dytqt")`, measured with `xprop`, not assumed —
+and that the icon rasterises to something non-blank at 16 and 256 px. A typo in
+any of those validates cleanly and still launches nothing, which is the failure
+that check exists to catch.
+
+The version is single-sourced: the Makefile's `VERSION` feeds `-DDYT_VERSION`
+for the GUI and names the package, so the About box and the `.deb` cannot
+disagree.
 
 ## Where the frames come from, and on which thread
 
