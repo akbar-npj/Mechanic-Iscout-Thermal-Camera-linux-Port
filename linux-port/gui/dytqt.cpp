@@ -2158,6 +2158,48 @@ static double retry_delay_s(int attempt)
     return d > kCap ? kCap : d;
 }
 
+/* ---------------------------------------------------------- the key list
+ *
+ * One table, two renderings.  The About box shows the bare list; the Help
+ * dialog shows the same lines under their headings.  The two therefore cannot
+ * disagree about what a key does — the same rule the status lines follow — and
+ * --selftest pins that they do not.
+ *
+ * The lines are stored *whole* rather than formatted from a label and a
+ * description.  About's output is what a user reads off a screenshot, and a
+ * `%-14s` that is one column off would be a silent regression no test would
+ * name.  A key that needs a heading of its own goes in as its own group. */
+
+struct key_line_t {
+    const char *group;
+    const char *line;
+};
+
+static const key_line_t kKeyLines[] = {
+    { "measurement", "  p l b n       point / line / box / clear\n" },
+    { "measurement", "  a i           alarm / isotherm\n" },
+    { "the device",  "  e A R D y     emissivity / ambient / reflected / distance, send\n" },
+    { "the device",  "  d r           device panel / retry\n" },
+    { "capture",     "  s v           save a still / record a clip\n" },
+    { "capture",     "  g o x         gallery: browse / open / export\n" },
+    { "the picture", "  1-0 , .       palette        u  unit\n" },
+    { "the picture", "  t             range auto/fixed\n" },
+    { "the picture", "  h H           flip horizontally / vertically\n" },
+    { "the picture", "  + -           zoom\n" },
+    { "the picture", "  z Z           super-resolve the visible / thermal plane\n" },
+    { "the picture", "  f [ ] ; '     fusion pattern, alignment\n" },
+    { "the window",  "  q             quit\n" },
+};
+
+/* The bare list, in the order About has always shown it. */
+static std::string key_list_text()
+{
+    std::string s;
+    for (const key_line_t &k : kKeyLines)
+        s += k.line;
+    return s;
+}
+
 /* ------------------------------------------------------------- selftest
  *
  * The offline check.  It runs the same path the window does, under
@@ -2167,9 +2209,11 @@ static double retry_delay_s(int attempt)
  * populated, and the canvas actually painted more than one colour.
  */
 
-/* Defined with the About action below; the selftest reads it to check the
- * version it reports and the super-resolution line. */
+/* Defined with the About action below; the selftest reads them to check the
+ * version About reports, the super-resolution line, and that the guide covers
+ * every key the About list does. */
 static std::string about_text(bool have_model = false);
+static std::string help_text();
 
 static int selftest(const opts &o)
 {
@@ -3560,7 +3604,13 @@ static int selftest(const opts &o)
     /* 46. The About text names the app and the version the package carries, and
      * reports the one thing the build's feature macros cannot: whether a model
      * was actually loaded.  kAppVersion is the Makefile's VERSION when built
-     * that way, so this is also what a stale About box would fail. */
+     * that way, so this is also what a stale About box would fail.
+     *
+     * The last two conditions are the guard for the *shared* key list: About
+     * renders it verbatim, and the guide renders the same lines under their
+     * headings.  A key added to the table and forgotten by one of them is
+     * exactly the drift this catches, and it is checked here rather than
+     * against a copy of the list because a copy is the thing that drifts. */
     {
         const std::string t  = about_text(true);
         const std::string t0 = about_text(false);
@@ -3570,10 +3620,22 @@ static int selftest(const opts &o)
         const bool keys  = t.find("z Z") != std::string::npos;
         const bool model = t.find("a model is loaded") != std::string::npos &&
                            t0.find("no model loaded") != std::string::npos;
-        const bool ok = named && keys && model;
+
+        const std::string list  = key_list_text();
+        const std::string guide = help_text();
+        const bool shared = !list.empty() &&
+                            t.find(list) != std::string::npos;
+        bool covered = !list.empty() && guide.find(kAppName) != std::string::npos;
+        for (const key_line_t &k : kKeyLines)
+            if (guide.find(k.line) == std::string::npos)
+                covered = false;
+
+        const bool ok = named && keys && model && shared && covered;
         std::printf("  %-4s the About text names the app and its version "
-                    "(%s), the SR keys and the model state\n",
-                    ok ? "ok" : "FAIL", kAppVersion);
+                    "(%s), the SR keys, the model state and the shared key "
+                    "list (about %s, guide %s)\n",
+                    ok ? "ok" : "FAIL", kAppVersion, shared ? "yes" : "NO",
+                    covered ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -4041,6 +4103,56 @@ private:
  * MNN" says a runtime is linked, not that a model was found and loaded.  The
  * two are separate failures and the SR keys behave differently under each, so
  * the box says which one it is. */
+/* ---------------------------------------------------------- the help guide
+ *
+ * The guide: what the app is, how to start, then the shared key list under its
+ * headings.  Reached from Help -> Keyboard shortcuts and the toolbar.  About
+ * shows the bare list; both render kKeyLines, so the two cannot disagree. */
+static std::string help_text()
+{
+    std::string s;
+
+    s += std::string(kAppName) + " - how to use it\n\n";
+    s += "This window shows the picture from a DYT / Mechanic-Ti USB thermal\n";
+    s += "camera.  With no camera attached it replays a saved raw frame instead,\n";
+    s += "so the app is still useful for looking at a recording.  Every pixel and\n";
+    s += "every string comes from libdyt, the same engine the command-line viewer\n";
+    s += "(tools/dytview) draws with, so the two always agree.\n\n";
+
+    s += "getting started\n";
+    s += "  * Drag on the picture to place the selected tool (point, line or box)\n";
+    s += "    and read a temperature.  The reading appears in the strip below the\n";
+    s += "    picture, beside the frame's hottest and coldest pixels (marked H and\n";
+    s += "    L on the picture).\n";
+    s += "  * Everything the keys do is also on the menu bar and the toolbar, so a\n";
+    s += "    key you have forgotten can be found there.  The two cannot disagree:\n";
+    s += "    a menu item runs exactly what its key runs.\n";
+    s += "  * 's' saves a still and 'v' records a clip, into the capture directory\n";
+    s += "    (the current directory by default); 'g' browses what has been saved.\n";
+    s += "  * F11 is full screen.  The picture scales up to fill the screen, keeping\n";
+    s += "    its shape, with the leftover margin in black; F11 again restores the\n";
+    s += "    window.  A window enlarged by hand scales the same way.\n";
+    s += "  * 'd' shows the device's own identity and its stored parameters; the\n";
+    s += "    panel is drawn over the picture.\n\n";
+
+    s += "keys\n";
+    const char *group = nullptr;
+    for (const key_line_t &k : kKeyLines) {
+        if (!group || std::strcmp(group, k.group) != 0) {
+            group = k.group;
+            s += "  ";
+            s += group;
+            s += "\n";
+        }
+        s += k.line;
+    }
+
+    s += "\nthe runtime parameters (e A R D) arm a value that 'y' then sends and\n";
+    s += "Esc cancels.  While one is armed it takes the keyboard, so a stray key\n";
+    s += "cannot slip past a pending write.\n";
+    return s;
+}
+
 static std::string about_text(bool have_model)
 {
     std::string s;
@@ -4063,19 +4175,8 @@ static std::string about_text(bool have_model)
     s += "\nsuper-resolution: ";
     s += have_model ? "a model is loaded (2x)\n" : "no model loaded\n";
     s += "\nkeys\n";
-    s += "  p l b n       point / line / box / clear\n";
-    s += "  a i           alarm / isotherm\n";
-    s += "  e A R D y     emissivity / ambient / reflected / distance, send\n";
-    s += "  d r           device panel / retry\n";
-    s += "  s v           save a still / record a clip\n";
-    s += "  g o x         gallery: browse / open / export\n";
-    s += "  1-0 , .       palette        u  unit\n";
-    s += "  t             range auto/fixed\n";
-    s += "  h H           flip horizontally / vertically\n";
-    s += "  + -           zoom\n";
-    s += "  z Z           super-resolve the visible / thermal plane\n";
-    s += "  f [ ] ; '     fusion pattern, alignment\n";
-    s += "  q             quit\n";
+    s += key_list_text();
+    s += "\nHelp -> Keyboard shortcuts has the full guide.\n";
     return s;
 }
 
