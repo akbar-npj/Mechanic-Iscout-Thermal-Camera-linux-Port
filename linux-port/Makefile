@@ -285,8 +285,11 @@ endif
 # The mp4 recorder (Phase 7) needs only OpenCV: its fixture and --selftest paths
 # are device-free, so it is useful — and testable — on a host with no libusb.
 # Live recording additionally needs libuvc, which is linked only when present.
+#
+# player_test is the reader's gate and needs only OpenCV too — it round-trips a
+# synthetic frame through the writer and back, so it is device-free.
 ifdef HAVE_OPENCV
-TOOLS += $(BUILD)/dytrec
+TOOLS += $(BUILD)/dytrec $(BUILD)/player_test
 endif
 
 # The mp4 writer both dytrec and the Qt app's `v` key drive.  It needs OpenCV,
@@ -295,6 +298,15 @@ endif
 REC_OBJ :=
 ifdef HAVE_OPENCV
 REC_OBJ := $(BUILD)/recorder.o
+endif
+
+# The mp4 reader, the writer's mirror: the Qt app's gallery plays clips through
+# it.  OpenCV-gated like the writer, so a build without OpenCV has neither and
+# the gallery says clips need OpenCV rather than failing to link.  player_test
+# links both objects to pin them as a symmetric pair.
+PLAY_OBJ :=
+ifdef HAVE_OPENCV
+PLAY_OBJ := $(BUILD)/player.o
 endif
 
 # The Qt6 GUI shell.  Like dytrec, its fixture and --selftest paths are
@@ -530,8 +542,23 @@ $(BUILD)/poll_model_test: tools/poll_model_test.c $(BUILD)/frame_source.o $(LIB)
 $(BUILD)/recorder.o: tools/recorder.cpp tools/recorder.h $(FLAG_STAMP) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -Itools -c $< -o $@
 
+# The shared mp4 reader, beside the writer it mirrors.
+$(BUILD)/player.o: tools/player.cpp tools/player.h $(FLAG_STAMP) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Itools -c $< -o $@
+
+# dytrec links only the writer: it records, and the reader is a separate seam
+# with its own gate (player_test, below).
 $(BUILD)/dytrec: tools/dytrec.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
 	$(CXX) $(CXXFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) -o $@
+
+# The reader/writer round-trip.  The test is C and drives both seams through
+# their C headers, but the objects behind them are C++ over OpenCV, so it is
+# compiled as C and linked with $(CXX) — the same shape as mnn_test.
+$(BUILD)/player_test.o: tools/player_test.c tools/recorder.h tools/player.h $(HDRS) | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/player_test: $(BUILD)/player_test.o $(REC_OBJ) $(PLAY_OBJ) | $(BUILD)
+	$(CXX) $(BUILD)/player_test.o $(REC_OBJ) $(PLAY_OBJ) $(LDLIBS) $(CV_LIBS) -o $@
 
 # The Qt6 GUI shell.  It links the same two pieces as dytrec — the port library
 # and the frame source — plus Qt6 Widgets.  The frame source is the seam that
@@ -539,14 +566,16 @@ $(BUILD)/dytrec: tools/dytrec.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_sou
 # libuvc it is the live camera, and the GUI code does not change between them.
 # $(UVC_LINK) is empty when libusb is absent, exactly as for dytrec.  $(REC_OBJ)
 # and $(CV_LIBS) are empty when OpenCV is: the app then has no `v` key and says
-# so, rather than failing at the first recorded frame.  $(MNN_LIBS) is empty
-# when there is no MNN runtime: the app then reports no model at start-up and
-# the SR keys refuse, which is the same shape the other optional features take.
+# so, rather than failing at the first recorded frame.  $(PLAY_OBJ) is the same
+# gate for clip playback — without OpenCV the gallery refuses a clip with a
+# message naming OpenCV instead of failing to link.  $(MNN_LIBS) is empty when
+# there is no MNN runtime: the app then reports no model at start-up and the SR
+# keys refuse, which is the same shape the other optional features take.
 #
 # -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
 # it relatively, whereas gui/dytqt.cpp does not.
-$(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(MNN_DEP) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(QT_DEFS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(MNN_LIBS) $(QT6_LIBS) -o $@
+$(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h tools/player.h $(REC_OBJ) $(PLAY_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(MNN_DEP) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(QT_DEFS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(PLAY_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(MNN_LIBS) $(QT6_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.
@@ -592,6 +621,8 @@ endif
 ifdef HAVE_OPENCV
 	@echo "== mp4 recorder self-test =="
 	@$(BUILD)/dytrec --selftest
+	@echo "== mp4 reader/writer round-trip =="
+	@$(BUILD)/player_test
 endif
 ifdef HAVE_QT6
 	@echo "== Qt6 GUI self-test =="
