@@ -127,6 +127,11 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 | `n` | no tool, and forget the placed points |
 | `a` | arm the alarm, or disarm it if already armed |
 | `i` | toggle the isotherm |
+| `d` | show or hide the device panel |
+
+The runtime-parameter keys and `r` (retry) and `q` (quit) are routed *before*
+these and are case-sensitive, so they are documented separately — see "Runtime
+parameters and the device panel" below.
 
 One gesture covers all three tools: a press places **both** points, a move while
 the button is held moves point 1, and a release ends the drag — so a click leaves
@@ -165,6 +170,79 @@ every pixel is outside it. And the armed band is fixed at the moment `a` is
 pressed, so a camera whose auto-range later settles elsewhere will show an alarm
 that no longer matches the scene — the honest consequence of a derived band, and
 the reason explicit thresholds are a later task.
+
+### Runtime parameters and the device panel
+
+The four radiometric parameters the device stores — emissivity, ambient,
+reflected, distance — are the only thing the port ever *writes* to the camera.
+A parameter key only **arms** a candidate; nothing is sent until the user
+confirms, because the device applies these immediately and a stray keypress
+would visibly change the reading.
+
+| key | case | effect |
+|---|---|---|
+| `e` | lowercase | arm emissivity; pressing it again advances the ladder |
+| `A` | Shift | arm ambient |
+| `R` | Shift | arm reflected |
+| `D` | Shift | arm distance |
+| `y` | either | send the armed candidate |
+| `n` | either | cancel (also the measurement "no tool" key when nothing is armed) |
+| `Esc` | — | cancel |
+| `d` | lowercase | show or hide the device panel |
+| `q` | lowercase | quit — never swallowed, even while armed |
+| `r` | lowercase | retry the device (#87) |
+
+**The letters are case-sensitive, and that is the whole difficulty.** The
+reference viewer binds `e`/`A`/`R`/`D` as raw ASCII, so `A` is ambient and `a`
+is the alarm, `D` is distance and `d` is the panel, `R` is reflected and `r` is
+retry. `QKeyEvent::key()` returns the uppercase code for *both* cases, so the
+window reads `e->text()` — which carries the real case — and only falls back to
+the folded key for events that have no text (a synthesized `QKeyEvent`, which is
+what `--selftest` sends, so assertions 23–27 keep working). `Esc` is translated
+to 27 explicitly, because `Qt::Key_Escape` is `0x01000000`, not 27, and
+`dyt_vm_param_key()` tests for 27.
+
+The ladder, the arming rule and the "every other key is swallowed while armed"
+rule are `dyt_vm_param_key()`'s, in `src/view_model.c`, pinned by
+`view_model_test`. `FrameView` owns the arming state and draws the confirmation
+overlay; `run_gui` owns the device and reaches it through a
+`std::function<bool(type, value)>`. The split is the same one the pointer
+handler follows: the state that is drawn and mutated lives with the canvas.
+
+**The write runs on `DeviceWorker`, not the GUI thread.** It is the third
+`Job::Kind`, alongside bring-up and teardown. `dyt_capture_set_param()` is two
+control transfers of up to 1000 ms each plus a 250 ms settle, so it is ~250 ms
+typical and ~2.25 s worst case — and a user who confirms a write should not
+watch the window stop responding. The job *borrows* the capture handle rather
+than owning it, which is safe only because the worker runs one job at a time and
+every teardown is posted through the same worker: `reconnect()` and
+`post_bringup()` both refuse while it is busy, so nothing can close the handle
+under a write. A confirm pressed during a bring-up or teardown is therefore
+**refused**, not queued, and the candidate stays armed so it can be confirmed
+again — the status strip says `device busy; try again`. The result comes back on
+the GUI thread through the same `invokeMethod` the other jobs use, updates the
+panel's override table only on `rc == 0`, and is printed to stderr as well
+(`dytqt: set emissivity = 1.00 -> rc 0`), which is what a live run's transcript
+shows.
+
+**The device panel** (`d`) lists the module serial, the decoded user serial, the
+four stored parameters and the slot count, top-left over the image. Its rows are
+`dyt_vm_info()`'s, not the window's. The identity is read once per bring-up,
+inside `bring_up_live()` between `open()` and `start()` — the only window in
+which the reads answer cleanly — and rides out of the worker in the job's `out`
+(so `struct live` gained a `dyt_device_info_t`; it stays trivially copyable
+because that is a plain C struct). A value a runtime write superseded is
+suffixed `*`, with `(* = set this session)` added to the slot line — but only a
+write that returned `rc == 0`, so a rejected write cannot claim to have changed
+the device. A reconnect clears the panel, the override table and any armed
+candidate, because the re-opened device's own stored values are authoritative
+again.
+
+Two behaviours are inherited from the viewer. The panel is visible by default.
+And the write changes the device's *stored* value, not just the host's
+thermometry: the host conversion's ambient is fixed at open, so a write to
+ambient does not by itself re-scale the picture the window is showing — the
+device's own reading changes, which is exactly what a read-back confirms.
 
 ## The toolkit decision — Qt6 Widgets
 
@@ -325,6 +403,14 @@ $ ./build/dytqt --selftest
   ok   the alarm key arms the derived band, then disarms (31.7..32.1)
   ok   the isotherm key toggles the overlay
   ok   the strip reports the measurement ("box (10,10)-(60,50) n=2091")
+  ok   a parameter key arms its ladder and advances it (arm yes, advance yes, switch yes)
+  ok   the case split holds (e/A/R/D yes, r=retry yes, R=reflected yes)
+  ok   a key while armed is swallowed and ESC cancels (swallow yes, cancel yes)
+  ok   y sends the armed value and a refusal keeps it armed (send yes, keep yes)
+  ok   the device panel rows and the override `*` (rows yes, override yes, failed-write yes)
+  ok   the device panel is painted over the image (fill yes, toggle yes)
+  ok   the confirmation is painted only while armed (idle 0, armed 7048, cancelled 0)
+  ok   q quits and is never swallowed (idle yes, armed yes)
 === ALL PASS ===
 ```
 
@@ -362,9 +448,38 @@ band and disarming, the isotherm toggling, and the strip reporting the
 measurement. The expected source pixel comes from `dyt_view_transform_map()`
 itself, so they pin the *routing* (that a widget coordinate reaches
 `dyt_vm_tool_mouse()` with the right `dst` size) rather than the transform, which
-assertion 16 already covers. The overlay's *painting* is deliberately not
-asserted: a pixel check on a drawn rectangle is brittle, so it was verified by eye
-from a fixture render instead.
+assertion 16 already covers. The measurement overlay's *painting* is deliberately
+not asserted: a pixel check on a drawn rectangle is brittle, so it was verified by
+eye from a fixture render instead.
+
+Assertions 28–35 cover the runtime-parameter ladder and the device panel, and they
+are the reason the arming state lives in `FrameView` rather than in the front end:
+they drive the real window with real key events and then read the widget's own
+state. 28 pins that a key arms its ladder and that re-pressing it advances the
+rung; 29 pins the case split — `A`/`R`/`D` arm their parameters, lowercase `r` is
+retry and uppercase `R` is reflected, which is the binding an unconditional fold
+would destroy; 30 pins that every other key is swallowed while armed and that
+`Esc` cancels; 31 pins that `y` reaches the front end with the armed value and
+that a refusal leaves it armed. The write itself needs a device, so the send is
+intercepted — what these pin is the routing and the contract, not libuvc.
+
+32–35 are where the panel and the confirmation are checked. 32 builds a synthetic
+`dyt_device_info_t` and pins the rows *and* the `*` rule, including that a write
+returning `rc != 0` does not mark the stored value as superseded. 33 and 34 assert
+that both overlays actually paint, which is the check 23–27 deliberately skip for
+the measurement shapes: rather than sampling one pixel of a drawn rectangle, 33
+samples three interior pixels that the panel's opaque background must cover, and
+34 *counts* the confirmation's fill colour with the candidate armed and without
+(`idle 0, armed 7048, cancelled 0`) so an unlucky palette pixel cannot make it
+pass on its own. 35 pins that `q` quits and is never swallowed, armed or not.
+
+What these cannot pin is the write's real return code and the worker's `SetParam`
+branch, because both need a live `dyt_capture_t`. That was verified against the
+camera instead: arming emissivity with `e` and confirming with `y` printed
+`dytqt: set emissivity = 1.00 -> rc 0`, and `probe --read --param 3` then read the
+slot back as `128  1.0000` (it had been `127  0.9922`) — the read-back the
+`params.h` contract says to verify with. The original value was written back
+afterwards.
 
 ## Where the frames come from, and on which thread
 
@@ -484,13 +599,21 @@ then abandons it the same way.
   its device handle and the leaked session with it, because there is no way to
   cancel it without a timeout in vendored libuvc. Adding one there was the
   alternative weighed and not taken.
-* **The parameter ladder and the device panel.** `src/view_model.c` also provides
-  the runtime-parameter arm/confirm machine (`dyt_vm_param_key`) and the device
-  panel's rows (`dyt_vm_info`), and `view_model_test` pins both. The window does
-  not route keys into them yet, so that UI is unexercised — task #89. `n` will
-  then have to reach the parameter handler first and be swallowed while something
-  is armed, exactly as the reference viewer orders it. The measurement UI itself
-  is wired (see "Measurement and alarm").
+* **The runtime write is only verified on hardware.** `dyt_capture_set_param()`
+  is the one device write the port makes, and `--selftest` intercepts the send
+  rather than issuing it, so the worker's `SetParam` branch and the real return
+  code are exercised only against the camera (see "Runtime parameters and the
+  device panel"). The claim that a control transfer does not disturb the
+  isochronous stream rests on the vendor doing the same thing, not on a
+  measurement of this port.
+* **The ladder has no rung for the device's own defaults.** Emissivity is
+  `127/128` on the reference unit and the ladder steps `1.00, 0.95, …`, so a
+  write cannot restore the stored value through the UI. The live check put
+  `127/128` back with a throwaway helper rather than with the app.
+* **A message can outlive its moment.** The transient write-result line is
+  driven by the pump's tick counter, so a stream that stalls while a result is
+  showing leaves it up until frames resume. Minor, and the reference viewer's
+  poll-driven TTL behaves the same way.
 * **No view keys.** Palette, unit, range, flip, zoom and fusion are reachable from
   the command line (`--zoom`) but not from the window, so the mirror is still
   unexercised interactively — which is why assertion 16 drives the transform

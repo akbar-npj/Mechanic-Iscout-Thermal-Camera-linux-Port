@@ -123,7 +123,7 @@ static void usage(const char *prog)
         "                   256x192 raw-AD frame; default is the device's own\n"
         "                   256x384 dual-half frame, which needs no order\n"
         "\n"
-        "with --live the window reconnects on its own; press R to retry now\n",
+        "with --live the window reconnects on its own; press r to retry now\n",
         prog, opts{}.fixture.c_str());
 }
 
@@ -417,10 +417,10 @@ static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
  * These are the reference viewer's bindings: one key per tool, "n" also
  * forgetting the placed points, "a" arming the derived band or disarming, "i"
  * toggling the isotherm.  The view keys (palette, unit, range, flip, zoom,
- * fusion) and the runtime-parameter ladder are deliberately not here; they are
- * later tasks.  The letters are free of the device keys: the window keeps "R"
- * for retry (Qt reports both 'r' and 'R' as Qt::Key_R, but no measurement key
- * uses it). */
+ * fusion) are deliberately not here; they are later tasks.  The
+ * runtime-parameter ladder is a sibling (FrameView::param_key), because its
+ * keys are case-sensitive and this function's are not.  The letters are free
+ * of the device keys: retry is lowercase "r" and the panel toggle is "d". */
 static int apply_measure_key(dyt_session_t *sess, int key)
 {
     dyt_snapshot_t s;
@@ -522,6 +522,133 @@ public:
         return 1;
     }
 
+    /* Apply a runtime-parameter key.  `raw` is the *unfolded* character, so
+     * the reference's case-sensitive bindings survive: 'e' emissivity, 'A'
+     * ambient, 'R' reflected, 'D' distance, and 'y' to send.  The ladder and
+     * the arming rule are the view model's (dyt_vm_param_key); what stays here
+     * is the state the confirmation overlay draws from and the callback into
+     * the front end that owns the device.  Returns 1 if the key was ours.
+     *
+     * While something is armed the view model consumes every key except 'q',
+     * so a stray palette key cannot slip past a pending confirmation. */
+    int param_key(int raw)
+    {
+        dyt_vm_param_event_t ev;
+
+        if (!dyt_vm_param_key(raw, armed_type_, armed_rung_, &ev))
+            return 0;
+
+        switch (ev.action) {
+        case DYT_VM_PARAM_ARMED:
+            armed_type_  = ev.type;
+            armed_rung_  = ev.rung;
+            armed_value_ = ev.value;
+            update();
+            return 1;
+
+        case DYT_VM_PARAM_SEND:
+            /* The front end owns the device, so it decides whether the write
+             * can even be attempted.  A refusal (a bring-up or teardown in
+             * flight, or no device) leaves the candidate armed, so the user
+             * can confirm again rather than losing it silently. */
+            if (on_param_send_ && on_param_send_(ev.type, ev.value)) {
+                armed_type_  = (dyt_order_type_t)0;
+                armed_rung_  = 0;
+                armed_value_ = 0.f;
+            }
+            update();
+            return 1;
+
+        case DYT_VM_PARAM_CANCEL:
+            if (on_param_cancel_)
+                on_param_cancel_(ev.type);
+            armed_type_  = (dyt_order_type_t)0;
+            armed_rung_  = 0;
+            armed_value_ = 0.f;
+            update();
+            return 1;
+
+        case DYT_VM_PARAM_SWALLOW:
+            return 1;
+
+        case DYT_VM_PARAM_NONE:
+        default:
+            return 0;
+        }
+    }
+
+    /* Show or hide the device-information overlay. */
+    void toggle_info()
+    {
+        show_info_ = !show_info_;
+        update();
+    }
+
+    /* The device identity the worker read at bring-up.  `have` is false when
+     * the read did not run, which is also how a failed bring-up clears it. */
+    void set_info(const dyt_device_info_t &d, bool have)
+    {
+        info_      = d;
+        have_info_ = have ? 1 : 0;
+        update();
+    }
+
+    /* Forget the device: its identity, the runtime writes this session made,
+     * and any armed candidate.  Called when the stream is unwound, because a
+     * re-opened device's own stored values are authoritative again and the
+     * candidate referred to a device that is gone. */
+    void clear_info()
+    {
+        info_        = dyt_device_info_t{};
+        have_info_   = 0;
+        armed_type_  = (dyt_order_type_t)0;
+        armed_rung_  = 0;
+        armed_value_ = 0.f;
+        for (int i = 0; i < 5; i++) {
+            override_v_[i]  = 0.f;
+            override_on_[i] = 0;
+        }
+        update();
+    }
+
+    /* Record a completed write.  Only a successful one supersedes the stored
+     * value — the panel's `*` suffix must not claim a write the device
+     * rejected.  `type` is a dyt_order_type_t (1..4; index 0 is unused). */
+    void set_param_result(dyt_order_type_t type, float value, int rc)
+    {
+        if (rc == 0 && type >= DYT_ORDER_REFLECTED && type <= DYT_ORDER_DISTANCE) {
+            override_v_[type]  = value;
+            override_on_[type] = 1;
+        }
+        update();
+    }
+
+    /* The front end owns the device handle, so the write is reached through a
+     * callback rather than a pointer kept here.  It returns 1 when the write
+     * was accepted for sending. */
+    std::function<bool(dyt_order_type_t, float)> on_param_send_;
+    std::function<void(dyt_order_type_t)>        on_param_cancel_;
+
+    /* -- what --selftest pins.  The state the overlays draw from, without a
+     * canvas grab, plus the info rows the panel would show. */
+    bool             param_armed() const { return armed_type_ != 0; }
+    dyt_order_type_t armed_type()  const { return armed_type_; }
+    int              armed_rung()  const { return armed_rung_; }
+    float            armed_value() const { return armed_value_; }
+    bool             info_shown()  const { return have_info_ && show_info_; }
+
+    /* The info panel's `i`-th row as it would be drawn, or "" out of range.
+     * Built on demand so the selftest sees exactly what the panel shows,
+     * override suffix and all. */
+    QString info_line(int i) const
+    {
+        dyt_vm_info_t info;
+        if (dyt_vm_info(&info_, override_v_, override_on_, &info) < 0 ||
+            i < 0 || i >= info.n)
+            return QString();
+        return QString::fromUtf8(info.line[i]);
+    }
+
     bool  has_frame() const { return !img_.isNull(); }
     QSize imageSize() const { return img_.size(); }
 
@@ -567,6 +694,10 @@ protected:
         if (img_.isNull()) {
             p.setPen(QColor(200, 200, 200));
             p.drawText(rect(), Qt::AlignCenter, placeholder_);
+            /* The parameter keys do not need a frame: once bring-up finishes
+             * the device is open and a write can be armed over the
+             * placeholder, so its confirmation must be visible here too. */
+            draw_confirm(p);
             return;
         }
 
@@ -612,8 +743,14 @@ protected:
          * only here, at draw time. */
         const int sw = snap_.width, sh = snap_.height;
         const int dw = img_.width(), dh = img_.height();
-        if (sw <= 0 || sh <= 0)
+        if (sw <= 0 || sh <= 0) {
+            /* Degenerate geometry: the projections below would be meaningless,
+             * but the two overlays that do not depend on the frame still are
+             * not — so draw those and stop. */
+            draw_info_panel(p);
+            draw_confirm(p);
             return;
+        }
 
         /* Source pixel -> widget position, clamping into the frame first so a
          * box dragged partly off the image still draws, clipped at the edge,
@@ -719,9 +856,85 @@ protected:
                 }
             }
         }
+
+        /* The two panels, and the confirmation last so it sits over every
+         * other overlay.  The rows and the wording are the view model's; only
+         * the placement is here. */
+        draw_info_panel(p);
+        draw_confirm(p);
     }
 
 private:
+    /* The device panel: the module serial, the decoded user serial, the four
+     * stored radiometric parameters and the slot count, top-left over the
+     * image — the reference viewer's placement (draw_info_panel).  A value a
+     * runtime write superseded carries a `*`, which dyt_vm_info() adds. */
+    void draw_info_panel(QPainter &p)
+    {
+        if (!have_info_ || !show_info_)
+            return;
+
+        dyt_vm_info_t info;
+        if (dyt_vm_info(&info_, override_v_, override_on_, &info) < 0)
+            return;
+
+        const int pad = 6, lh = 17;
+        int wmax = 0;
+        for (int i = 0; i < info.n; i++)
+            wmax = std::max(wmax, p.fontMetrics().horizontalAdvance(
+                                      QString::fromUtf8(info.line[i])));
+
+        const QRect box(kPad + 6, kPad + 6, wmax + 2 * pad, lh * info.n + 2 * pad);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(16, 16, 16));
+        p.drawRect(box);
+        p.setPen(QColor(120, 120, 120));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(box.adjusted(0, 0, -1, -1));
+
+        p.setPen(QColor(190, 225, 255));
+        const int ascent = p.fontMetrics().ascent();
+        for (int i = 0; i < info.n; i++)
+            p.drawText(box.x() + pad, box.y() + pad + lh * i + ascent,
+                       QString::fromUtf8(info.line[i]));
+    }
+
+    /* The armed-write confirmation, centred over the bottom of the image.
+     * Drawn last, so it sits over every other overlay. */
+    void draw_confirm(QPainter &p)
+    {
+        if (!armed_type_)
+            return;
+
+        const dyt_vm_ladder_t *L = dyt_vm_ladder(armed_type_);
+        if (!L)
+            return;
+
+        char val[32];
+        dyt_vm_param_format(armed_type_, armed_value_, val, sizeof val);
+        const QString s = QStringLiteral("SET ") + QString::fromUtf8(L->name) +
+                          QStringLiteral(" = ") + QString::fromUtf8(val) +
+                          QStringLiteral("    y = send    n / esc = cancel");
+
+        /* The widget may be showing the placeholder, with no image to centre
+         * on, so fall back to its own size. */
+        const int iw = img_.isNull() ? width()  : img_.width();
+        const int ih = img_.isNull() ? height() : img_.height();
+        const int tw = 12 + p.fontMetrics().horizontalAdvance(s);
+        const int x  = std::max(kPad + 6, kPad + (iw - tw) / 2);
+        const int y  = kPad + ih - 34;
+        const QRect r(x - 4, y - 4, tw + 8, 28);
+
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 150));
+        p.drawRect(r);
+        p.setPen(QColor(0, 220, 255));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(r.adjusted(0, 0, -1, -1));
+        p.setPen(QColor(255, 255, 255));
+        p.drawText(r, Qt::AlignCenter, s);
+    }
+
     /* The one widget -> image mapping, so a click and the marker it places
      * cannot disagree.  floor(), not a cast: (int)(-0.5) is 0, which would
      * place a point one pixel outside the image. */
@@ -744,6 +957,21 @@ private:
     dyt_session_t      *sess_        = nullptr;   /* borrowed */
     dyt_vm_pointer_t    ptr_         = DYT_VM_POINTER_INIT;
     const float        *temps_       = nullptr;   /* borrowed from the pump */
+
+    /* The armed runtime-parameter candidate.  `type` 0 means nothing armed. */
+    dyt_order_type_t    armed_type_  = (dyt_order_type_t)0;
+    int                 armed_rung_  = 0;
+    float               armed_value_ = 0.f;
+
+    /* The device identity and the runtime writes made this session, so the
+     * panel never shows a stored value a write has superseded.  Indexed by
+     * dyt_order_type_t (1..4; index 0 unused), which is what dyt_vm_info()
+     * expects.  Visible by default, as in the reference viewer. */
+    dyt_device_info_t   info_{};
+    int                 have_info_   = 0;
+    bool                show_info_   = true;
+    float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
+    int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -858,6 +1086,9 @@ public:
      * back while the event loop is still alive. */
     std::function<void()> on_close_;
     std::function<void()> on_retry_;
+    /* Quit is a callback rather than close() inline so --selftest can observe
+     * `q` without tearing the window down.  run_gui installs it as close(). */
+    std::function<void()> on_quit_;
 
     /* Size the window to the canvas it has to show.  Called once before the
      * window is shown, and again whenever the canvas changes size.
@@ -920,18 +1151,58 @@ protected:
 
     void keyPressEvent(QKeyEvent *e) override
     {
-        /* Retry first: "R" is the device key and must keep working whatever
-         * else is bound. */
-        if (e->key() == Qt::Key_R && on_retry_) {
+        /* One unfolded character, because the bindings are not all the same
+         * case.  The runtime-parameter keys are case-sensitive — 'e' arms
+         * emissivity but 'A'/'R'/'D' arm ambient/reflected/distance, and 'y'
+         * sends — while the measurement keys are lowercase.  Qt reports a
+         * letter as its uppercase code, so e->key() alone cannot tell 'r' from
+         * 'R'; e->text() carries the real case.  A synthesized event (as
+         * --selftest sends) has no text, so fall back to the folded key. */
+        int raw;
+        if (e->key() == Qt::Key_Escape)
+            raw = 27;      /* the view model's cancel code; Qt::Key_Escape is not 27 */
+        else if (!e->text().isEmpty() &&
+                 e->text().at(0).unicode() > 0 && e->text().at(0).unicode() < 128)
+            raw = e->text().at(0).unicode();
+        else {
+            raw = e->key();
+            if (raw >= Qt::Key_A && raw <= Qt::Key_Z)
+                raw += 'a' - 'A';
+        }
+
+        /* The runtime-parameter ladder first.  While a candidate is armed the
+         * view model consumes every key except 'q', so a stray palette or tool
+         * key cannot slip past a pending confirmation. */
+        if (view_ && view_->param_key(raw))
+            return;
+
+        /* Quit.  'q' is deliberately never swallowed, armed or not. */
+        if (raw == 'q') {
+            if (on_quit_)
+                on_quit_();
+            else
+                close();
+            return;
+        }
+
+        /* Retry: lowercase only, because uppercase 'R' arms reflected. */
+        if (raw == 'r' && on_retry_) {
             on_retry_();
             return;
         }
-        /* Qt reports a letter as its uppercase code, so lowercase it before
-         * the measurement bindings — which are all lowercase — are consulted.
+
+        /* The device panel. */
+        if (raw == 'd' && view_) {
+            view_->toggle_info();
+            return;
+        }
+
+        /* Everything else is the measurement bindings, which are lowercase —
+         * so fold the unfolded character back down before consulting them.
          * The return value decides, rather than a list of letters here, so
          * --selftest and the window cannot disagree about what is bound. */
-        int k = e->key();
-        if (k >= Qt::Key_A && k <= Qt::Key_Z)
+        int k = raw;
+        if (k >= 'A' && k <= 'Z')
             k += 'a' - 'A';
         if (view_ && view_->measure_key(k))
             return;
@@ -977,6 +1248,14 @@ struct pump {
      * than a callback so the pump stays a plain function of the session. */
     bool reconnect    = false;
 
+    /* A transient notice the strip shows — the outcome of a runtime-parameter
+     * write, or why one was refused.  Owned here because it is the front end's,
+     * not the session's, and because dyt_vm_readout_line() already takes it as
+     * an argument.  The TTL is in ticks, so it only advances while the pump
+     * steps (the reference viewer's poll-driven rule). */
+    std::string msg;
+    int         msg_ttl = 0;
+
     long long ticks  = 0;   /* timer callbacks */
     long long frames = 0;   /* frames actually painted */
     int       fails  = 0;
@@ -996,6 +1275,10 @@ struct pump {
         int            w = 0, h = 0;
 
         ticks++;
+
+        /* Expire the transient notice before anything can re-set it. */
+        if (msg_ttl > 0 && --msg_ttl == 0)
+            msg.clear();
 
         if (!fs) {
             /* Bring-up failed, so there is no source to pull from — but the
@@ -1076,7 +1359,8 @@ struct pump {
         const QImage wrapped(pix, w, h, w * 3, QImage::Format_RGB888);
         win->view()->set_frame(snap, transformed(wrapped, snap.xform), pal,
                                scr.temps);
-        win->set_frame_status(snap, ds, fps.fps(), mode);
+        win->set_frame_status(snap, ds, fps.fps(), mode,
+                              msg.empty() ? nullptr : msg.c_str());
 
         frames++;                        /* painted frames, for --frames/--png */
         return true;
@@ -1720,6 +2004,269 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* ---- the runtime-parameter ladder and the device panel ----------------
+     *
+     * The parameter keys are case-sensitive, so these send a real character
+     * rather than a bare key code: it is e->text() that carries the case, and
+     * the synthesized events the measurement assertions use carry none.  The
+     * write itself needs a device, so the send is intercepted here — what is
+     * pinned is the routing and the contract, not libuvc. */
+    auto send_char = [&](char c, Qt::KeyboardModifiers m = Qt::NoModifier) {
+        const Qt::Key k = (c >= 'a' && c <= 'z')
+                              ? (Qt::Key)(Qt::Key_A + (c - 'a'))
+                              : (c >= 'A' && c <= 'Z')
+                                    ? (Qt::Key)(Qt::Key_A + (c - 'A'))
+                                    : (Qt::Key)(unsigned char)c;
+        QKeyEvent e(QEvent::KeyPress, k, m, QString(QChar(c)));
+        QApplication::sendEvent(&win, &e);
+    };
+    auto send_esc = [&]() {
+        QKeyEvent e(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(&win, &e);
+    };
+
+    FrameView *fv = win.view();
+
+    int              sends  = 0;
+    dyt_order_type_t sent_t = (dyt_order_type_t)0;
+    float            sent_v = 0.f;
+    bool             send_ok = true;
+    fv->on_param_send_ = [&](dyt_order_type_t t, float v) {
+        sends++;
+        sent_t = t;
+        sent_v = v;
+        return send_ok;
+    };
+    bool quit_seen  = false;
+    bool retry_seen = false;
+    win.on_quit_  = [&]() { quit_seen  = true; };
+    win.on_retry_ = [&]() { retry_seen = true; };
+
+    /* 28. A parameter key arms its ladder, re-pressing it advances the rung,
+     * and a different parameter's key starts its own ladder at the first. */
+    {
+        send_char('e');
+        const bool a = fv->param_armed() &&
+                       fv->armed_type() == DYT_ORDER_EMISSIVITY &&
+                       fv->armed_rung() == 0 &&
+                       std::fabs(fv->armed_value() - 1.00f) < 1e-6;
+        send_char('e');
+        const bool b = fv->armed_rung() == 1 &&
+                       std::fabs(fv->armed_value() - 0.95f) < 1e-6;
+        send_char('A');
+        const bool c = fv->armed_type() == DYT_ORDER_AMBIENT &&
+                       fv->armed_rung() == 0;
+        send_esc();
+
+        const bool ok = a && b && c;
+        std::printf("  %-4s a parameter key arms its ladder and advances it "
+                    "(arm %s, advance %s, switch %s)\n",
+                    ok ? "ok" : "FAIL", a ? "yes" : "NO", b ? "yes" : "NO",
+                    c ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 29. The case split: 'e' is emissivity but 'A'/'R'/'D' are the other
+     * three, and lowercase 'r' is still the device retry while uppercase 'R'
+     * is reflected.  This is the binding the old unconditional fold destroyed. */
+    {
+        send_char('e');
+        const bool em = fv->armed_type() == DYT_ORDER_EMISSIVITY;
+        send_esc();
+        send_char('A');
+        const bool am = fv->armed_type() == DYT_ORDER_AMBIENT;
+        send_esc();
+        send_char('R');
+        const bool re = fv->armed_type() == DYT_ORDER_REFLECTED;
+        send_esc();
+        send_char('D');
+        const bool di = fv->armed_type() == DYT_ORDER_DISTANCE;
+        send_esc();
+
+        retry_seen = false;
+        send_char('r');
+        const bool lower = retry_seen && !fv->param_armed();
+
+        retry_seen = false;
+        send_char('R');
+        const bool upper = !retry_seen &&
+                           fv->armed_type() == DYT_ORDER_REFLECTED;
+        send_esc();
+
+        const bool ok = em && am && re && di && lower && upper;
+        std::printf("  %-4s the case split holds (e/A/R/D %s, r=retry %s, "
+                    "R=reflected %s)\n", ok ? "ok" : "FAIL",
+                    (em && am && re && di) ? "yes" : "NO",
+                    lower ? "yes" : "NO", upper ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 30. While a candidate is armed every other key is swallowed, so a stray
+     * tool or view key cannot slip past a pending confirmation; ESC cancels. */
+    {
+        dyt_snapshot_t s{};
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const dyt_tool_t tool0 = s.tool;
+        const int        iso0  = s.iso_on;
+
+        send_char('e');
+        send_char('p');                 /* would be the point tool, unarmed */
+        send_char('i');                 /* would toggle the isotherm */
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool swallowed = fv->param_armed() && s.tool == tool0 &&
+                               s.iso_on == iso0;
+        send_esc();
+        const bool cancelled = !fv->param_armed();
+
+        const bool ok = swallowed && cancelled;
+        std::printf("  %-4s a key while armed is swallowed and ESC cancels "
+                    "(swallow %s, cancel %s)\n", ok ? "ok" : "FAIL",
+                    swallowed ? "yes" : "NO", cancelled ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 31. Confirming reaches the front end with the armed value, and a refused
+     * write leaves the candidate armed rather than losing it. */
+    {
+        sends = 0; sent_t = (dyt_order_type_t)0; sent_v = 0.f; send_ok = true;
+        send_char('A');
+        send_char('y');
+        const bool sent = sends == 1 && sent_t == DYT_ORDER_AMBIENT &&
+                          std::fabs(sent_v - 20.0f) < 1e-6 &&
+                          !fv->param_armed();
+
+        send_ok = false;
+        send_char('e');
+        send_char('y');
+        const bool kept = fv->param_armed() &&
+                          fv->armed_type() == DYT_ORDER_EMISSIVITY;
+        send_ok = true;
+        send_esc();
+
+        const bool ok = sent && kept;
+        std::printf("  %-4s y sends the armed value and a refusal keeps it "
+                    "armed (send %s, keep %s)\n", ok ? "ok" : "FAIL",
+                    sent ? "yes" : "NO", kept ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 32. The device panel's rows come from the view model, and a value a
+     * write superseded is marked with a `*` — but only a write that succeeded. */
+    {
+        dyt_device_info_t d{};
+        d.have_sn = 1;
+        std::snprintf(d.sn_str, sizeof d.sn_str, "TESTSN");
+        d.params_read = DYT_PARAM_N;
+        d.radio.ok         = DYT_RADIO_EMISSIVITY | DYT_RADIO_DISTANCE;
+        d.radio.emissivity = 96;        /* 96/128  = 0.75 */
+        d.radio.distance   = 128;       /* 128/128 = 1.00 */
+        fv->set_info(d, true);
+
+        const QString serial = fv->info_line(0);
+        const QString emis0  = fv->info_line(1);
+        const bool base = serial.contains(QStringLiteral("TESTSN")) &&
+                          emis0.contains(QStringLiteral("0.7500")) &&
+                          !emis0.contains(QChar('*'));
+
+        fv->set_param_result(DYT_ORDER_EMISSIVITY, 0.80f, 0);
+        const bool over = fv->info_line(1).contains(QStringLiteral("0.8000*"));
+
+        /* A failed write must not claim the stored value was superseded. */
+        fv->set_param_result(DYT_ORDER_DISTANCE, 5.0f, -1);
+        const QString emis2 = fv->info_line(1);
+        const bool nofail = emis2.contains(QStringLiteral("1.0000")) &&
+                            !emis2.contains(QStringLiteral("5.0000"));
+
+        const bool ok = base && over && nofail;
+        std::printf("  %-4s the device panel rows and the override `*` "
+                    "(rows %s, override %s, failed-write %s)\n",
+                    ok ? "ok" : "FAIL", base ? "yes" : "NO",
+                    over ? "yes" : "NO", nofail ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 33. The device panel is painted.  Its background is opaque and sits at a
+     * fixed spot, so an interior pixel must be the fill colour while it is up;
+     * that is what pins the overlay reaching the canvas, not just the rows. */
+    {
+        const QImage on = fv->grab().toImage();
+        const bool fill = fv->info_shown() &&
+                          on.pixelColor(15, 15) == QColor(16, 16, 16) &&
+                          on.pixelColor(16, 15) == QColor(16, 16, 16) &&
+                          on.pixelColor(15, 16) == QColor(16, 16, 16);
+
+        fv->toggle_info();              /* hide */
+        const bool hidden = !fv->info_shown();
+        fv->toggle_info();              /* show again */
+
+        const bool ok = fill && hidden && fv->info_shown();
+        std::printf("  %-4s the device panel is painted over the image "
+                    "(fill %s, toggle %s)\n", ok ? "ok" : "FAIL",
+                    fill ? "yes" : "NO", hidden ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 34. The confirmation is painted, and only while something is armed.  The
+     * fill colour is counted rather than sampled, so an unlucky palette pixel
+     * cannot make this pass on its own. */
+    {
+        auto count_fill = [](const QImage &im) {
+            int n = 0;
+            for (int y = 0; y < im.height(); y++)
+                for (int x = 0; x < im.width(); x++)
+                    if (im.pixelColor(x, y) == QColor(0, 0, 150))
+                        n++;
+            return n;
+        };
+
+        send_esc();                     /* nothing armed */
+        const int before = count_fill(fv->grab().toImage());
+
+        send_char('e');                 /* armed */
+        const int after = count_fill(fv->grab().toImage());
+        send_esc();
+        const int gone = count_fill(fv->grab().toImage());
+
+        const bool ok = after > before && after > gone;
+        std::printf("  %-4s the confirmation is painted only while armed "
+                    "(idle %d, armed %d, cancelled %d)\n", ok ? "ok" : "FAIL",
+                    before, after, gone);
+        if (!ok)
+            fails++;
+    }
+
+    /* 35. `q` quits, and is never swallowed — even while a write is armed,
+     * which is the view model's explicit contract. */
+    {
+        quit_seen = false;
+        send_char('q');
+        const bool idle = quit_seen;
+
+        quit_seen = false;
+        send_char('e');                 /* arm */
+        send_char('q');
+        const bool armed = quit_seen && fv->param_armed();
+        send_esc();
+
+        const bool ok = idle && armed;
+        std::printf("  %-4s q quits and is never swallowed (idle %s, armed "
+                    "%s)\n", ok ? "ok" : "FAIL", idle ? "yes" : "NO",
+                    armed ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* Leave the view model's state as the rest of the run found it. */
+    fv->clear_info();
+    win.on_quit_  = nullptr;
+    win.on_retry_ = nullptr;
+
     dyt_frame_source_close(fs);
     dyt_session_free(sess);
 
@@ -1740,6 +2287,12 @@ struct live {
     dyt_frame_source_t    *fs   = nullptr;
     int                    rc   = -1;
     dyt_mode_t             mode = DYT_MODE_1000;
+
+    /* The identity read at bring-up.  It rides here so it crosses the worker
+     * boundary in the job's `out`, and it must stay a plain C struct: `live`
+     * is copied by value, so anything non-POD here would break that. */
+    dyt_device_info_t      info{};
+    int                    have_info = 0;
 };
 
 /* Bring the device up, or fail leaving `L` in a state tear_down_live() can
@@ -1775,9 +2328,15 @@ static int bring_up_live(const dyt_capture_opts &cap, dyt_session_t *sess, live 
         return -1;
     }
 
-    dyt_device_info_t info;
-    if (dyt_capture_read_info(L.cap, &info) == 0 && info.have_sn)
-        std::fprintf(stderr, "dytqt: serial %s\n", info.sn_str);
+    /* Retained rather than discarded: the panel shows these, and the read can
+     * only be made in this idle window, so there is no second chance.  A read
+     * that ran but found no serial still counts — the panel degrades row by
+     * row (dyt_vm_info) rather than vanishing. */
+    if (dyt_capture_read_info(L.cap, &L.info) == 0) {
+        L.have_info = 1;
+        if (L.info.have_sn)
+            std::fprintf(stderr, "dytqt: serial %s\n", L.info.sn_str);
+    }
 
     if (dyt_capture_start(L.cap, dyt_session_capture_on_frame, L.sc) != 0)
         return -1;
@@ -1814,20 +2373,35 @@ static void tear_down_live(live &L)
  * owned — `sess` is borrowed (the session outlives every job), and `in`/`out`
  * are handles the GUI moves in and out so exactly one side owns them at a time. */
 struct Job {
-    enum Kind { BringUp, TearDown } kind = BringUp;
+    enum Kind { BringUp, TearDown, SetParam } kind = BringUp;
     dyt_capture_opts cap{};
     dyt_session_t   *sess = nullptr;
     live             in{};    /* TearDown: the handles to unwind */
     live             out{};   /* BringUp: what was created; empty on failure */
+
+    /* SetParam: the capture handle is *borrowed*, never owned — `in`/`out` are
+     * the owned handles that tear_down_live() unwinds, and this is not one of
+     * them.  It stays valid because the worker runs one job at a time and
+     * every teardown is posted through the same worker. */
+    dyt_capture_t   *dev = nullptr;
+    dyt_order_type_t ptype = (dyt_order_type_t)0;
+    float            pvalue = 0.f;
+
     int              rc = -1;
 };
 
-/* Runs bring-up and teardown off the GUI thread.
+/* Runs bring-up, teardown and the runtime-parameter write off the GUI thread.
  *
- * Both touch the device and both can block without bound — dyt_capture_open()
- * on a wedged camera, dyt_capture_stop() on a stream whose transfers never
+ * Bring-up and teardown can block without bound — dyt_capture_open() on a
+ * wedged camera, dyt_capture_stop() on a stream whose transfers never
  * complete.  On the GUI thread either one freezes the window with no way out,
  * and no QTimer can rescue it because the GUI thread is the one blocked.
+ *
+ * The write is bounded but slow: dyt_capture_set_param() is two control
+ * transfers of up to 1000 ms each plus a 250 ms settle, so ~250 ms typical and
+ * ~2.25 s worst case.  It belongs here for the same reason — a user who
+ * confirms a write should not watch the window stop responding — and it is
+ * safe to run here because the vendor's own tool writes while streaming.
  *
  * A std::thread, detached, rather than a QThread: this file has no Q_OBJECT and
  * the build runs no moc, so a queued signal is not available either way — and
@@ -1836,7 +2410,9 @@ struct Job {
  * std::thread simply dies with the process.
  *
  * One job at a time, enforced by busy(): a second bring-up while the first is
- * still inside dyt_capture_open() would fight it for the device. */
+ * still inside dyt_capture_open() would fight it for the device, and a teardown
+ * must never run under a write that is borrowing the capture handle.  That
+ * single-job rule is what makes the borrowed handle in Job::dev safe. */
 class DeviceWorker {
 public:
     using Done = std::function<void(const std::shared_ptr<Job> &)>;
@@ -1854,8 +2430,15 @@ public:
                  * hands back an empty `live` and a retry starts from clean. */
                 if (job->rc != 0)
                     tear_down_live(job->out);
-            } else {
+            } else if (job->kind == Job::TearDown) {
                 tear_down_live(job->in);
+            } else {
+                /* SetParam.  Borrows the handle and owns nothing, so there is
+                 * nothing to unwind.  This is the one device write the port
+                 * implements, and it can block for a couple of seconds — which
+                 * is exactly why it is here and not on the GUI thread. */
+                job->rc = dyt_capture_set_param(job->dev, (int)job->ptype,
+                                                job->pvalue);
             }
             /* Back to the GUI thread.  invokeMethod with a functor needs no
              * Q_OBJECT and no moc.  If the application is already gone this is
@@ -1943,6 +2526,9 @@ static int run_gui(const opts &o, QApplication &app)
             pm.mode         = L.mode;
             pm.bringup_rc   = j->rc;
             pm.bringup_done = true;
+            /* A failed bring-up handed back an empty `out`, so this clears the
+             * panel as well as filling it. */
+            win.view()->set_info(L.info, L.have_info != 0);
             if (j->rc == 0) {
                 attempt = 0;
                 retry_timer.stop();
@@ -1963,6 +2549,10 @@ static int run_gui(const opts &o, QApplication &app)
         pm.bringup_done = false;      /* CONNECTING, not LIVE over a dead stream */
         pm.stall.reset();
         attempt = 0;
+        /* The device is about to be re-opened, so its identity and the writes
+         * this session made no longer describe it — and a candidate armed
+         * against it is meaningless.  The fresh bring-up re-reads both. */
+        win.view()->clear_info();
 
         auto afterwards = [&, now]() {
             if (quitting)
@@ -1985,6 +2575,61 @@ static int run_gui(const opts &o, QApplication &app)
     };
 
     win.on_retry_ = [&]() { reconnect(true); };
+    win.on_quit_  = [&]() { win.close(); };
+
+    /* The runtime-parameter write.  The window owns the arming state and the
+     * device handle lives here, so the two meet through these callbacks — the
+     * same split as on_retry_/on_close_, and the only option without a moc. */
+    win.view()->on_param_send_ = [&](dyt_order_type_t type, float value) -> bool {
+        /* Refuse rather than queue: a bring-up or teardown owns the device, and
+         * the job's borrowed handle would not be safe beside one.  Returning
+         * false keeps the candidate armed so the user can confirm again. */
+        if (quitting || worker.busy() || !L.cap) {
+            pm.msg     = "device busy; try again";
+            pm.msg_ttl = 90;
+            return false;
+        }
+
+        const dyt_vm_ladder_t *lad = dyt_vm_ladder(type);
+        char val[32];
+        dyt_vm_param_format(type, value, val, sizeof val);
+        pm.msg     = std::string("set ") + (lad ? lad->name : "?") + " = " + val +
+                     "  (sending)";
+        pm.msg_ttl = 150;
+
+        auto job    = std::make_shared<Job>();
+        job->kind   = Job::SetParam;
+        job->dev    = L.cap;      /* borrowed; the worker owns nothing */
+        job->ptype  = type;
+        job->pvalue = value;
+        worker.post(job, [&](const std::shared_ptr<Job> &j) {
+            if (quitting)
+                return;
+            const dyt_vm_ladder_t *l2 = dyt_vm_ladder(j->ptype);
+            char v2[32];
+            dyt_vm_param_format(j->ptype, j->pvalue, v2, sizeof v2);
+            if (j->rc == 0) {
+                win.view()->set_param_result(j->ptype, j->pvalue, 0);
+                pm.msg = std::string("set ") + (l2 ? l2->name : "?") + " = " + v2 +
+                         "  (sent)";
+            } else {
+                pm.msg = std::string("set ") + (l2 ? l2->name : "?") +
+                         " FAILED (rc " + std::to_string(j->rc) + ")";
+            }
+            pm.msg_ttl = 150;
+            /* Also to stderr, as the reference viewer does: the strip is the
+             * user's view, but a live run's transcript is the evidence. */
+            std::fprintf(stderr, "dytqt: set %s = %s -> rc %d\n",
+                         l2 ? l2->name : "?", v2, j->rc);
+        });
+        return true;
+    };
+    win.view()->on_param_cancel_ = [&](dyt_order_type_t type) {
+        const dyt_vm_ladder_t *lad = dyt_vm_ladder(type);
+        pm.msg     = std::string("cancelled: ") + (lad ? lad->name : "?");
+        pm.msg_ttl = 90;
+    };
+
     win.on_close_ = [&]() {
         /* Only mark it: the device is handed back after app.exec() returns, so
          * teardown never runs re-entrantly inside a close event.
