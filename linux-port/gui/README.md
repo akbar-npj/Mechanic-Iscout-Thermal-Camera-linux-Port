@@ -160,6 +160,25 @@ button, so the wiring is pinned too, and requires the dialog to be modeless.
 nothing to act on — in a `QTextBrowser` so an address can be selected, which a
 `QMessageBox` label would not allow.
 
+The dialog has a second group, **Display**, holding the view options the retired
+menu bar carried: Unit, Fusion, Zoom, Full screen and the device panel. They live
+here rather than in the Troubleshoot tab because the reference's tab has exactly
+four groups (Temperature Measurement / Analysis / High Temperature / Image
+Enhancement), and this dialog is the reference's own catch-all Setting panel —
+the same reason it is the rail's catch-all item. Palette is deliberately absent:
+the rail's Palette item *is* its popup picker, and two routes to one list would be
+one more than the reference has.
+
+Each Display control routes the same way every other control does: through
+`handle_key` when the action has a key (`+`/`-` for zoom, F11, `d`, `r`, `?`),
+and to the session when it is an absolute choice no key can express (Unit,
+Fusion — the same split the menu bar made). Like the parameter rows, they are
+re-seeded on every open, so a unit changed from the keyboard or a full screen
+toggled with F11 cannot leave the dialog showing the other one. Assertion 53f
+pins all of it, including that the full-screen checkbox *presses F11* rather than
+setting the flag itself, which is what keeps the window's `fitted_` bookkeeping
+in step.
+
 `FrameView::render_canvas()` draws the canvas's content at the canvas's own
 size, in canvas coordinates, and is what the overlay assertions sample. A
 widget `grab()` would be cropped once the rail and panel take their columns —
@@ -970,6 +989,7 @@ $ ./build/dytqt --selftest
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
+  ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))

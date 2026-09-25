@@ -34,8 +34,10 @@
 #include <QActionGroup>
 #include <QApplication>
 #include <QButtonGroup>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QColor>
+#include <QComboBox>
 #include <QDialog>
 #include <QDoubleSpinBox>
 #include <QEventLoop>
@@ -2912,6 +2914,13 @@ public:
         outer->setContentsMargins(12, 12, 12, 12);
         outer->setSpacing(10);
 
+        /* ---- Device: the four runtime parameters, and the one device
+         * action that is not a parameter. ---- */
+        auto *dev = new QGroupBox(QStringLiteral("Device"), this);
+        auto *devlay = new QVBoxLayout(dev);
+        devlay->setContentsMargins(8, 6, 8, 8);
+        devlay->setSpacing(8);
+
         auto *grid = new QGridLayout;
         grid->setHorizontalSpacing(10);
         grid->setVerticalSpacing(6);
@@ -2938,9 +2947,9 @@ public:
             if (!name.isEmpty())
                 name[0] = name[0].toUpper();
 
-            auto *lab = new QLabel(name, this);
+            auto *lab = new QLabel(name, dev);
 
-            auto *spin = new QDoubleSpinBox(this);
+            auto *spin = new QDoubleSpinBox(dev);
             spin->setObjectName(QStringLiteral("setting"));
             spin->setDecimals(decimals(L->type));
             spin->setRange(lo, hi);
@@ -2949,7 +2958,7 @@ public:
             spin->setKeyboardTracking(false);
             spin->setValue(L->vals[0]);
 
-            auto *btn = new QPushButton(QStringLiteral("Send"), this);
+            auto *btn = new QPushButton(QStringLiteral("Send"), dev);
             btn->setObjectName(QStringLiteral("setting"));
             QObject::connect(btn, &QPushButton::clicked, this, [this, L, spin]() {
                 const float v = (float)spin->value();
@@ -2973,19 +2982,127 @@ public:
             sends_[L->type] = btn;
         }
         grid->setColumnStretch(1, 1);
-        outer->addLayout(grid);
+        devlay->addLayout(grid);
+
+        /* Retry is a device action with a key, so it runs that key — the same
+         * rule every other control here follows. */
+        retry_ = new QPushButton(QStringLiteral("Retry connection"), dev);
+        retry_->setObjectName(QStringLiteral("setting"));
+        QObject::connect(retry_, &QPushButton::clicked, this,
+                         [this]() { if (on_key) on_key('r'); });
+        devlay->addWidget(retry_, 0, Qt::AlignLeft);
+        outer->addWidget(dev);
+
+        /* ---- Display: the view options the retired menu bar carried.  They
+         * are here rather than in the Troubleshoot tab because the reference's
+         * tab has exactly four groups and this dialog is the reference's own
+         * catch-all Setting panel.  Palette is deliberately absent: the rail's
+         * Palette item is its popup picker, and two routes to one list would
+         * be one more than the reference has. ---- */
+        auto *disp = new QGroupBox(QStringLiteral("Display"), this);
+        auto *dlay = new QGridLayout(disp);
+        dlay->setContentsMargins(8, 6, 8, 8);
+        dlay->setHorizontalSpacing(10);
+        dlay->setVerticalSpacing(6);
+
+        /* Unit — an absolute choice, so no key can express it; the menu made
+         * the same call. */
+        dlay->addWidget(new QLabel(QStringLiteral("Unit"), disp), 0, 0);
+        auto *ubox = new QWidget(disp);
+        auto *ulay = new QHBoxLayout(ubox);
+        ulay->setContentsMargins(0, 0, 0, 0);
+        ulay->setSpacing(6);
+        units_ = new QButtonGroup(this);
+        for (int i = 0; i < DYT_UNIT_N; i++) {
+            const char *nm = dyt_unit_name((dyt_unit_t)i);
+            auto *b = new QPushButton(QString::fromUtf8(nm ? nm : "?"), ubox);
+            b->setObjectName(QStringLiteral("setting"));
+            b->setCheckable(true);
+            b->setFocusPolicy(Qt::NoFocus);
+            units_->addButton(b, i);
+            ulay->addWidget(b);
+        }
+        QObject::connect(units_, &QButtonGroup::idClicked, this,
+                         [this](int id) {
+                             if (on_unit)
+                                 on_unit((dyt_unit_t)id);
+                         });
+        dlay->addWidget(ubox, 0, 1);
+
+        /* Fusion — likewise absolute. */
+        dlay->addWidget(new QLabel(QStringLiteral("Fusion"), disp), 1, 0);
+        fusion_ = new QComboBox(disp);
+        fusion_->setObjectName(QStringLiteral("setting"));
+        fusion_->setFocusPolicy(Qt::NoFocus);
+        for (int i = 0; i < DYT_FUSION_N; i++) {
+            const char *nm = dyt_fusion_name((dyt_fusion_t)i);
+            fusion_->addItem(QString::fromUtf8(nm ? nm : "?"));
+        }
+        QObject::connect(fusion_, &QComboBox::currentIndexChanged, this,
+                         [this](int i) {
+                             if (on_fusion)
+                                 on_fusion((dyt_fusion_t)i);
+                         });
+        dlay->addWidget(fusion_, 1, 1);
+
+        /* Zoom — a delta, so it has keys and they are what the buttons run. */
+        dlay->addWidget(new QLabel(QStringLiteral("Zoom"), disp), 2, 0);
+        auto *zbox = new QWidget(disp);
+        auto *zlay = new QHBoxLayout(zbox);
+        zlay->setContentsMargins(0, 0, 0, 0);
+        zlay->setSpacing(6);
+        for (const auto &z : { std::make_pair(QStringLiteral("Zoom out"), '-'),
+                               std::make_pair(QStringLiteral("Zoom in"), '+') }) {
+            auto *b = new QPushButton(z.first, zbox);
+            b->setObjectName(QStringLiteral("setting"));
+            b->setFocusPolicy(Qt::NoFocus);
+            const int k = z.second;
+            QObject::connect(b, &QPushButton::clicked, this,
+                             [this, k]() { if (on_key) on_key(k); });
+            zlay->addWidget(b);
+            zoom_[k == '+' ? 1 : 0] = b;
+        }
+        zlay->addStretch(1);
+        dlay->addWidget(zbox, 2, 1);
+
+        fullscreen_ = new QCheckBox(QStringLiteral("Full screen"), disp);
+        fullscreen_->setObjectName(QStringLiteral("setting"));
+        fullscreen_->setFocusPolicy(Qt::NoFocus);
+        QObject::connect(fullscreen_, &QCheckBox::clicked, this,
+                         [this]() { if (on_key) on_key(Qt::Key_F11); });
+        dlay->addWidget(fullscreen_, 3, 0, 1, 2);
+
+        info_ = new QCheckBox(QStringLiteral("Device panel"), disp);
+        info_->setObjectName(QStringLiteral("setting"));
+        info_->setFocusPolicy(Qt::NoFocus);
+        QObject::connect(info_, &QCheckBox::clicked, this,
+                         [this]() { if (on_key) on_key('d'); });
+        dlay->addWidget(info_, 4, 0, 1, 2);
+
+        dlay->setColumnStretch(1, 1);
+        outer->addWidget(disp);
 
         status_ = new QLabel(this);
         status_->setObjectName(QStringLiteral("settingstatus"));
         status_->setWordWrap(true);
         outer->addWidget(status_);
 
+        auto *buttons = new QHBoxLayout;
+        about_ = new QPushButton(QStringLiteral("About…"), this);
+        about_->setObjectName(QStringLiteral("setting"));
+        about_->setFocusPolicy(Qt::NoFocus);
+        QObject::connect(about_, &QPushButton::clicked, this,
+                         [this]() { if (on_key) on_key('?'); });
+        buttons->addWidget(about_);
+        buttons->addStretch(1);
         auto *close = new QPushButton(QStringLiteral("Close"), this);
         close->setObjectName(QStringLiteral("setting"));
         QObject::connect(close, &QPushButton::clicked, this, &QDialog::accept);
-        outer->addWidget(close, 0, Qt::AlignRight);
+        buttons->addWidget(close);
+        outer->addLayout(buttons);
 
         seed(nullptr);
+        sync_display(DYT_UNIT_C, DYT_FUSION_INFRARED, false, false);
     }
 
     /* Point every row at the value the session knows, and label the ones the
@@ -3019,6 +3136,32 @@ public:
                                "it is sent, and the reading changes with it."));
     }
 
+    /* Point the Display controls at the state the session and the window are
+     * in.  Called on every open beside seed(), for the same reason: a unit
+     * changed from the keyboard, or a full screen toggled with F11, must not
+     * leave the dialog showing the other one. */
+    void sync_display(dyt_unit_t unit, dyt_fusion_t fusion, bool fullscreen,
+                      bool info)
+    {
+        if (units_) {
+            const QSignalBlocker block(units_);
+            if (QAbstractButton *b = units_->button((int)unit))
+                b->setChecked(true);
+        }
+        if (fusion_) {
+            const QSignalBlocker block(fusion_);
+            fusion_->setCurrentIndex((int)fusion);
+        }
+        if (fullscreen_) {
+            const QSignalBlocker block(fullscreen_);
+            fullscreen_->setChecked(fullscreen);
+        }
+        if (info_) {
+            const QSignalBlocker block(info_);
+            info_->setChecked(info);
+        }
+    }
+
     /* -- what --selftest drives.  The rows are indexed by dyt_order_type_t, so
      * a test asks for the parameter by the same name the ladder uses. */
     QDoubleSpinBox *spin(dyt_order_type_t t) const
@@ -3029,7 +3172,26 @@ public:
     {
         return t >= 0 && t <= DYT_ORDER_DISTANCE ? sends_[t] : nullptr;
     }
+    QPushButton *unit_button(dyt_unit_t u) const
+    {
+        return units_ ? qobject_cast<QPushButton *>(units_->button((int)u))
+                      : nullptr;
+    }
+    QComboBox *fusion_box() const { return fusion_; }
+    QPushButton *retry_button() const { return retry_; }
+    QPushButton *zoom_button(bool in) const { return zoom_[in ? 1 : 0]; }
+    QPushButton *about_button() const { return about_; }
+    QCheckBox   *fullscreen_box() const { return fullscreen_; }
+    QCheckBox   *info_box() const { return info_; }
     QString status_text() const { return status_ ? status_->text() : QString(); }
+
+    /* Every action a control here takes goes out through one of these, so the
+     * dialog holds no session and cannot become a second front end.  `on_key`
+     * is MainWindow's handle_key, which is why the buttons that have keys press
+     * them rather than calling the engine. */
+    std::function<void(int)>           on_key;
+    std::function<void(dyt_unit_t)>    on_unit;
+    std::function<void(dyt_fusion_t)>  on_fusion;
 
 private:
     static int decimals(dyt_order_type_t t)
@@ -3053,6 +3215,14 @@ private:
     QLabel         *labs_[DYT_ORDER_DISTANCE + 1]  = {};
     QDoubleSpinBox *spins_[DYT_ORDER_DISTANCE + 1] = {};
     QPushButton    *sends_[DYT_ORDER_DISTANCE + 1] = {};
+    /* Display. */
+    QButtonGroup *units_      = nullptr;
+    QComboBox    *fusion_     = nullptr;
+    QPushButton  *retry_      = nullptr;
+    QPushButton  *zoom_[2]    = {};   /* [0] out, [1] in */
+    QPushButton  *about_      = nullptr;
+    QCheckBox    *fullscreen_ = nullptr;
+    QCheckBox    *info_       = nullptr;
 };
 
 /* ---------------------------------------------------------- contact dialog */
@@ -3218,8 +3388,27 @@ public:
                     return view_ && view_->on_param_send_ &&
                            view_->on_param_send_(t, v);
                 }, this);
+
+            /* The Display controls route the same two ways every other
+             * control does: through handle_key when the action has a key, and
+             * through the session when it is an absolute choice no key can
+             * express (unit, fusion — the same split the menu bar made). */
+            settings_->on_key = [this](int k) { handle_key(k); };
+            settings_->on_unit = [this](dyt_unit_t u) {
+                if (sess_)
+                    dyt_session_set_unit(sess_, u);
+            };
+            settings_->on_fusion = [this](dyt_fusion_t f) {
+                if (sess_)
+                    dyt_session_set_fusion(sess_, f);
+            };
         }
         settings_->seed(settings_current());
+        settings_->sync_display(
+            (dyt_unit_t)(snap_.unit < DYT_UNIT_N ? snap_.unit : DYT_UNIT_C),
+            (dyt_fusion_t)(snap_.fusion < DYT_FUSION_N ? snap_.fusion
+                                                       : DYT_FUSION_INFRARED),
+            fullscreen_, view_ && view_->info_shown());
         return settings_;
     }
 
@@ -6749,6 +6938,104 @@ static int selftest(const opts &o)
         fv->on_param_send_ = nullptr;
         /* Leave the override table as the run found it. */
         fv->set_param_result(DYT_ORDER_EMISSIVITY, 0.80f, 0);
+    }
+
+    /* 53f. The Settings dialog's Display section — the view options the retired
+     * menu bar carried.  Pinned for the same reason as every other control:
+     * each one must reach the session or the window through the one dispatch,
+     * and must show the state the session is in rather than the last thing
+     * clicked.  Unit and fusion are the two the keyboard cannot express (they
+     * are absolute choices), so those go to the session directly, exactly as
+     * the menu bar did; the rest have keys and press them. */
+    {
+        SettingsDialog *dlg = win.settings_dialog();
+        dyt_snapshot_t  s0{};
+        dyt_session_snapshot(sess, &s0, nullptr, 0);
+
+        /* Seeded from the session, not from a default. */
+        const bool seeded =
+            dlg->unit_button(s0.unit) &&
+            dlg->unit_button(s0.unit)->isChecked() &&
+            dlg->fusion_box() &&
+            dlg->fusion_box()->currentIndex() == (int)s0.fusion;
+
+        /* Unit: an absolute choice, so the radio moves the session itself. */
+        const dyt_unit_t want_u =
+            s0.unit == DYT_UNIT_K ? DYT_UNIT_C : DYT_UNIT_K;
+        if (QPushButton *ub = dlg->unit_button(want_u))
+            ub->click();
+        dyt_snapshot_t s1{};
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool unit_ok = s1.unit == want_u;
+
+        /* Fusion: likewise.  Driven through the combo's own index so the
+         * signal a user's selection would raise is the one that runs. */
+        const dyt_fusion_t want_f = s1.fusion == DYT_FUSION_BLEND
+                                        ? DYT_FUSION_INFRARED : DYT_FUSION_BLEND;
+        dlg->fusion_box()->setCurrentIndex((int)want_f);
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+        const bool fusion_ok = s2.fusion == want_f;
+
+        /* Zoom is a delta, so its buttons press the keys. */
+        const int zoom_before = s2.xform.zoom;
+        if (QPushButton *zb = dlg->zoom_button(true))
+            zb->click();
+        dyt_snapshot_t s3{};
+        dyt_session_snapshot(sess, &s3, nullptr, 0);
+        const bool zoom_ok = s3.xform.zoom > zoom_before;
+        if (QPushButton *zb = dlg->zoom_button(false))
+            zb->click();                    /* put it back */
+
+        /* Full screen and the device panel are window/canvas flags, and both
+         * have keys — so the checkbox must press its key, not set the flag. */
+        const bool fs_before = win.fullscreen();
+        if (QCheckBox *cb = dlg->fullscreen_box())
+            cb->click();
+        const bool fs_ok = win.fullscreen() != fs_before;
+        if (QCheckBox *cb = dlg->fullscreen_box())
+            cb->click();                    /* back */
+        const bool fs_restored = win.fullscreen() == fs_before;
+
+        const bool info_before = fv->info_shown();
+        if (QCheckBox *cb = dlg->info_box())
+            cb->click();
+        const bool info_ok = fv->info_shown() != info_before;
+        if (QCheckBox *cb = dlg->info_box())
+            cb->click();
+
+        /* Retry and About reach the window's own callbacks, which is where the
+         * device lifecycle and the About box live. */
+        int  retries = 0, abouts = 0;
+        win.on_retry_ = [&]() { retries++; };
+        win.on_about_ = [&]() { abouts++; };
+        if (QPushButton *rb = dlg->retry_button())
+            rb->click();
+        if (QPushButton *ab = dlg->about_button())
+            ab->click();
+        win.on_retry_ = nullptr;
+        win.on_about_ = nullptr;
+        const bool wired = retries == 1 && abouts == 1;
+
+        /* Restore the session state this assertion moved. */
+        dyt_session_set_unit(sess, s0.unit);
+        dyt_session_set_fusion(sess, s0.fusion);
+
+        const bool ok = dlg && seeded && unit_ok && fusion_ok && zoom_ok &&
+                        fs_ok && fs_restored && info_ok && wired;
+        std::printf("  %-4s the Settings Display section drives the session and "
+                    "the window (seeded %s, unit %s, fusion %s, zoom %s, "
+                    "full screen %s, panel %s, retry+about %s)\n",
+                    ok ? "ok" : "FAIL", seeded ? "yes" : "NO",
+                    unit_ok ? "yes" : "NO", fusion_ok ? "yes" : "NO",
+                    zoom_ok ? "yes" : "NO",
+                    (fs_ok && fs_restored) ? "yes" : "NO",
+                    info_ok ? "yes" : "NO", wired ? "yes" : "NO");
+        if (!ok)
+            fails++;
+
+        if (dlg)
+            dlg->hide();
     }
 
     /* 56. No toolbar row is overflowing.  Qt hides the buttons that do not fit
