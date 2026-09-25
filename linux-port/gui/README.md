@@ -21,6 +21,9 @@ binary and the packages stay **`dytqt`**, which is why `Exec=`, `Icon=`,
 ```
 MainWindow : QWidget
 └── QVBoxLayout (margins 0, spacing 0)
+    ├── QMenuBar    (stretch 0)   File / View / Measure / Device / Help
+    ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide
+    ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery
     ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
     └── StatusStrip (stretch 0)   three left-aligned lines
 ```
@@ -37,6 +40,85 @@ known — fit rather than be cropped. It uses `resize()`, not `adjustSize()`:
 platform's 800×600 screen produced a 533×400 window for a 660×400 canvas, and
 `--selftest`'s assertion 7 caught it. A window larger than the screen is the
 lesser evil; a silently cropped image is not.
+
+### Menus and the toolbar
+
+The menu bar and the two toolbar rows are a second way to reach the same actions,
+not a second set of actions. Every item that has a key is built by
+`key_action()`, which connects its `triggered` to `handle_key(key)` — the one
+dispatch the keyboard uses — so a menu item runs exactly what its key runs and
+the two cannot drift. Assertion 50 pins it: triggering the third palette item
+moves the session exactly as the `3` key does.
+
+**No `QAction` carries a shortcut.** Qt's shortcut map consumes a matching key
+*before* `keyPressEvent` runs, so a shortcut would fire while a runtime-parameter
+candidate is armed and break the ladder's swallow contract — every key but `q`
+must be swallowed until the candidate is confirmed or cancelled (assertion 30).
+The key's name therefore goes in the item's tooltip, not in its `shortcut`.
+
+Two menus are the exception, because they select an *absolute* value that no key
+can express: **Unit** (the `u` key cycles) and **Fusion** (the `f` key cycles).
+Each item is a single `dyt_session_set_*` call, so there is no rule for the two
+to disagree about.
+
+The checkmarks come from the snapshot, not from the item's own toggle:
+`sync_actions()` runs after every painted frame and sets each action's state from
+`snap_`, so an action whose key was refused — a super-resolution plane with no
+model, a write the device rejected — cannot stay lit. It is called only from
+`set_frame_status`, never from `set_state_line`: the no-device path's snapshot is
+zeroed, and syncing from it would clear every checkmark. A stalled stream keeps
+the last real frame's states, which is what the canvas is still showing.
+
+Neither bar may take focus (`Qt::NoFocus`). A focused tool button swallows the
+keys before `keyPressEvent` sees them, which would silently break every binding
+the moment someone clicked a button; assertion 53 pins the policy. The toolbar
+is split into **two rows** and given an `Ignored` horizontal size policy, so it
+can never *widen* the window away from the picture: the package ships no icons,
+so a button is its text, and one row of these labels is wider than the canvas. If
+a row ever does outgrow the window, Qt shows its own overflow arrow rather than
+clipping silently — assertion 56 requires that neither row is overflowing at the
+default size, since a hidden button is the very thing the split exists to avoid.
+
+`MainWindow` stays a plain `QWidget` rather than becoming a `QMainWindow`:
+`QMainWindow::sizeHint()` does not account for its menu and tool bar heights, so
+`fit_to_view()`'s `resize(sizeHint())` would size the window for the central
+widget alone and let the bars steal rows from the canvas. As rows of a
+`QVBoxLayout` they count towards `QWidget::sizeHint()` automatically.
+
+### Fit to window and full screen
+
+The canvas is drawn at its natural size — the engine's zoomed frame — until the
+window is larger than it needs, and scales to fit after that. The scale is
+`FrameView::display_scale()`: the smaller of the widget's width and height ratios
+against the canvas's `sizeHint()`, clamped to at least 1.0, so it engages only
+when there is room and is *exactly* 1.0 at the natural size (a 0.99 from rounding
+would resample every pixel of the common case for nothing). `display_origin()`
+centres the result and floors it to whole pixels — a half-pixel offset at scale 1
+would blur the picture and move the overlay samples by one.
+
+This is a **display** transform, applied after everything the engine does. `img_`
+is already the source magnified by `zoom * sr`, and the measurement, marker and
+pointer mappings all work in those coordinates; `paintEvent` applies
+`translate(display_origin()); scale(s, s)` *after* the engine transform, so
+`dyt_view_transform_map/project` never see it. `pointer()` is its exact inverse
+(same origin, same scale), which is what keeps a click on the pixel it names —
+assertion 55 checks that a click at a scaled position lands on the pixel the
+projection put there. At the natural size the origin is `(0,0)` and the scale is
+1, so the drawing is pixel-for-pixel what it always was — which is what keeps the
+pixel assertions honest, since they compare at the natural size.
+Nearest-neighbour, like the engine's own zoom: a thermal picture magnified
+smoothly invents gradients that are not in the data.
+
+**F11 is full screen** (`toggle_fullscreen()`), the vendor viewer's binding.
+Because the canvas scales to whatever room it is given, full screen needs no
+special canvas handling — the picture fills the screen, keeps its shape, and
+leaves the margin black; F11 again restores the window. `fit_to_view()` returns
+early while fullscreen is on: it runs on every painted frame, and `resize()` on a
+fullscreen window is not harmless — the window manager owns that geometry and may
+drop the fullscreen hint, and on the offscreen platform `resize()` really does
+change the size. The guard sits *before* the `fitted_` cache, so leaving
+fullscreen clears `fitted_` and re-fits, in case the canvas changed size (a zoom,
+or a super-resolved frame) while it was up. Assertion 49 pins the round trip.
 
 ### The three status lines
 
@@ -561,7 +643,7 @@ feature takes, and the reason `make check` passes both ways. See
 ./build/dytqt                          # the fixture, or the camera if it is absent
 ./build/dytqt --selftest               # headless check, needs no display
 ./build/dytqt --palette 5 --zoom 3
-./build/dytqt --png /tmp/canvas.png    # save the window and exit
+./build/dytqt --png /tmp/canvas.png    # save the canvas and exit
 ./build/dytqt --live                   # stream from the camera
 ./build/dytqt --live --vid 0x0bda --pid 0x5840
 ```
@@ -618,10 +700,16 @@ only there because the port's super-resolution model was recovered against it.
 
 Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
 alarm and `i` shows the isotherm, `z`/`Z` turn on super-resolution, `s` saves a
-still and `v` records a clip, `g` browses what has been saved, and with `--live`
-the window reconnects on its own while `R` retries immediately — see
-"Measurement and alarm", "Super-resolution", "Capture: stills and clips" and
-"The gallery".
+still and `v` records a clip, `g` browses what has been saved, `d` shows the
+device panel, and with `--live` the window reconnects on its own while `R`
+retries immediately — see "Measurement and alarm", "Super-resolution", "Capture:
+stills and clips" and "The gallery". `F11` is full screen, and the picture scales
+up to fill a window enlarged by hand — see "Fit to window and full screen".
+
+Everything the keys do is also on the **menu bar and toolbar**, and **Help →
+Keyboard shortcuts** opens a scrollable guide (`F1` and `?` open About instead).
+A menu item runs exactly what its key runs, so the on-screen controls cannot
+drift from the keyboard — see "Menus and the toolbar".
 
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
@@ -631,17 +719,17 @@ and not a thing that is only ever run by hand.
 ```
 $ ./build/dytqt --selftest
   ok   painted the requested 25 frame(s) (got 25)
-  ok   the frame path fits the 40 ms budget at 25 fps (worst step 2.8 ms)
+  ok   the frame path fits the 40 ms budget at 25 fps (worst step 1.1 ms)
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (660x456, 64 distinct colours)
+  ok   the canvas painted (660x533, 64 distinct colours)
   ok   the canvas is not clipped (660x400, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
         line 2: tool: none (p point, l line, b box, n clear)
-        line 3: range auto   |   FIXTURE  766.5 fps
-  ok   line 3 names the source ("range auto   |   FIXTURE  766.5 fps")
+        line 3: range auto   |   FIXTURE  1045.5 fps
+  ok   line 3 names the source ("range auto   |   FIXTURE  1045.5 fps")
   ok   the range mode reaches the snapshot (auto -> fixed -> auto)
   ok   the engine names the range modes ("auto", "fixed")
   ok   the fps meter is exact (25.0 fps)
@@ -665,7 +753,7 @@ $ ./build/dytqt --selftest
   ok   a key while armed is swallowed and ESC cancels (swallow yes, cancel yes)
   ok   y sends the armed value and a refusal keeps it armed (send yes, keep yes)
   ok   the device panel rows and the override `*` (rows yes, override yes, failed-write yes)
-  ok   the device panel is painted over the image (fill yes, toggle yes)
+  ok   the device panel is painted over the image (fill yes, toggle yes, covers yes)
   ok   the confirmation is painted only while armed (idle 0, armed 7048, cancelled 0)
   ok   q quits and is never swallowed (idle yes, armed yes)
   ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
@@ -676,11 +764,23 @@ $ ./build/dytqt --selftest
   ok   a clip is refused where there is no disk (refused yes, says why yes)
   ok   the capture keys route (still 1, record 1)
   ok   the gallery keys browse and open (open yes, move yes, swallow yes, opened 1, exported 1, closed yes, back to live yes)
-  ok   the About text names the app and its version (0.1.0), the SR keys and the model state
+  ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 660x533 yes)
+  ok   a menu action reaches the session like its key (palette 0 -> 2)
+  ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
+  ok   the Help item opens the guide (1)
+  ok   neither bar can take the keyboard (menubar no focus, 2 toolbar row(s), 0 that would)
+  ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
+  ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
+  ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
 === ALL PASS ===
 ```
+
+The transcript above is abridged — assertions 43–45 (the view keys, the
+preferences round-trip and the About key route) are omitted for length; the run
+prints them between the gallery keys and the About text.
 
 Two of these are worth calling out because they are the ones that would otherwise
 pass vacuously:
@@ -692,9 +792,10 @@ pass vacuously:
   relation it checks would hold for an untransformed frame too, and would prove
   nothing.
 
-The `766.5 fps` on line 3 is not a bug — `--selftest` paces nothing, so it runs
-the 25 frames as fast as it can. Assertion 9 checks the *label* there and
-assertion 12 pins the arithmetic instead.
+The `1045.5 fps` on line 3 is not a bug — `--selftest` paces nothing, so it runs
+the 25 frames as fast as it can (the figure is whatever the machine manages, so
+it differs run to run). Assertion 9 checks the *label* there and assertion 12
+pins the arithmetic instead.
 
 Assertions 17 and 18 cover the live path without a camera: 17 checks that
 `--live` is refused when it contradicts the fixture-only flags, and 18 checks
@@ -782,6 +883,35 @@ the session, and post the notice that is a refused key's only feedback. 48 pins
 the reason the factor is in the transform at all: with a 2× picture, mapping the
 two corner output pixels must land on the plane's two corners. It is written to
 skip (and say so) on a build with no model, where there is no 2× picture to map.
+
+49–56 cover the window chrome — the menu, the toolbar, full screen and the
+fit-to-window display layer. Each pins a failure that would otherwise stay
+invisible until a user hit it, so they are worth naming one by one:
+
+* **49** drives F11 in and out and requires the window to come back the size it
+  went in at, which is what catches the fullscreen guard in `fit_to_view()`
+  leaving `fitted_` advanced and the window stuck at the screen's size.
+* **50** triggers a palette action and reads the session back, so the on-screen
+  controls cannot become a second front end free to drift from the keyboard.
+* **51** flips from a *key*, not the action, and requires the checkmark to match
+  the session both times *and* the two frames to differ — so neither a sync that
+  never ran nor one echoing the action's own toggle can pass.
+* **52** observes the Help item through its callback, so no modal opens and the
+  test needs no display.
+* **53** requires the menu bar and both toolbar rows to be `Qt::NoFocus`, which
+  is what stops a clicked button from swallowing every key afterwards.
+* **56** requires neither row to be hiding a button behind Qt's overflow arrow —
+  the very thing the two-row split exists to avoid. It prints before 54 and 55
+  because the numbers are the order the checks were written, not the order they
+  run.
+* **54** grows the window and requires the canvas to be 1:1 before, scaled and
+  centred after, and 1:1 again when it shrinks back; the first half is what keeps
+  the pixel assertions honest, since at the natural size the scale is exactly 1
+  and the origin exactly `(0,0)`.
+* **55** clicks at a scaled position and requires the placed point to be the
+  pixel the projection put there. It is the assertion that catches a scale
+  applied to the paint but not to the pointer, which would place every marker
+  somewhere else while looking entirely plausible.
 
 37b is the still writer's 2× case: `save_still()` sizes its buffer from the
 snapshot's factor, so the assertion reads the written PNG's own IHDR back and
@@ -891,7 +1021,10 @@ those, and `%build`/`%install` only copy files). Details worth knowing:
   `make install` ships the library, so the two cannot disagree.
 * **`%files` is an anti-drift guard.** Fedora sets
   `%_unpackaged_files_terminate_build`, so a file `make install` staged but the
-  spec does not list fails the build rather than being silently dropped.
+  spec does not list fails the build rather than being silently dropped. The
+  window chrome added nothing to it: the menu bar, the toolbar and the Help
+  dialog are all built in the binary from `help_text()`, so `make install` stages
+  no new file and `%files` is unchanged.
 
 `_topdir` and the stage default to `~/.cache/dytqt/{rpmbuild,stage}` — absolute
 and space-free by design, because this tree's path contains a space. A

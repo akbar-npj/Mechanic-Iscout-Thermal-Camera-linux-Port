@@ -282,7 +282,11 @@ static void usage(const char *prog)
         "                   256x192 raw-AD frame; default is the device's own\n"
         "                   256x384 dual-half frame, which needs no order\n"
         "\n"
-        "with --live the window reconnects on its own; press r to retry now\n",
+        "with --live the window reconnects on its own; press r to retry now\n"
+        "\n"
+        "in the window: F11 is full screen, and Help -> Keyboard shortcuts\n"
+        "opens the full key guide; everything the keys do is also on the menu\n"
+        "bar and the toolbar\n",
         prog, opts{}.fixture.c_str());
 }
 
