@@ -30,20 +30,29 @@
 #include <thread>
 #include <vector>
 
+#include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QCloseEvent>
 #include <QColor>
+#include <QDialog>
 #include <QEventLoop>
 #include <QImage>
 #include <QKeyEvent>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
+#include <QPushButton>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSize>
 #include <QString>
+#include <QTextBrowser>
 #include <QTimer>
+#include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -1683,9 +1692,22 @@ public:
         view_  = new FrameView(this);
         strip_ = new StatusStrip(this);
 
+        /* The chrome is built before the layout that holds it, and before the
+         * first fit_to_view(): the window is sized from its layout's hint, so
+         * the bars have to be in the layout by then or the canvas would be
+         * given a window sized as though they were not there.
+         *
+         * MainWindow stays a plain QWidget rather than becoming a QMainWindow.
+         * QMainWindow::sizeHint() does not account for its menu and tool bar
+         * heights, so fit_to_view()'s resize(sizeHint()) would size the window
+         * for the central widget alone and let the bars steal rows from the
+         * canvas — clipping the picture.  As rows of a QVBoxLayout they count
+         * towards QWidget::sizeHint() automatically. */
         auto *lay = new QVBoxLayout(this);
         lay->setContentsMargins(0, 0, 0, 0);
         lay->setSpacing(0);
+        lay->addWidget(build_menus(), 0);
+        lay->addWidget(build_toolbar(), 0);
         lay->addWidget(view_, 1);
         lay->addWidget(strip_, 0);
 
@@ -1699,6 +1721,16 @@ public:
 
     FrameView   *view()  const { return view_; }
     StatusStrip *strip() const { return strip_; }
+
+    /* The session the on-screen controls act on.  The canvas borrows it too;
+     * the window needs its own handle because a few menu items (unit, fusion)
+     * select an absolute value, which no key does — cycling is all the
+     * keyboard can express.  Borrowed, never freed here. */
+    void set_session(dyt_session_t *s)
+    {
+        sess_ = s;
+        view_->set_session(s);
+    }
 
     /* The front end owns the device lifecycle, so the window only reports the
      * two events it cannot act on itself.  `on_close_` runs before the close is
@@ -1728,8 +1760,34 @@ public:
      * dialog blocking the event loop. */
     std::function<void()> on_about_;
 
+    /* The usage guide.  A callback for the same reason About is one: the modal
+     * lives in the front end, so --selftest can observe the route without a
+     * dialog.  It has no key of its own — F1 is About, and F sits next to 'f'
+     * (fusion), where a mis-shift would open a modal.  The Help menu and the
+     * toolbar button are how it is reached. */
+    std::function<void()> on_help_;
+
     /* The browsing state, owned here and read by the canvas at paint time. */
     dyt_vm_gallery_t *gallery() { return &gal_; }
+
+    /* The on-screen controls, public so --selftest can trigger one and check it
+     * lands where the key would.  Every one of them is also the member
+     * sync_actions() keeps checked against the snapshot. */
+    QAction *act_palette_[10] = {};
+    QAction *act_unit_[DYT_UNIT_N] = {};
+    QAction *act_range_       = nullptr;
+    QAction *act_flip_h_      = nullptr;
+    QAction *act_flip_v_      = nullptr;
+    QAction *act_fusion_[DYT_FUSION_N] = {};
+    QAction *act_sr_[3]       = {};
+    QAction *act_tool_[4]     = {};
+    QAction *act_alarm_       = nullptr;
+    QAction *act_iso_         = nullptr;
+    QAction *act_info_        = nullptr;
+    QAction *act_record_      = nullptr;
+    QAction *act_gallery_     = nullptr;
+    QAction *act_fullscreen_  = nullptr;
+    QAction *act_help_        = nullptr;
 
     /* Show a saved still: the canvas draws it and line 3 names it.  The pump
      * keeps painting the live frame underneath, so clear_viewing() restores the
@@ -1811,6 +1869,14 @@ public:
             fitted_ = QSize();
             fit_to_view();
         }
+        /* The checkmark is set here as well as in sync_actions(), because the
+         * fullscreen state does not come from a frame: a stalled stream paints
+         * no frame, so the sync would not run and the menu would keep claiming
+         * the old state. */
+        if (act_fullscreen_) {
+            const QSignalBlocker block(act_fullscreen_);
+            act_fullscreen_->setChecked(fullscreen_);
+        }
         if (view_)
             view_->update();
     }
@@ -1827,7 +1893,9 @@ public:
         strip_->set_lines(QString::fromUtf8(a), QString::fromUtf8(b),
                           viewing() ? viewing_label_ : state_line(st, snap, fps));
         strip_->set_alarm(snap.alarm_on != 0, snap.alarm);
+        snap_ = snap;               /* for the action lambdas */
         fit_to_view();
+        sync_actions();
     }
 
     /* No frame to paint — the placeholder is up, so lines 1 and 2 keep
@@ -2009,8 +2077,292 @@ protected:
     }
 
 private:
+    /* ---- the on-screen controls ----------------------------------------
+     *
+     * Every item that has a key runs that key, through handle_key().  Nothing
+     * here sets a shortcut: Qt's shortcut map consumes a matching key *before*
+     * keyPressEvent runs, so a shortcut would fire while a runtime-parameter
+     * candidate is armed and break the ladder's swallow contract (assertion
+     * 30).  The key's name goes in the item's tooltip instead.
+     *
+     * The two exceptions are the menus that select an *absolute* value — unit
+     * and fusion — because no key expresses one: the keys cycle.  Each is a
+     * single session setter, so there is no rule for the two to disagree about.
+     *
+     * The same QAction objects are shared between a menu and the toolbar, so a
+     * checkmark and a tool button are the same state by construction. */
+
+    /* An item that does exactly what its key does.  `hint` names the key, for
+     * the tooltip only. */
+    QAction *key_action(const QString &text, int key, const char *hint,
+                        bool checkable = false)
+    {
+        QAction *a = new QAction(text, this);
+        a->setCheckable(checkable);
+        a->setToolTip(QStringLiteral("%1    %2")
+                          .arg(text, QString::fromUtf8(hint)));
+        connect(a, &QAction::triggered, this, [this, key]() {
+            handle_key(key);
+            setFocus();     /* the click took it; the keys need it back */
+        });
+        return a;
+    }
+
+    /* An item with no key of its own. */
+    QAction *plain_action(const QString &text, std::function<void()> fn,
+                          bool checkable = false)
+    {
+        QAction *a = new QAction(text, this);
+        a->setCheckable(checkable);
+        connect(a, &QAction::triggered, this, [this, fn]() {
+            if (fn)
+                fn();
+            setFocus();
+        });
+        return a;
+    }
+
+    QMenuBar *build_menus()
+    {
+        auto *bar = new QMenuBar(this);
+        /* Neither bar may take focus.  A focused tool button swallows the keys
+         * before keyPressEvent sees them, which would silently break every
+         * binding in the app the moment someone clicked a button. */
+        bar->setFocusPolicy(Qt::NoFocus);
+
+        /* ---- File ---- */
+        QMenu *file = bar->addMenu(QStringLiteral("&File"));
+        file->addAction(key_action(QStringLiteral("Save still"), 's', "s"));
+        act_record_  = key_action(QStringLiteral("Record clip"), 'v', "v", true);
+        act_gallery_ = key_action(QStringLiteral("Gallery"), 'g', "g", true);
+        file->addAction(act_record_);
+        file->addAction(act_gallery_);
+        file->addSeparator();
+        file->addAction(key_action(QStringLiteral("Quit"), 'q', "q"));
+
+        /* ---- View ---- */
+        QMenu *view = bar->addMenu(QStringLiteral("&View"));
+        act_fullscreen_ = key_action(QStringLiteral("Full screen"),
+                                     Qt::Key_F11, "F11", true);
+        view->addAction(act_fullscreen_);
+        view->addSeparator();
+
+        /* The ten the digits reach.  Palettes past the tenth are still
+         * reachable with Next/Previous, exactly as the keyboard reaches them —
+         * so the menu is no more capable than the keys, and no less. */
+        QMenu *pal = view->addMenu(QStringLiteral("Palette"));
+        auto  *palgrp = new QActionGroup(this);
+        palgrp->setExclusive(true);
+        for (int i = 0; i < 10; i++) {
+            const int  key    = (i == 9) ? '0' : ('1' + i);
+            const char hint[] = { (char)key, '\0' };
+            act_palette_[i] = key_action(
+                QStringLiteral("Palette %1").arg(i + 1), key, hint, true);
+            palgrp->addAction(act_palette_[i]);
+            pal->addAction(act_palette_[i]);
+        }
+        pal->addSeparator();
+        pal->addAction(key_action(QStringLiteral("Next palette"), '.', "."));
+        pal->addAction(key_action(QStringLiteral("Previous palette"), ',', ","));
+
+        QMenu *unit = view->addMenu(QStringLiteral("Unit"));
+        auto  *ugrp = new QActionGroup(this);
+        ugrp->setExclusive(true);
+        for (int i = 0; i < DYT_UNIT_N; i++) {
+            const char *nm = dyt_unit_name((dyt_unit_t)i);
+            act_unit_[i] = plain_action(
+                QString::fromUtf8(nm ? nm : "?"),
+                [this, i]() {
+                    if (sess_)
+                        dyt_session_set_unit(sess_, (dyt_unit_t)i);
+                },
+                true);
+            ugrp->addAction(act_unit_[i]);
+            unit->addAction(act_unit_[i]);
+        }
+
+        act_range_ = key_action(QStringLiteral("Fixed range"), 't', "t", true);
+        view->addAction(act_range_);
+        view->addSeparator();
+
+        act_flip_h_ = key_action(QStringLiteral("Flip horizontally"), 'h', "h", true);
+        act_flip_v_ = key_action(QStringLiteral("Flip vertically"), 'H', "H", true);
+        view->addAction(act_flip_h_);
+        view->addAction(act_flip_v_);
+        view->addSeparator();
+        view->addAction(key_action(QStringLiteral("Zoom in"), '+', "+"));
+        view->addAction(key_action(QStringLiteral("Zoom out"), '-', "-"));
+        view->addSeparator();
+
+        QMenu *fus = view->addMenu(QStringLiteral("Fusion"));
+        auto  *fgrp = new QActionGroup(this);
+        fgrp->setExclusive(true);
+        for (int i = 0; i < DYT_FUSION_N; i++) {
+            const char *nm = dyt_fusion_name((dyt_fusion_t)i);
+            act_fusion_[i] = plain_action(
+                QString::fromUtf8(nm ? nm : "?"),
+                [this, i]() {
+                    if (sess_)
+                        dyt_session_set_fusion(sess_, (dyt_fusion_t)i);
+                },
+                true);
+            fgrp->addAction(act_fusion_[i]);
+            fus->addAction(act_fusion_[i]);
+        }
+
+        /* Super-resolution.  "Off" has no key: the keys toggle whichever plane
+         * is selected, so off is the same key again.  Routing it through the
+         * active plane's key keeps the refusal notice, which is the only
+         * feedback a super-resolution key that cannot take effect ever has. */
+        QMenu *sr = view->addMenu(QStringLiteral("Super-resolution"));
+        auto  *sgrp = new QActionGroup(this);
+        sgrp->setExclusive(true);
+        act_sr_[0] = plain_action(QStringLiteral("Off"), [this]() {
+            if (snap_.sr != DYT_SR_OFF)
+                handle_key(snap_.sr == DYT_SR_THERMAL ? 'Z' : 'z');
+        }, true);
+        act_sr_[1] = key_action(QStringLiteral("Visible plane (2x)"), 'z', "z", true);
+        act_sr_[2] = key_action(QStringLiteral("Thermal plane (2x)"), 'Z', "Z", true);
+        for (int i = 0; i < 3; i++) {
+            sgrp->addAction(act_sr_[i]);
+            sr->addAction(act_sr_[i]);
+        }
+
+        view->addSeparator();
+        act_info_ = key_action(QStringLiteral("Device panel"), 'd', "d", true);
+        view->addAction(act_info_);
+
+        /* ---- Measure ---- */
+        QMenu *meas = bar->addMenu(QStringLiteral("&Measure"));
+        auto  *tgrp = new QActionGroup(this);
+        tgrp->setExclusive(true);
+        /* The menu's order and the array's index are different things:
+         * act_tool_ is indexed by dyt_tool_t, so the two are mapped rather
+         * than assumed equal (DYT_TOOL_NONE is 0, not last). */
+        static const struct {
+            const char *text;
+            const char *hint;
+            int         key;
+        } tools[4] = { { "Point", "p", 'p' },
+                       { "Line",  "l", 'l' },
+                       { "Box",   "b", 'b' },
+                       { "None",  "n", 'n' } };
+        static const dyt_tool_t order[4] = { DYT_TOOL_POINT, DYT_TOOL_LINE,
+                                             DYT_TOOL_BOX, DYT_TOOL_NONE };
+        for (int i = 0; i < 4; i++) {
+            act_tool_[order[i]] = key_action(QString::fromUtf8(tools[i].text),
+                                             tools[i].key, tools[i].hint, true);
+            tgrp->addAction(act_tool_[order[i]]);
+            meas->addAction(act_tool_[order[i]]);
+        }
+        meas->addSeparator();
+        act_alarm_ = key_action(QStringLiteral("Alarm"), 'a', "a", true);
+        act_iso_   = key_action(QStringLiteral("Isotherm"), 'i', "i", true);
+        meas->addAction(act_alarm_);
+        meas->addAction(act_iso_);
+
+        /* ---- Device ---- */
+        QMenu *dev = bar->addMenu(QStringLiteral("&Device"));
+        dev->addAction(key_action(QStringLiteral("Retry connection"), 'r', "r"));
+
+        /* ---- Help ---- */
+        QMenu *help = bar->addMenu(QStringLiteral("&Help"));
+        act_help_ = plain_action(QStringLiteral("Keyboard shortcuts"),
+                                 [this]() { if (on_help_) on_help_(); });
+        help->addAction(act_help_);
+        help->addAction(key_action(QStringLiteral("About"), '?', "?"));
+        return bar;
+    }
+
+    QToolBar *build_toolbar()
+    {
+        auto *tb = new QToolBar(this);
+        tb->setFocusPolicy(Qt::NoFocus);
+        /* The package ships no icons, so the buttons are their text.  The
+         * labels are the menu's, which is why the width is whatever the text
+         * needs — the window is sized to fit it, and the canvas scales the
+         * picture into whatever room is left. */
+        tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
+
+        tb->addAction(act_fullscreen_);
+        tb->addAction(act_info_);
+        tb->addSeparator();
+        tb->addAction(act_range_);
+        tb->addAction(act_flip_h_);
+        tb->addAction(act_flip_v_);
+        tb->addSeparator();
+        tb->addAction(act_tool_[DYT_TOOL_POINT]);
+        tb->addAction(act_tool_[DYT_TOOL_LINE]);
+        tb->addAction(act_tool_[DYT_TOOL_BOX]);
+        tb->addAction(act_tool_[DYT_TOOL_NONE]);
+        tb->addSeparator();
+        tb->addAction(act_alarm_);
+        tb->addAction(act_iso_);
+        tb->addSeparator();
+        tb->addAction(key_action(QStringLiteral("Still"), 's', "s"));
+        tb->addAction(act_record_);
+        tb->addAction(act_gallery_);
+        tb->addSeparator();
+        tb->addAction(act_help_);
+        return tb;
+    }
+
+    /* Bring the checkmarks up to date with the frame that was just painted.
+     *
+     * The snapshot is the authority, not the action's own toggle: an action
+     * whose key was refused (a super-resolution plane with no model, a write
+     * the device rejected) must not stay lit.  triggered() is what the actions
+     * are connected to and setChecked() does not emit it, so there is no loop
+     * here; the blocker is belt and braces.
+     *
+     * Called only from set_frame_status — never from set_state_line, whose
+     * snapshot is zeroed on the no-device path and would clear every
+     * checkmark.  A stalled stream therefore keeps the last real frame's
+     * states, which is what the canvas is still showing. */
+    void sync_actions()
+    {
+        auto set = [](QAction *a, bool on) {
+            if (!a)
+                return;
+            const QSignalBlocker block(a);
+            a->setChecked(on);
+        };
+
+        for (int i = 0; i < 10; i++) {
+            /* Only the palettes that actually loaded are selectable. */
+            if (act_palette_[i] && snap_.palette_n > 0)
+                act_palette_[i]->setEnabled(i < snap_.palette_n);
+            set(act_palette_[i], snap_.palette == i);
+        }
+        for (int i = 0; i < DYT_UNIT_N; i++)
+            set(act_unit_[i], (int)snap_.unit == i);
+        set(act_range_,  snap_.range_mode != DYT_RANGE_AUTO);
+        set(act_flip_h_, snap_.xform.flip_h != 0);
+        set(act_flip_v_, snap_.xform.flip_v != 0);
+        for (int i = 0; i < DYT_FUSION_N; i++)
+            set(act_fusion_[i], (int)snap_.fusion == i);
+        set(act_sr_[0], snap_.sr == DYT_SR_OFF);
+        set(act_sr_[1], snap_.sr == DYT_SR_VISIBLE);
+        set(act_sr_[2], snap_.sr == DYT_SR_THERMAL);
+        set(act_tool_[DYT_TOOL_POINT], snap_.tool == DYT_TOOL_POINT);
+        set(act_tool_[DYT_TOOL_LINE],  snap_.tool == DYT_TOOL_LINE);
+        set(act_tool_[DYT_TOOL_BOX],   snap_.tool == DYT_TOOL_BOX);
+        set(act_tool_[DYT_TOOL_NONE],  snap_.tool == DYT_TOOL_NONE);
+        set(act_alarm_, snap_.alarm_on != 0);
+        set(act_iso_,   snap_.iso_on != 0);
+        set(act_info_,  view_ && view_->info_shown());
+        set(act_record_, strip_ && !strip_->recording_label().isEmpty());
+        set(act_gallery_, gal_.open);
+        set(act_fullscreen_, fullscreen_);
+    }
+
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
+    dyt_session_t *sess_ = nullptr;      /* borrowed */
+    /* The last painted frame, so an action lambda can read the current state
+     * (which super-resolution plane to switch off, say) without a second
+     * snapshot call. */
+    dyt_snapshot_t snap_{};
     QSize        fitted_{};
     /* Whether showFullScreen() is in force.  Tracked here rather than asked of
      * the window manager, because fit_to_view() consults it on every painted
@@ -2307,7 +2659,7 @@ static int selftest(const opts &o)
     }
 
     MainWindow win;
-    win.view()->set_session(sess);
+    win.set_session(sess);
     pump       pm;
     pm.fs   = fs;
     pm.sess = sess;
@@ -3856,6 +4208,107 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 50. A menu or toolbar item does what its key does.  The two are wired to
+     * one dispatch, so what this pins is the wiring: the palette action must
+     * move the session exactly as '3' does (assertion 43), or the on-screen
+     * controls would be a second front end, free to drift from the keyboard.
+     * '1' first, so the palette is somewhere the action has to move it from. */
+    {
+        dyt_snapshot_t s{};
+        send_char('1');                             /* palette index 0 */
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const int before = s.palette;
+
+        if (win.act_palette_[2])
+            win.act_palette_[2]->trigger();
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+
+        const bool ok = win.act_palette_[2] && before == 0 && s.palette == 2;
+        std::printf("  %-4s a menu action reaches the session like its key "
+                    "(palette %d -> %d)\n", ok ? "ok" : "FAIL", before,
+                    s.palette);
+        if (!ok)
+            fails++;
+    }
+
+    /* 51. The checkmarks follow the frame, not the click.  The flip is driven
+     * from a *key* here, so a sync that merely echoed the action's own toggled
+     * state would leave the mark wrong — which is the failure this exists to
+     * catch, since a checkable action is the only place the app shows a state
+     * the engine owns. */
+    {
+        /* Read the session's own state rather than assuming where the flip
+         * started: assertion 43 has already turned it on, so a test that
+         * expected the first 'h' to light the mark would be testing the start
+         * state rather than the sync. */
+        auto flip_h = [&]() {
+            dyt_snapshot_t s{};
+            dyt_session_snapshot(sess, &s, nullptr, 0);
+            return s.xform.flip_h != 0;
+        };
+
+        send_char('h');
+        pm.step();                  /* a painted frame is what drives the sync */
+        const bool a  = flip_h();
+        const bool c1 = win.act_flip_h_ && win.act_flip_h_->isChecked() == a;
+
+        send_char('h');
+        pm.step();
+        const bool b  = flip_h();
+        const bool c2 = win.act_flip_h_ && win.act_flip_h_->isChecked() == b;
+
+        /* The mark matched the frame both times *and* the two frames differed,
+         * so neither a sync that never ran nor one that echoed the action's own
+         * toggle can pass.  The two 'h' presses cancel, leaving the flip as it
+         * was found. */
+        const bool ok = win.act_flip_h_ && a != b && c1 && c2;
+        std::printf("  %-4s the checkmarks follow the frame, not the click "
+                    "(flip h %d then %d, matched %s / %s)\n",
+                    ok ? "ok" : "FAIL", (int)a, (int)b, c1 ? "yes" : "NO",
+                    c2 ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 52. The Help item routes to the guide.  Observed through the callback, so
+     * no dialog opens: the modal belongs to the front end, and --selftest must
+     * never need a display. */
+    {
+        int help = 0;
+        win.on_help_ = [&]() { help++; };
+        if (win.act_help_)
+            win.act_help_->trigger();
+        const bool ok = help == 1;
+        std::printf("  %-4s the Help item opens the guide (%d)\n",
+                    ok ? "ok" : "FAIL", help);
+        if (!ok)
+            fails++;
+        win.on_help_ = nullptr;
+    }
+
+    /* 53. Neither bar can take the keyboard.  A focused tool button swallows
+     * the keys before keyPressEvent sees them, which would break every binding
+     * in the app the moment someone clicked a button — and it stays invisible
+     * until a user reports that the keys stopped working after they clicked
+     * something.  The bar's own focus policy is what stops it. */
+    {
+        QMenuBar *mb = win.findChild<QMenuBar *>();
+        QToolBar *tb = win.findChild<QToolBar *>();
+        const bool ok = mb && tb &&
+                        mb->focusPolicy() == Qt::NoFocus &&
+                        tb->focusPolicy() == Qt::NoFocus;
+        std::printf("  %-4s neither bar can take the keyboard "
+                    "(menubar %s, toolbar %s)\n", ok ? "ok" : "FAIL",
+                    mb ? (mb->focusPolicy() == Qt::NoFocus ? "no focus"
+                                                           : "TAKES FOCUS")
+                       : "MISSING",
+                    tb ? (tb->focusPolicy() == Qt::NoFocus ? "no focus"
+                                                           : "TAKES FOCUS")
+                       : "MISSING");
+        if (!ok)
+            fails++;
+    }
+
     /* Leave the view model's state as the rest of the run found it. */
     fv->clear_info();
     win.on_quit_  = nullptr;
@@ -4296,7 +4749,7 @@ static int run_gui(const opts &o_in, QApplication &app)
     setup_super_resolution(sess, o);
 
     MainWindow win;
-    win.view()->set_session(sess);
+    win.set_session(sess);
     pump       pm;
     pm.sess = sess;
     pm.win  = &win;
@@ -4540,6 +4993,29 @@ static int run_gui(const opts &o_in, QApplication &app)
             dyt_session_snapshot(sess, &snap, nullptr, 0) == 0 && snap.sr_cap;
         QMessageBox::about(&win, QString("About ") + kAppName,
                            QString::fromStdString(about_text(have_model)));
+    };
+
+    /* The usage guide.  A dialog rather than a message box, because the text is
+     * long enough to need scrolling and a user copying a key out of it should
+     * be able to select it — neither of which a QMessageBox's label allows.
+     * The text itself is help_text(), which renders the same key table the
+     * About box does, so the two cannot disagree about what a key does. */
+    win.on_help_ = [&]() {
+        QDialog dlg(&win);
+        dlg.setWindowTitle(QString("Keyboard shortcuts - ") + kAppName);
+        dlg.resize(680, 560);
+
+        auto *box = new QTextBrowser(&dlg);
+        box->setPlainText(QString::fromStdString(help_text()));
+        box->setReadOnly(true);
+
+        auto *close = new QPushButton(QStringLiteral("Close"), &dlg);
+        QObject::connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
+
+        auto *lay = new QVBoxLayout(&dlg);
+        lay->addWidget(box, 1);
+        lay->addWidget(close, 0, Qt::AlignRight);
+        dlg.exec();
     };
 
     /* Render a still at the source's own size with the app's palette, into
