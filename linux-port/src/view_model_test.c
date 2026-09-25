@@ -16,9 +16,11 @@
  * build:  via the Makefile (make check)
  */
 #include <math.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utime.h>
 
@@ -56,6 +58,26 @@ static void strcheck(const char *what, const char *got, const char *want)
         snprintf(d, sizeof d, "got \"%s\" want \"%s\"", got, want);
         fail(what, d);
     }
+}
+
+/* mkdir -p for the tests' own temp trees; 0 on success. */
+static int mkdir_p(const char *path)
+{
+    char   buf[4096];
+    size_t i;
+
+    if (strlen(path) >= sizeof buf)
+        return -1;
+    strcpy(buf, path);
+    for (i = 1; buf[i]; i++) {
+        if (buf[i] != '/')
+            continue;
+        buf[i] = '\0';
+        if (mkdir(buf, 0700) != 0 && errno != EEXIST)
+            return -1;
+        buf[i] = '/';
+    }
+    return (mkdir(buf, 0700) == 0 || errno == EEXIST) ? 0 : -1;
 }
 
 /* A snapshot with everything at a known value, so each test changes only the
@@ -645,10 +667,13 @@ static void test_alarm_band(void)
              dyt_vm_alarm_band(&s, NULL, &hi, &h), -1);
 }
 
+static void test_data_dir(void);
+
 static void test_utilities(void)
 {
     char b[4096];
     int  i, okfmt = 1;
+
 
     if (dyt_vm_timestamp(b, sizeof b) != 0) {
         fail("util: a timestamp", "failed");
@@ -678,6 +703,94 @@ static void test_utilities(void)
         ok("util: an unreadable palette directory falls through");
     else
         fail("util: an unreadable palette directory falls through", b);
+
+    test_data_dir();
+}
+
+/* The installed-layout search.  Tested through dyt_vm_find_data_dir rather than
+ * the palette wrapper, because the wrapper's earlier candidates (cwd, then
+ * relative to the executable) always resolve under `make check` and would hide
+ * the XDG branch. */
+static void test_data_dir(void)
+{
+    char  root[] = "/tmp/dyt-vm-xdg-XXXXXX";
+    char  b[4096], want[4096];
+    char *old = getenv("XDG_DATA_DIRS");
+    char *save = old ? strdup(old) : NULL;
+
+    if (!mkdtemp(root)) {
+        fail("data dir: a temp root", "mkdtemp failed");
+        free(save);
+        return;
+    }
+
+    /* <root>/usr/share/dytqt/palettes, and a second entry that does not exist,
+     * so the search has to walk past one miss. */
+    snprintf(b, sizeof b, "%s/usr/share/dytqt/palettes", root);
+    if (mkdir_p(b) != 0) {
+        fail("data dir: the fixture tree", "could not create it");
+        goto out;
+    }
+
+    snprintf(b, sizeof b, "%s/absent:%s/usr/share", root, root);
+    setenv("XDG_DATA_DIRS", b, 1);
+
+    snprintf(want, sizeof want, "%s/usr/share/dytqt/palettes", root);
+    if (dyt_vm_find_data_dir("palettes", b, sizeof b) == 1 &&
+        strcmp(b, want) == 0)
+        ok("data dir: XDG_DATA_DIRS is searched past a miss");
+    else
+        fail("data dir: XDG_DATA_DIRS is searched past a miss", b);
+
+    /* A leaf that is not there is a miss, not a false hit. */
+    intcheck("data dir: an absent leaf is not found",
+             dyt_vm_find_data_dir("no-such-leaf", b, sizeof b), 0);
+
+    /* A path is refused: the search must not escape dytqt/. */
+    intcheck("data dir: a leaf with a separator is refused",
+             dyt_vm_find_data_dir("../palettes", b, sizeof b), 0);
+    intcheck("data dir: \"..\" is refused",
+             dyt_vm_find_data_dir("..", b, sizeof b), 0);
+
+    /* An empty XDG_DATA_DIRS must behave exactly like the spec default,
+     * whatever that resolves to on this host — which may or may not have the
+     * package installed.  Comparing the two is host-independent; asserting a
+     * fixed result would not be. */
+    {
+        char got_empty[4096];
+        int  rc_empty, rc_default;
+
+        setenv("XDG_DATA_DIRS", "", 1);
+        rc_empty = dyt_vm_find_data_dir("palettes", b, sizeof b);
+        snprintf(got_empty, sizeof got_empty, "%s", b);
+
+        setenv("XDG_DATA_DIRS", "/usr/local/share:/usr/share", 1);
+        rc_default = dyt_vm_find_data_dir("palettes", b, sizeof b);
+
+        if (rc_empty == rc_default && strcmp(got_empty, b) == 0)
+            ok("data dir: an empty XDG_DATA_DIRS falls back to the default");
+        else
+            fail("data dir: an empty XDG_DATA_DIRS falls back to the default",
+                 b);
+    }
+
+out:
+    if (save) {
+        setenv("XDG_DATA_DIRS", save, 1);
+        free(save);
+    } else {
+        unsetenv("XDG_DATA_DIRS");
+    }
+    /* Leave nothing behind. */
+    snprintf(b, sizeof b, "%s/usr/share/dytqt/palettes", root);
+    rmdir(b);
+    snprintf(b, sizeof b, "%s/usr/share/dytqt", root);
+    rmdir(b);
+    snprintf(b, sizeof b, "%s/usr/share", root);
+    rmdir(b);
+    snprintf(b, sizeof b, "%s/usr", root);
+    rmdir(b);
+    rmdir(root);
 }
 
 /* ------------------------------------------------- capture and recording */

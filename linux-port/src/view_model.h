@@ -439,9 +439,18 @@ int dyt_vm_view_key(dyt_session_t *s, int key);
  * to the cwd. */
 int dyt_vm_exe_dir(char *out, size_t n);
 
+/* Find an installed data subdirectory: <datadir>/dytqt/<leaf> under each
+ * directory in $XDG_DATA_DIRS (default /usr/local/share:/usr/share) — the
+ * location `make install` uses.  `leaf` is a single name with no separator.
+ * Returns 1 and fills `out` when one is readable, 0 otherwise.  This is what
+ * lets a packaged binary find the palettes and the super-resolution model from
+ * any cwd. */
+int dyt_vm_find_data_dir(const char *leaf, char *out, size_t n);
+
 /* Find the palette directory: `dir_opt` first when non-NULL and non-empty,
- * then "palettes", "../palettes", and both again relative to the executable.
- * Returns 1 and fills `out` when one is readable, 0 otherwise. */
+ * then "palettes", "../palettes", both again relative to the executable, and
+ * finally dyt_vm_find_data_dir("palettes", ...).  Returns 1 and fills `out`
+ * when one is readable, 0 otherwise. */
 int dyt_vm_find_palette_dir(const char *dir_opt, char *out, size_t n);
 
 /* "YYYYMMDD-HHMMSS" in local time, for a filename.  Returns 0 on success. */

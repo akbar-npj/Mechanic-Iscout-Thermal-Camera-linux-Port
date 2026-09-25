@@ -1038,6 +1038,57 @@ int dyt_vm_exe_dir(char *out, size_t n)
     return 0;
 }
 
+/* One candidate directory: readable?  On success copies it to `out`. */
+static int palette_dir_ok(const char *p, char *out, size_t n)
+{
+    if (!p || !p[0] || access(p, R_OK) != 0)
+        return 0;
+    snprintf(out, n, "%s", p);
+    return 1;
+}
+
+/* The installed layout: <datadir>/dytqt/<leaf> under each XDG data directory.
+ * $XDG_DATA_DIRS when set and non-empty, else the spec's default of
+ * /usr/local/share:/usr/share — which is where `make install` puts the data for
+ * both prefixes that matter.  This is what lets a packaged dytqt find the
+ * vendor palettes (and the super-resolution model) from any cwd; without it an
+ * installed binary silently falls back to the six built-in ramps. */
+int dyt_vm_find_data_dir(const char *leaf, char *out, size_t n)
+{
+    const char *dirs;
+    const char *p;
+
+    if (!out || n == 0)
+        return 0;
+    out[0] = '\0';
+
+    /* A leaf, not a path: no separators, or the search could escape dytqt/. */
+    if (!leaf || !leaf[0] || strchr(leaf, '/') || strcmp(leaf, ".") == 0 ||
+        strcmp(leaf, "..") == 0)
+        return 0;
+
+    dirs = getenv("XDG_DATA_DIRS");
+    if (!dirs || !dirs[0])
+        dirs = "/usr/local/share:/usr/share";
+
+    for (p = dirs; *p; ) {
+        const char *sep = strchr(p, ':');
+        size_t      len = sep ? (size_t)(sep - p) : strlen(p);
+        char        cand[4096];
+        int         need = (int)strlen(leaf) + (int)sizeof "/dytqt/" + 1;
+
+        if (len > 0 && len + (size_t)need < sizeof cand) {
+            snprintf(cand, sizeof cand, "%.*s/dytqt/%s", (int)len, p, leaf);
+            if (palette_dir_ok(cand, out, n))
+                return 1;
+        }
+        if (!sep)
+            break;
+        p = sep + 1;
+    }
+    return 0;
+}
+
 int dyt_vm_find_palette_dir(const char *dir_opt, char *out, size_t n)
 {
     char        cand[4096];
@@ -1049,30 +1100,26 @@ int dyt_vm_find_palette_dir(const char *dir_opt, char *out, size_t n)
         return 0;
     out[0] = '\0';
 
-    if (dir_opt && dir_opt[0]) {
-        if (access(dir_opt, R_OK) == 0) {
-            snprintf(out, n, "%s", dir_opt);
-            return 1;
-        }
-    }
+    /* An explicit request wins. */
+    if (palette_dir_ok(dir_opt, out, n))
+        return 1;
 
-    for (i = 0; i < 2; i++) {
-        if (access(fixed[i], R_OK) == 0) {
-            snprintf(out, n, "%s", fixed[i]);
+    /* Then beside the cwd and the executable, so a source-tree run keeps using
+     * the tree's own palettes rather than an installed copy. */
+    for (i = 0; i < 2; i++)
+        if (palette_dir_ok(fixed[i], out, n))
             return 1;
-        }
-    }
 
     if (dyt_vm_exe_dir(ed, sizeof ed) == 0) {
         for (i = 0; i < 2; i++) {
             snprintf(cand, sizeof cand, "%s/%s", ed, fixed[i]);
-            if (access(cand, R_OK) == 0) {
-                snprintf(out, n, "%s", cand);
+            if (palette_dir_ok(cand, out, n))
                 return 1;
-            }
         }
     }
-    return 0;
+
+    /* Finally the installed location. */
+    return dyt_vm_find_data_dir("palettes", out, n);
 }
 
 int dyt_vm_timestamp(char *out, size_t n)
