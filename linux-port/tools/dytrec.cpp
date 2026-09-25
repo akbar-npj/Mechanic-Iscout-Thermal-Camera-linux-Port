@@ -39,13 +39,10 @@
 
 #include <unistd.h>
 
-#include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/videoio.hpp>
-
 #include "capture.h"
 #include "frame_source.h"
 #include "fusion.h"
+#include "recorder.h"
 #include "session.h"
 #include "session_capture.h"
 
@@ -189,13 +186,13 @@ static dyt_session_t *setup_session(const rec &r)
 
 /* Encode `want` frames from `fs` into `out`.  The writer is opened from the
  * first frame's geometry, which is the only point where the size is known on
- * the live path. */
+ * the live path — that and the RGB->BGR swap both live in tools/recorder.c,
+ * shared with the Qt app so the two cannot produce different containers. */
 static int record_frames(dyt_frame_source_t *fs, const rec &r)
 {
-    cv::VideoWriter  w;
-    const uint8_t   *rgb = nullptr;
-    int              ww = 0, hh = 0, written = 0;
-    bool             opened = false;
+    const uint8_t  *rgb = nullptr;
+    int             ww = 0, hh = 0, written = 0;
+    dyt_recorder_t *rec = nullptr;
 
     if (r.codec.size() != 4) {
         std::fprintf(stderr, "dytrec: --codec must be a 4-character fourcc\n");
@@ -203,6 +200,13 @@ static int record_frames(dyt_frame_source_t *fs, const rec &r)
     }
     if (!(r.fps > 0.0)) {
         std::fprintf(stderr, "dytrec: --fps must be positive\n");
+        return -1;
+    }
+
+    rec = dyt_recorder_open(r.out.c_str(), r.fps, r.codec.c_str());
+    if (!rec) {
+        std::fprintf(stderr, "dytrec: cannot start a recorder for %s\n",
+                     r.out.c_str());
         return -1;
     }
 
@@ -220,31 +224,14 @@ static int record_frames(dyt_frame_source_t *fs, const rec &r)
         if (st == DYT_FS_END)
             break;
         if (st == DYT_FS_ERROR) {
-            if (opened) w.release();
+            dyt_recorder_close(rec);
             return -1;
         }
 
-        if (!opened) {
-            w.open(r.out,
-                   cv::VideoWriter::fourcc(r.codec[0], r.codec[1], r.codec[2],
-                                           r.codec[3]),
-                   r.fps, cv::Size(ww, hh), true);
-            if (!w.isOpened()) {
-                std::fprintf(stderr, "dytrec: cannot open %s with codec '%s'\n",
-                             r.out.c_str(), r.codec.c_str());
-                return -1;
-            }
-            opened = true;
-            std::fprintf(stderr,
-                         "dytrec: recording %dx%d @ %.2f fps, codec %s -> %s\n",
-                         ww, hh, r.fps, r.codec.c_str(), r.out.c_str());
+        if (dyt_recorder_write(rec, rgb, ww, hh) != 0) {
+            dyt_recorder_close(rec);
+            return -1;
         }
-
-        /* dyt_session_render_rgb() produces RGB; OpenCV wants BGR. */
-        cv::Mat src(hh, ww, CV_8UC3, const_cast<uint8_t *>(rgb));
-        cv::Mat bgr;
-        cv::cvtColor(src, bgr, cv::COLOR_RGB2BGR);
-        w.write(bgr);
         written++;
 
         /* Pace to the requested rate.  Without this a fixture would be encoded
@@ -256,8 +243,7 @@ static int record_frames(dyt_frame_source_t *fs, const rec &r)
         std::this_thread::sleep_until(due);
     }
 
-    if (opened)
-        w.release();
+    dyt_recorder_close(rec);
 
     std::fprintf(stderr, "dytrec: wrote %d frame(s)%s\n", written,
                  g_stop ? " (interrupted)" : "");

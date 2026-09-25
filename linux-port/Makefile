@@ -228,6 +228,14 @@ ifdef HAVE_OPENCV
 TOOLS += $(BUILD)/dytrec
 endif
 
+# The mp4 writer both dytrec and the Qt app's `v` key drive.  It needs OpenCV,
+# so it exists only when OpenCV does; when it does not, both tools are built
+# without it and the app says so rather than failing at the first frame.
+REC_OBJ :=
+ifdef HAVE_OPENCV
+REC_OBJ := $(BUILD)/recorder.o
+endif
+
 # The Qt6 GUI shell.  Like dytrec, its fixture and --selftest paths are
 # device-free, so it is useful on a host with no libusb; live capture goes
 # through the same tools/frame_source.c and so needs libuvc only when present.
@@ -441,19 +449,26 @@ $(BUILD)/frame_source.o: tools/frame_source.c tools/frame_source.h $(HDRS) $(FLA
 $(BUILD)/poll_model_test: tools/poll_model_test.c $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) -o $@
 
-$(BUILD)/dytrec: tools/dytrec.cpp $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) -o $@
+# The shared mp4 writer.  An explicit rule because the generic pattern only
+# covers src/*.c, and because it is C++ over OpenCV.
+$(BUILD)/recorder.o: tools/recorder.cpp tools/recorder.h $(FLAG_STAMP) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Itools -c $< -o $@
+
+$(BUILD)/dytrec: tools/dytrec.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) -o $@
 
 # The Qt6 GUI shell.  It links the same two pieces as dytrec — the port library
 # and the frame source — plus Qt6 Widgets.  The frame source is the seam that
 # keeps the app testable: pointed at a fixture it is device-free, pointed at
 # libuvc it is the live camera, and the GUI code does not change between them.
-# $(UVC_LINK) is empty when libusb is absent, exactly as for dytrec.
+# $(UVC_LINK) is empty when libusb is absent, exactly as for dytrec.  $(REC_OBJ)
+# and $(CV_LIBS) are empty when OpenCV is: the app then has no `v` key and says
+# so, rather than failing at the first recorded frame.
 #
 # -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
 # it relatively, whereas gui/dytqt.cpp does not.
-$(BUILD)/dytqt: gui/dytqt.cpp $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) -Itools $< $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(QT6_LIBS) -o $@
+$(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(QT6_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.
