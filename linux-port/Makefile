@@ -23,6 +23,11 @@ CFLAGS ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -ffp-contract=off
 CFLAGS += -Isrc -Ithird_party/libuvc/include -Ithird_party/stb
 LDLIBS := -lm -lpthread
 
+# The app's version, in one place: the GUI compiles it in (the -DDYT_VERSION
+# macro below) and the package is named after it, so the About box and the
+# .deb cannot disagree.  See the packaging section at the end of this file.
+VERSION ?= 0.1.0
+
 # libusb-1.0 enables the real control-transfer backend and the probe tool.
 USB_CFLAGS := $(shell pkg-config --cflags libusb-1.0 2>/dev/null)
 USB_LIBS   := $(shell pkg-config --libs   libusb-1.0 2>/dev/null)
@@ -133,6 +138,11 @@ ifdef HAVE_MNN
 QT_DEFS += -DDYT_HAVE_MNN
 endif
 
+# The version the About box reports, taken from the same VERSION the package is
+# built as.  The single quotes survive make and the shell and leave the double
+# quotes for the compiler, so the macro is the string "0.1.0" and not a number.
+QT_DEFS += -DDYT_VERSION='"$(VERSION)"'
+
 BUILD := build
 
 # ---------------------------------------------------------------------------
@@ -211,6 +221,18 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
             $(BUILD)/mnn.o $(BUILD)/view_model.o $(BUILD)/frame_ready.o
 
+# The MNN runtime object belongs *in* the archive, beside mnn.o.  mnn.o is a
+# member of libdyt.a and, when a runtime is present, references
+# dyt_mnn_runtime_*; without mnn_runtime.o the archive is not self-consistent
+# and any consumer that calls the seam and links libdyt.a alone fails with
+# undefined references.  Archive semantics keep this cheap: a member is only
+# extracted when something references it, so a front end that never touches the
+# seam (dytqt, dytrec, dytview) still links no MNN — verified by there being no
+# dyt_mnn symbol and no libMNN NEEDED entry in those binaries.
+ifdef HAVE_MNN
+LIB_OBJS += $(BUILD)/mnn_runtime.o
+endif
+
 TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/calib_test $(BUILD)/pipeline_test $(BUILD)/palette_test \
          $(BUILD)/units_test $(BUILD)/display_test $(BUILD)/measure_test \
@@ -272,7 +294,7 @@ endif
 FROZEN := $(addprefix tools/thermometry_diff/out/, \
             240 240_fixon 256 256_fixon 384 384_fixon 640 640_fixon)
 
-.PHONY: all check clean
+.PHONY: all check clean install uninstall deb
 
 # libuvc is only needed by the live-capture tools; the byte-verified
 # pipeline and its tests build with just a C compiler, so $(UVC_LIB) is
@@ -411,19 +433,18 @@ $(BUILD)/imgwrite_test: src/imgwrite_test.c $(LIB) | $(BUILD)
 # model at models/zoom2.mnn, so run it from the port root.
 #
 # The test itself is C, but the runtime half is C++, so the link goes through
-# $(CXX) whenever MNN is present.
+# $(CXX) whenever MNN is present.  mnn_runtime.o comes from $(LIB) — it is a
+# member of the archive — so the link only adds the MNN library itself.
 ifdef HAVE_MNN
 $(BUILD)/mnn_runtime.o: src/mnn_runtime.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(MNN_CFLAGS) -c $< -o $@
-
-MNN_OBJ := $(BUILD)/mnn_runtime.o
 endif
 
 $(BUILD)/mnn_test.o: src/mnn_test.c $(HDRS) $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) $(MNN_OBJ) | $(BUILD)
-	$(CXX) $(BUILD)/mnn_test.o $(LIB) $(MNN_OBJ) $(LDLIBS) $(MNN_LIBS) -o $@
+$(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) | $(BUILD)
+	$(CXX) $(BUILD)/mnn_test.o $(LIB) $(LDLIBS) $(MNN_LIBS) -o $@
 
 $(BUILD)/dumpframe: src/dumpframe.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
@@ -529,6 +550,7 @@ ifdef HAVE_QT6
 	@echo "== Qt6 GUI self-test =="
 	@$(BUILD)/dytqt --selftest
 endif
+	@sh packaging/check.sh
 	@echo "== frame pipeline vs frozen vendor ground truth =="
 	@fail=0; \
 	for d in $(FROZEN); do \
@@ -544,3 +566,101 @@ endif
 
 clean:
 	rm -rf $(BUILD)
+
+# ---------------------------------------------------------------------------
+# Packaging: install and .deb
+#
+# The desktop entry and icon live in packaging/ and are checked against the app
+# by packaging/check.sh, which `make check` runs.  `make install` lays the
+# freedesktop files out under DESTDIR/PREFIX; `make deb` wraps that same layout
+# in a Debian package, so the two cannot drift — the deb installs exactly what
+# `make install` does, plus the control metadata.
+#
+# The build host is Fedora, so the deb is a cross-format artifact: dpkg-deb
+# builds and inspects it, but nothing here installs or runs it.  Depends is
+# measured from the binary with dpkg-shlibdeps when dpkg-dev is present, and
+# otherwise falls back to DEB_DEPENDS below; the recipe says which it used, so a
+# guess is never mistaken for a measurement.
+# ---------------------------------------------------------------------------
+PREFIX  ?= /usr/local
+DESTDIR ?=
+BINDIR   = $(PREFIX)/bin
+DATADIR  = $(PREFIX)/share
+APPDIR   = $(DATADIR)/applications
+ICONDIR  = $(DATADIR)/icons/hicolor
+
+# The hicolor sizes this icon is installed at.  The SVG alone is not enough:
+# several desktops still do not read scalable icons, so the Makefile rasterises
+# it with ImageMagick at install time and ships no PNG in the source tree.
+ICON_SIZES := 16 24 32 48 64 128 256
+ICON_TOOL  := $(shell command -v magick 2>/dev/null || command -v convert 2>/dev/null)
+
+DEB_NAME       := dytqt
+DEB_ARCH       := $(shell dpkg --print-architecture 2>/dev/null || echo unknown)
+DEB_MAINTAINER ?= dytqt port <noreply@example.invalid>
+
+# The fallback dependency list, used only when dpkg-shlibdeps cannot measure it.
+# The OpenCV runtime packages carry the upstream soname (libopencv-core406 on
+# Debian bookworm, ...410 on trixie), so this default names one release; set
+# DEB_DEPENDS for your target.  The Qt6 and libusb names are unversioned.
+DEB_DEPENDS ?= libc6, libstdc++6, libgcc-s1, libusb-1.0-0, \
+	libopencv-core406, libopencv-imgproc406, libopencv-highgui406, \
+	libopencv-videoio406, libopencv-imgcodecs406, \
+	libqt6widgets6, libqt6gui6, libqt6core6
+
+DEB_ROOT := $(BUILD)/deb/$(DEB_NAME)_$(VERSION)_$(DEB_ARCH)
+DEB_FILE := $(BUILD)/$(DEB_NAME)_$(VERSION)_$(DEB_ARCH).deb
+
+install: $(BUILD)/dytqt
+	@test -n "$(ICON_TOOL)" || { \
+	    echo "install: ImageMagick (magick or convert) is needed for the icon" >&2; \
+	    exit 1; }
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 0755 $(BUILD)/dytqt $(DESTDIR)$(BINDIR)/dytqt
+	install -d $(DESTDIR)$(APPDIR)
+	install -m 0644 packaging/dytqt.desktop $(DESTDIR)$(APPDIR)/dytqt.desktop
+	@for s in $(ICON_SIZES); do \
+	    install -d $(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps; \
+	    $(ICON_TOOL) -background none packaging/dytqt.svg -resize $${s}x$${s} \
+	        $(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png || exit 1; \
+	done
+	@echo "installed dytqt $(VERSION) to $(DESTDIR)$(PREFIX)"
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/dytqt
+	rm -f $(DESTDIR)$(APPDIR)/dytqt.desktop
+	@for s in $(ICON_SIZES); do \
+	    rm -f $(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png; \
+	done
+	@echo "removed dytqt from $(DESTDIR)$(PREFIX)"
+
+deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
+	@command -v dpkg-deb >/dev/null 2>&1 || { \
+	    echo "deb: dpkg-deb is required (install dpkg)" >&2; exit 1; }
+	rm -rf $(DEB_ROOT)
+	install -d $(DEB_ROOT)/DEBIAN
+	$(MAKE) install DESTDIR=$(abspath $(DEB_ROOT)) PREFIX=/usr BUILD=$(BUILD)
+	@dep="$(DEB_DEPENDS)"; \
+	if command -v dpkg-shlibdeps >/dev/null 2>&1; then \
+	    if d=$$(dpkg-shlibdeps -O $(BUILD)/dytqt 2>/dev/null \
+	            | sed -n 's/^shlibs:Depends=//p') && [ -n "$$d" ]; then \
+	        dep="$$d"; echo "deb: Depends measured from the binary"; \
+	    else \
+	        echo "deb: Depends from DEB_DEPENDS (dpkg-shlibdeps gave nothing)"; \
+	    fi; \
+	else \
+	    echo "deb: Depends from DEB_DEPENDS (dpkg-shlibdeps absent)"; \
+	fi; \
+	sed -e 's|@PACKAGE@|$(DEB_NAME)|g' \
+	    -e 's|@VERSION@|$(VERSION)|g' \
+	    -e 's|@ARCH@|$(DEB_ARCH)|g' \
+	    -e "s|@DEPENDS@|$$dep|g" \
+	    -e 's|@MAINTAINER@|$(DEB_MAINTAINER)|g' \
+	    packaging/deb/control.in > $(DEB_ROOT)/DEBIAN/control; \
+	chmod 0644 $(DEB_ROOT)/DEBIAN/control
+	install -d $(DEB_ROOT)/usr/share/doc/$(DEB_NAME)
+	install -m 0644 packaging/deb/copyright \
+	    $(DEB_ROOT)/usr/share/doc/$(DEB_NAME)/copyright
+	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_FILE)
+	@echo "built $(DEB_FILE)"
+	@dpkg-deb --info $(DEB_FILE)
