@@ -52,7 +52,6 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QMenu>
-#include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
@@ -61,6 +60,7 @@
 #include <QPolygon>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSize>
@@ -68,7 +68,6 @@
 #include <QTabWidget>
 #include <QTextBrowser>
 #include <QTimer>
-#include <QToolBar>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -120,7 +119,7 @@ static const int kStripPad = 4;  /* the strip's own margin */
  * them against the reference without grepping for hex. */
 static const char kDarkQss[] =
     "QWidget { background: #1e1e1e; color: #e6e6e6; }"
-    "QMenuBar, QToolBar, QTabWidget::pane, QGroupBox, QFrame { "
+    "QTabWidget::pane, QGroupBox, QFrame { "
         "background: #2b2b2b; }"
     "QGroupBox { border: 1px solid #3a3a3a; border-radius: 2px; "
         "margin-top: 10px; padding-top: 6px; }"
@@ -187,6 +186,7 @@ struct opts {
     std::string fixture = "testdata/mode1000_256x384_default.raw";
     std::string palette_dir;
     std::string png;                 /* save the canvas here, then exit */
+    std::string shot;                /* save the whole window here, then exit */
     std::string capture_dir = ".";   /* where 's' and 'v' put their files */
     std::string model;               /* --model: the super-resolution model */
     int  width   = 256;
@@ -348,6 +348,10 @@ static void usage(const char *prog)
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
         "  --png PATH       write the canvas here and exit\n"
+        "  --shot PATH      write the whole window here and exit (the shell,\n"
+        "                   rail and panel included — use --png for the picture\n"
+        "                   alone).  Either implies --frames 1 unless one is\n"
+        "                   given, so the app exits by itself\n"
         "  --capture-dir D  where 's' (still) and 'v' (clip) write, and the\n"
         "                   folder the gallery lists (default: the Pictures\n"
         "                   folder, else $HOME; a saved preference wins)\n"
@@ -369,9 +373,10 @@ static void usage(const char *prog)
         "\n"
         "with --live the window reconnects on its own; press r to retry now\n"
         "\n"
-        "in the window: F11 is full screen, and Help -> Keyboard shortcuts\n"
-        "opens the full key guide; everything the keys do is also on the menu\n"
-        "bar and the toolbar\n",
+        "in the window: F11 is full screen; the left rail's Tutorials opens the\n"
+        "full key guide, and its Setting opens the parameters and the view\n"
+        "options.  Everything the keys do is on the rail or in the right panel,\n"
+        "and quit is the window's close button or 'q'\n",
         prog, opts{}.fixture.c_str());
 }
 
@@ -405,6 +410,7 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--fixture")                 { const char *v = next("--fixture"); if (!v) return false; o.fixture = v; o.fixture_set = true; }
         else if (a == "--palette-dir")             { const char *v = next("--palette-dir"); if (!v) return false; o.palette_dir = v; }
         else if (a == "--png")                     { const char *v = next("--png"); if (!v) return false; o.png = v; }
+        else if (a == "--shot")                    { const char *v = next("--shot"); if (!v) return false; o.shot = v; }
         else if (a == "--capture-dir")             { const char *v = next("--capture-dir"); if (!v) return false; o.capture_dir = v; o.capture_dir_set = true; }
         else if (a == "--prefs")                   { const char *v = next("--prefs"); if (!v) return false; o.prefs_path = v; }
         else if (a == "--no-prefs")                o.no_prefs = true;
@@ -1895,7 +1901,13 @@ public:
     explicit StatusStrip(QWidget *parent = nullptr) : QWidget(parent)
     {
         setAutoFillBackground(true);
-        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        /* The width is Ignored, the height Fixed.  The picture decides how wide
+         * the window is — never the status text: a long line (a saved file's
+         * full path, a device's notice) would otherwise widen the window the
+         * moment it appeared, and the window would jump as notices came and
+         * went.  The paint already elides each line to whatever width it is
+         * given, so nothing is lost, only shortened. */
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     }
 
     void set_lines(const QString &a, const QString &b, const QString &c)
@@ -2219,13 +2231,13 @@ private:
  * The Windows counterpart's left rail (manual p.5, /tmp/pdfx/w-08.png) is a
  * slim vertical strip of stacked icon+label buttons.  This is its Qt analogue.
  *
- * Every button is `Qt::NoFocus` for the same reason the menu bar and toolbar
- * rows were (and still are, while those exist): a focused button swallows the
- * keys before `keyPressEvent` sees them, which would silently break every
- * binding the moment someone clicked the rail.  `checkable` buttons mirror a
- * QAction's toggle so `handle_key` can drive them and `sync_actions()` can set
- * their state.  Each button's `clicked` runs the same `handle_key` the keyboard
- * does, so the rail is a second route to the same actions — never a second set.
+ * Every button is `Qt::NoFocus` for the same reason the control panel's are: a
+ * focused button swallows the keys before `keyPressEvent` sees them, which
+ * would silently break every binding the moment someone clicked the rail.
+ * `checkable` buttons are set from the session, not from their own toggle, so
+ * `handle_key` can drive them and `sync_actions()` can set their state.  Each
+ * button's `clicked` runs the same `handle_key` the keyboard does, so the rail
+ * is a second route to the same actions — never a second set.
  *
  * The eight icons are QPainter-drawn vectors: the package ships no icon assets,
  * and a hand-drawn glyph is the closest a no-asset build can come to the
@@ -2504,6 +2516,47 @@ public:
     }
     QTabWidget *tabs() const { return tabs_; }
 
+    /* The panel is as tall as its current page's content.
+     *
+     * QScrollArea::sizeHint() with widgetResizable() reports a small default
+     * rather than the widget's own, so the window would come up short — and
+     * because widgetResizable() resizes the page to the viewport, a page taller
+     * than that is neither scrolled nor fitted: it is silently clipped, and the
+     * last group becomes a control the user cannot reach.  Asking the page's
+     * own layout for what it needs is the fix; the scroll area then saves the
+     * user when the window is deliberately made smaller than that.
+     *
+     * The *current* page, not the tallest: the window is sized once, when the
+     * first frame arrives, and never re-fits on a tab switch, so the height
+     * stays put and only the opening tab has to fit.  Troubleshoot is both
+     * first and tallest, so nothing is hidden at start-up either way. */
+    QSize sizeHint() const override
+    {
+        QSize s(kPanelW, 0);
+        if (tabs_ && tabs_->currentWidget()) {
+            QWidget *page = tabs_->currentWidget();
+            if (auto *sa = qobject_cast<QScrollArea *>(page))
+                if (sa->widget())
+                    page = sa->widget();
+            s.setHeight(tabs_->tabBar()->sizeHint().height() +
+                        page->sizeHint().height());
+        }
+        return s;
+    }
+
+    /* …but it may be squeezed.  The height hint above is a preference, not a
+     * floor: without this the panel's minimum would be its content's, the
+     * window could not be made shorter than the tallest page, and the scroll
+     * area would be inert — a window that cannot be shrunk small enough for the
+     * screen is its own trap.  The tab bar plus one row is enough to see that
+     * the panel is there; the scroll area is what keeps every group reachable
+     * below that. */
+    QSize minimumSizeHint() const override
+    {
+        return QSize(kPanelW, (tabs_ ? tabs_->tabBar()->sizeHint().height() : 0)
+                              + 48);
+    }
+
     /* Bring every checkmark up to date with the frame just painted.  The
      * session-derived states come from `snap`; the three that live on the
      * canvas or the window (the marker toggle, a running clip, an open gallery)
@@ -2579,7 +2632,7 @@ public:
      * holding.  Each of 'z' and 'Z' toggles *its own* plane, so neither alone
      * means "off" from every mode — from thermal, 'z' would select visible
      * rather than clear.  Off therefore presses the key of the mode it is
-     * leaving, exactly as the menu's Off item does. */
+     * leaving, which is also why it needs a callback rather than a fixed key. */
     int sr_off_key() const
     {
         return sr_mode_ == DYT_SR_THERMAL ? 'Z' : 'z';
@@ -3171,6 +3224,23 @@ public:
         }
     }
 
+    /* The two Display controls that are window/canvas state rather than session
+     * state.  Set here — with the signals blocked — because this is the window
+     * telling the box what happened, not the box asking: a user pressing F11 or
+     * 'd' while the dialog is open must not leave it showing the other state,
+     * and a stalled stream paints no frame for the per-frame sync to catch. */
+    void sync_window(bool fullscreen, bool info)
+    {
+        if (fullscreen_) {
+            const QSignalBlocker block(fullscreen_);
+            fullscreen_->setChecked(fullscreen);
+        }
+        if (info_) {
+            const QSignalBlocker block(info_);
+            info_->setChecked(info);
+        }
+    }
+
     /* -- what --selftest drives.  The rows are indexed by dyt_order_type_t, so
      * a test asks for the parameter by the same name the ladder uses. */
     QDoubleSpinBox *spin(dyt_order_type_t t) const
@@ -3288,22 +3358,22 @@ public:
 
         /* The shell is the three-column Windows layout: a left icon rail, a
          * centre column holding the canvas and its status bar, and a right
-         * tabbed control panel.  The menu bar and two toolbar rows still live
-         * in the centre column for now; they are retired once the rail and
-         * panel carry every action they expose.
+         * tabbed control panel.  There is no menu bar and no toolbar — the
+         * reference has neither, and every action they carried now has a home
+         * on the rail, in the panel, or in the Settings dialog.
          *
          * MainWindow stays a plain QWidget rather than becoming a QMainWindow.
          * QMainWindow::sizeHint() does not account for its menu and tool bar
          * heights, so fit_to_view()'s resize(sizeHint()) would size the window
          * for the central widget alone and let the bars steal rows from the
-         * canvas — clipping the picture.  As rows of the centre column's
-         * QVBoxLayout they count towards QWidget::sizeHint() automatically, and
-         * the outer QHBoxLayout that holds rail | centre | panel is itself a
-         * row of that same QWidget::sizeHint(). */
+         * canvas — clipping the picture.  The centre column's QVBoxLayout rows
+         * count towards QWidget::sizeHint() automatically, and the outer
+         * QHBoxLayout that holds rail | centre | panel is itself a row of that
+         * same QWidget::sizeHint(). */
         rail_  = new IconRail(this);
         panel_ = new ControlPanel(this);
         /* Every panel control runs the one dispatch, exactly as the rail does
-         * and as the menu items did. */
+         * and as the retired menu items did. */
         panel_->on_key = [this](int k) { handle_key(k); };
 
         /* The rail's items.  Setting and Contact open a dialog; Palette opens
@@ -3362,9 +3432,6 @@ public:
         auto *clay = new QVBoxLayout(centre);
         clay->setContentsMargins(0, 0, 0, 0);
         clay->setSpacing(0);
-        clay->addWidget(build_menus(), 0);
-        clay->addWidget(toolbar_row(true), 0);
-        clay->addWidget(toolbar_row(false), 0);
         clay->addWidget(view_, 1);
         clay->addWidget(strip_, 0);
 
@@ -3430,7 +3497,8 @@ public:
             /* The Display controls route the same two ways every other
              * control does: through handle_key when the action has a key, and
              * through the session when it is an absolute choice no key can
-             * express (unit, fusion — the same split the menu bar made). */
+             * express (unit, fusion — the same split the retired menu bar
+             * made). */
             settings_->on_key = [this](int k) { handle_key(k); };
             settings_->on_unit = [this](dyt_unit_t u) {
                 if (sess_)
@@ -3549,9 +3617,10 @@ public:
     GalleryPanel *gallery_panel() const { return gal_panel_; }
 
     /* The session the on-screen controls act on.  The canvas borrows it too;
-     * the window needs its own handle because a few menu items (unit, fusion)
-     * select an absolute value, which no key does — cycling is all the
-     * keyboard can express.  Borrowed, never freed here. */
+     * the window needs its own handle because a few controls (unit, fusion,
+     * the palette popup's higher entries, Reset Image) select an absolute
+     * value or an operation, which no key expresses.  Borrowed, never freed
+     * here. */
     void set_session(dyt_session_t *s)
     {
         sess_ = s;
@@ -3584,9 +3653,10 @@ public:
      * anything saved since it was last looked at. */
     std::function<void()> on_gallery_refresh_;
 
-    /* The Folder… button and the File menu item.  The front end owns the
-     * dialog and the directory, so the window only reports that it was asked
-     * for — the same split as every other callback here. */
+    /* The gallery's Folder… button (the File menu's item went with the menu).
+     * The front end owns the dialog and the directory, so the window only
+     * reports that it was asked for — the same split as every other callback
+     * here. */
     std::function<void()> on_choose_folder_;
 
     /* The About box.  A callback so --selftest can see the key without a modal
@@ -3596,8 +3666,8 @@ public:
     /* The usage guide.  A callback for the same reason About is one: the modal
      * lives in the front end, so --selftest can observe the route without a
      * dialog.  It has no key of its own — F1 is About, and F sits next to 'f'
-     * (fusion), where a mis-shift would open a modal.  The Help menu and the
-     * toolbar button are how it is reached. */
+     * (fusion), where a mis-shift would open a modal.  The rail's Tutorials
+     * item is how it is reached. */
     std::function<void()> on_help_;
 
     /* The browsing state, owned here and read by the canvas at paint time. */
@@ -3607,25 +3677,6 @@ public:
      * clip up? paused?) and steers it (pause, stop), but the pump owns it and
      * is what advances it — the same borrow as sess_. */
     void set_playback(PlaybackCtl *p) { play_ = p; }
-
-    /* The on-screen controls, public so --selftest can trigger one and check it
-     * lands where the key would.  Every one of them is also the member
-     * sync_actions() keeps checked against the snapshot. */
-    QAction *act_palette_[10] = {};
-    QAction *act_unit_[DYT_UNIT_N] = {};
-    QAction *act_range_       = nullptr;
-    QAction *act_flip_h_      = nullptr;
-    QAction *act_flip_v_      = nullptr;
-    QAction *act_fusion_[DYT_FUSION_N] = {};
-    QAction *act_sr_[3]       = {};
-    QAction *act_tool_[4]     = {};
-    QAction *act_alarm_       = nullptr;
-    QAction *act_iso_         = nullptr;
-    QAction *act_info_        = nullptr;
-    QAction *act_record_      = nullptr;
-    QAction *act_gallery_     = nullptr;
-    QAction *act_fullscreen_  = nullptr;
-    QAction *act_help_        = nullptr;
 
     /* Show a saved still: the canvas draws it and line 3 names it.  The pump
      * keeps painting the live frame underneath, so clear_viewing() restores the
@@ -3702,10 +3753,6 @@ public:
         gal_.open = 0;
         if (gal_panel_)
             gal_panel_->hide();
-        if (act_gallery_) {
-            const QSignalBlocker block(act_gallery_);
-            act_gallery_->setChecked(false);
-        }
         view_->update();
     }
 
@@ -3802,14 +3849,12 @@ public:
             fitted_ = QSize();
             fit_to_view();
         }
-        /* The checkmark is set here as well as in sync_actions(), because the
-         * fullscreen state does not come from a frame: a stalled stream paints
-         * no frame, so the sync would not run and the menu would keep claiming
-         * the old state. */
-        if (act_fullscreen_) {
-            const QSignalBlocker block(act_fullscreen_);
-            act_fullscreen_->setChecked(fullscreen_);
-        }
+        /* Told to the Settings dialog here as well as in sync_actions(),
+         * because the fullscreen state does not come from a frame: a stalled
+         * stream paints no frame, so the per-frame sync would not run and the
+         * box would keep claiming the old state. */
+        if (settings_)
+            settings_->sync_window(fullscreen_, view_ && view_->info_shown());
         if (view_)
             view_->update();
     }
@@ -3845,8 +3890,9 @@ public:
 
     /* The single key dispatch.  Every key the app understands is interpreted
      * here and nowhere else, so the keyboard and the on-screen controls cannot
-     * disagree: a menu item or a toolbar button is just a call to this with the
-     * character its key would produce.  That is also why no QAction carries a
+     * disagree: a rail button, a panel row or a palette entry is just a call to
+     * this with the character its key would produce.  That is also why no
+     * QAction carries a
      * shortcut — Qt's shortcut map runs *before* keyPressEvent, so a shortcut
      * would fire while a runtime-parameter candidate is armed and break the
      * ladder's swallow contract (assertion 30).  The key's name belongs in the
@@ -4037,20 +4083,22 @@ protected:
     }
 
 private:
-    /* ---- the on-screen controls ----------------------------------------
+    /* ---- the palette picker's items ------------------------------------
      *
-     * Every item that has a key runs that key, through handle_key().  Nothing
-     * here sets a shortcut: Qt's shortcut map consumes a matching key *before*
-     * keyPressEvent runs, so a shortcut would fire while a runtime-parameter
-     * candidate is armed and break the ladder's swallow contract (assertion
-     * 30).  The key's name goes in the item's tooltip instead.
+     * These two builders outlived the menu bar they were written for: the
+     * palette popup is the one menu left, and it follows the same rule the
+     * retired menus did — an item that has a key *runs that key* through
+     * handle_key(), so the on-screen route can never be a second
+     * implementation.  Nothing here sets a QAction shortcut: Qt's shortcut map
+     * consumes a matching key *before* keyPressEvent runs, so a shortcut would
+     * fire while a runtime-parameter candidate is armed and break the ladder's
+     * swallow contract (assertion 30).  The key's name goes in the tooltip
+     * instead.
      *
-     * The two exceptions are the menus that select an *absolute* value — unit
-     * and fusion — because no key expresses one: the keys cycle.  Each is a
-     * single session setter, so there is no rule for the two to disagree about.
-     *
-     * The same QAction objects are shared between a menu and the toolbar, so a
-     * checkmark and a tool button are the same state by construction. */
+     * The one exception is the entry that selects an *absolute* value no key
+     * can express — a palette past the tenth — which sets the session directly.
+     * It is a single session setter, so there is no rule for the two to
+     * disagree about. */
 
     /* An item that does exactly what its key does.  `hint` names the key, for
      * the tooltip only. */
@@ -4102,209 +4150,13 @@ private:
         menu->popup(btn->mapToGlobal(QPoint(0, btn->height())));
     }
 
-    QMenuBar *build_menus()
-    {
-        auto *bar = new QMenuBar(this);
-        /* Neither bar may take focus.  A focused tool button swallows the keys
-         * before keyPressEvent sees them, which would silently break every
-         * binding in the app the moment someone clicked a button. */
-        bar->setFocusPolicy(Qt::NoFocus);
-        bar->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-
-        /* ---- File ---- */
-        QMenu *file = bar->addMenu(QStringLiteral("&File"));
-        file->addAction(key_action(QStringLiteral("Save still"), 's', "s"));
-        act_record_  = key_action(QStringLiteral("Record clip"), 'v', "v", true);
-        act_gallery_ = key_action(QStringLiteral("Gallery"), 'g', "g", true);
-        file->addAction(act_record_);
-        file->addAction(act_gallery_);
-        file->addSeparator();
-        file->addAction(key_action(QStringLiteral("Quit"), 'q', "q"));
-
-        /* ---- View ---- */
-        QMenu *view = bar->addMenu(QStringLiteral("&View"));
-        act_fullscreen_ = key_action(QStringLiteral("Full screen"),
-                                     Qt::Key_F11, "F11", true);
-        view->addAction(act_fullscreen_);
-        view->addSeparator();
-
-        /* The ten the digits reach.  Palettes past the tenth are still
-         * reachable with Next/Previous, exactly as the keyboard reaches them —
-         * so the menu is no more capable than the keys, and no less. */
-        QMenu *pal = view->addMenu(QStringLiteral("Palette"));
-        auto  *palgrp = new QActionGroup(this);
-        palgrp->setExclusive(true);
-        for (int i = 0; i < 10; i++) {
-            const int  key    = (i == 9) ? '0' : ('1' + i);
-            const char hint[] = { (char)key, '\0' };
-            act_palette_[i] = key_action(
-                QStringLiteral("Palette %1").arg(i + 1), key, hint, true);
-            palgrp->addAction(act_palette_[i]);
-            pal->addAction(act_palette_[i]);
-        }
-        pal->addSeparator();
-        pal->addAction(key_action(QStringLiteral("Next palette"), '.', "."));
-        pal->addAction(key_action(QStringLiteral("Previous palette"), ',', ","));
-
-        QMenu *unit = view->addMenu(QStringLiteral("Unit"));
-        auto  *ugrp = new QActionGroup(this);
-        ugrp->setExclusive(true);
-        for (int i = 0; i < DYT_UNIT_N; i++) {
-            const char *nm = dyt_unit_name((dyt_unit_t)i);
-            act_unit_[i] = plain_action(
-                QString::fromUtf8(nm ? nm : "?"),
-                [this, i]() {
-                    if (sess_)
-                        dyt_session_set_unit(sess_, (dyt_unit_t)i);
-                },
-                true);
-            ugrp->addAction(act_unit_[i]);
-            unit->addAction(act_unit_[i]);
-        }
-
-        act_range_ = key_action(QStringLiteral("Fixed range"), 't', "t", true);
-        view->addAction(act_range_);
-        view->addSeparator();
-
-        act_flip_h_ = key_action(QStringLiteral("Flip horizontally"), 'h', "h", true);
-        act_flip_v_ = key_action(QStringLiteral("Flip vertically"), 'H', "H", true);
-        view->addAction(act_flip_h_);
-        view->addAction(act_flip_v_);
-        view->addSeparator();
-        view->addAction(key_action(QStringLiteral("Zoom in"), '+', "+"));
-        view->addAction(key_action(QStringLiteral("Zoom out"), '-', "-"));
-        view->addSeparator();
-
-        QMenu *fus = view->addMenu(QStringLiteral("Fusion"));
-        auto  *fgrp = new QActionGroup(this);
-        fgrp->setExclusive(true);
-        for (int i = 0; i < DYT_FUSION_N; i++) {
-            const char *nm = dyt_fusion_name((dyt_fusion_t)i);
-            act_fusion_[i] = plain_action(
-                QString::fromUtf8(nm ? nm : "?"),
-                [this, i]() {
-                    if (sess_)
-                        dyt_session_set_fusion(sess_, (dyt_fusion_t)i);
-                },
-                true);
-            fgrp->addAction(act_fusion_[i]);
-            fus->addAction(act_fusion_[i]);
-        }
-
-        /* Super-resolution.  "Off" has no key: the keys toggle whichever plane
-         * is selected, so off is the same key again.  Routing it through the
-         * active plane's key keeps the refusal notice, which is the only
-         * feedback a super-resolution key that cannot take effect ever has. */
-        QMenu *sr = view->addMenu(QStringLiteral("Super-resolution"));
-        auto  *sgrp = new QActionGroup(this);
-        sgrp->setExclusive(true);
-        act_sr_[0] = plain_action(QStringLiteral("Off"), [this]() {
-            if (snap_.sr != DYT_SR_OFF)
-                handle_key(snap_.sr == DYT_SR_THERMAL ? 'Z' : 'z');
-        }, true);
-        act_sr_[1] = key_action(QStringLiteral("Visible plane (2x)"), 'z', "z", true);
-        act_sr_[2] = key_action(QStringLiteral("Thermal plane (2x)"), 'Z', "Z", true);
-        for (int i = 0; i < 3; i++) {
-            sgrp->addAction(act_sr_[i]);
-            sr->addAction(act_sr_[i]);
-        }
-
-        view->addSeparator();
-        act_info_ = key_action(QStringLiteral("Device panel"), 'd', "d", true);
-        view->addAction(act_info_);
-
-        /* ---- Measure ---- */
-        QMenu *meas = bar->addMenu(QStringLiteral("&Measure"));
-        auto  *tgrp = new QActionGroup(this);
-        tgrp->setExclusive(true);
-        /* The menu's order and the array's index are different things:
-         * act_tool_ is indexed by dyt_tool_t, so the two are mapped rather
-         * than assumed equal (DYT_TOOL_NONE is 0, not last). */
-        static const struct {
-            const char *text;
-            const char *hint;
-            int         key;
-        } tools[4] = { { "Point", "p", 'p' },
-                       { "Line",  "l", 'l' },
-                       { "Box",   "b", 'b' },
-                       { "None",  "n", 'n' } };
-        static const dyt_tool_t order[4] = { DYT_TOOL_POINT, DYT_TOOL_LINE,
-                                             DYT_TOOL_BOX, DYT_TOOL_NONE };
-        for (int i = 0; i < 4; i++) {
-            act_tool_[order[i]] = key_action(QString::fromUtf8(tools[i].text),
-                                             tools[i].key, tools[i].hint, true);
-            tgrp->addAction(act_tool_[order[i]]);
-            meas->addAction(act_tool_[order[i]]);
-        }
-        meas->addSeparator();
-        act_alarm_ = key_action(QStringLiteral("Alarm"), 'a', "a", true);
-        act_iso_   = key_action(QStringLiteral("Isotherm"), 'i', "i", true);
-        meas->addAction(act_alarm_);
-        meas->addAction(act_iso_);
-
-        /* ---- Device ---- */
-        QMenu *dev = bar->addMenu(QStringLiteral("&Device"));
-        dev->addAction(key_action(QStringLiteral("Retry connection"), 'r', "r"));
-
-        /* ---- Help ---- */
-        QMenu *help = bar->addMenu(QStringLiteral("&Help"));
-        act_help_ = plain_action(QStringLiteral("Keyboard shortcuts"),
-                                 [this]() { if (on_help_) on_help_(); });
-        help->addAction(act_help_);
-        help->addAction(key_action(QStringLiteral("About"), '?', "?"));
-        return bar;
-    }
-
-    /* Two rows, not one.
+    /* Bring the on-screen checkmarks up to date with the frame that was just
+     * painted.
      *
-     * The package ships no icons, so a button is its text, and one row of these
-     * labels is wider than the picture it sits above — which would leave the
-     * window sized to the toolbar with the picture stranded in the middle of a
-     * lot of black.  Split in two, both rows fit inside the canvas's own width,
-     * so the window stays sized to the picture.  The width policy is Ignored
-     * for the same reason: the bars must never *widen* the window, and if a row
-     * ever does outgrow it, Qt shows its own overflow arrow rather than
-     * clipping silently.  Assertion 56 pins that neither row overflows at the
-     * default size — nothing may be hidden behind that arrow. */
-    QToolBar *toolbar_row(bool view_row)
-    {
-        auto *tb = new QToolBar(this);
-        tb->setFocusPolicy(Qt::NoFocus);
-        tb->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-        tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
-
-        if (view_row) {
-            tb->addAction(act_fullscreen_);
-            tb->addAction(act_info_);
-            tb->addSeparator();
-            tb->addAction(act_range_);
-            tb->addAction(act_flip_h_);
-            tb->addAction(act_flip_v_);
-            tb->addSeparator();
-            tb->addAction(act_help_);
-        } else {
-            tb->addAction(act_tool_[DYT_TOOL_POINT]);
-            tb->addAction(act_tool_[DYT_TOOL_LINE]);
-            tb->addAction(act_tool_[DYT_TOOL_BOX]);
-            tb->addAction(act_tool_[DYT_TOOL_NONE]);
-            tb->addSeparator();
-            tb->addAction(act_alarm_);
-            tb->addAction(act_iso_);
-            tb->addSeparator();
-            tb->addAction(key_action(QStringLiteral("Still"), 's', "s"));
-            tb->addAction(act_record_);
-            tb->addAction(act_gallery_);
-        }
-        return tb;
-    }
-
-    /* Bring the checkmarks up to date with the frame that was just painted.
-     *
-     * The snapshot is the authority, not the action's own toggle: an action
+     * The snapshot is the authority, not the button's own toggle: a control
      * whose key was refused (a super-resolution plane with no model, a write
-     * the device rejected) must not stay lit.  triggered() is what the actions
-     * are connected to and setChecked() does not emit it, so there is no loop
-     * here; the blocker is belt and braces.
+     * the device rejected) must not stay lit.  ControlPanel::sync() blocks the
+     * buttons' own signals for the same reason.
      *
      * Called only from set_frame_status — never from set_state_line, whose
      * snapshot is zeroed on the no-device path and would clear every
@@ -4312,44 +4164,8 @@ private:
      * states, which is what the canvas is still showing. */
     void sync_actions()
     {
-        auto set = [](QAction *a, bool on) {
-            if (!a)
-                return;
-            const QSignalBlocker block(a);
-            a->setChecked(on);
-        };
-
-        for (int i = 0; i < 10; i++) {
-            /* Only the palettes that actually loaded are selectable. */
-            if (act_palette_[i] && snap_.palette_n > 0)
-                act_palette_[i]->setEnabled(i < snap_.palette_n);
-            set(act_palette_[i], snap_.palette == i);
-        }
-        for (int i = 0; i < DYT_UNIT_N; i++)
-            set(act_unit_[i], (int)snap_.unit == i);
-        set(act_range_,  snap_.range_mode != DYT_RANGE_AUTO);
-        set(act_flip_h_, snap_.xform.flip_h != 0);
-        set(act_flip_v_, snap_.xform.flip_v != 0);
-        for (int i = 0; i < DYT_FUSION_N; i++)
-            set(act_fusion_[i], (int)snap_.fusion == i);
-        set(act_sr_[0], snap_.sr == DYT_SR_OFF);
-        set(act_sr_[1], snap_.sr == DYT_SR_VISIBLE);
-        set(act_sr_[2], snap_.sr == DYT_SR_THERMAL);
-        set(act_tool_[DYT_TOOL_POINT], snap_.tool == DYT_TOOL_POINT);
-        set(act_tool_[DYT_TOOL_LINE],  snap_.tool == DYT_TOOL_LINE);
-        set(act_tool_[DYT_TOOL_BOX],   snap_.tool == DYT_TOOL_BOX);
-        set(act_tool_[DYT_TOOL_NONE],  snap_.tool == DYT_TOOL_NONE);
-        set(act_alarm_, snap_.alarm_on != 0);
-        set(act_iso_,   snap_.iso_on != 0);
-        set(act_info_,  view_ && view_->info_shown());
-        set(act_record_, strip_ && !strip_->recording_label().isEmpty());
-        set(act_gallery_, gal_.open);
-        set(act_fullscreen_, fullscreen_);
-
-        /* The panel's checkmarks, from the same snapshot plus the three states
-         * that live on the canvas or the window.  Synced here rather than from
-         * the button's own toggle, so a key the session refused cannot leave a
-         * button lit. */
+        /* The panel's checkmarks, from the snapshot plus the three states that
+         * live on the canvas or the window. */
         if (panel_)
             panel_->sync(snap_, view_ && view_->hot_shown(),
                          strip_ && !strip_->recording_label().isEmpty(),
@@ -4368,6 +4184,13 @@ private:
                 b->setChecked(snap_.tool != DYT_TOOL_NONE);
             }
         }
+
+        /* The Settings dialog's two window-state boxes, so 'd' toggled from the
+         * keyboard cannot leave the dialog showing the other state.  Only when
+         * it exists: it is created on first use, and there is nothing to tell
+         * before that. */
+        if (settings_)
+            settings_->sync_window(fullscreen_, view_ && view_->info_shown());
 
         /* The Super Resolution page reads the session rather than the
          * snapshot, so it is synced from here too — it is correct even for the
@@ -4852,8 +4675,9 @@ static int selftest(const opts &o)
             fails++;
 
         /* The canvas is written, not the window the check above grabs: --png
-         * is documented as "write the canvas here", and the window has had a
-         * menu bar and a toolbar in it since they were added. */
+         * is documented as "write the canvas here".  The window is what --shot
+         * is for — the rail and the panel are in it, and this file's assertion
+         * 6 is the only place a window grab is otherwise needed. */
         if (!o.png.empty() && win.view()->has_frame()) {
             if (win.view()->grab().save(QString::fromUtf8(o.png.c_str()))) {
                 std::printf("  ok   canvas written to %s\n", o.png.c_str());
@@ -6626,34 +6450,12 @@ static int selftest(const opts &o)
             fails++;
     }
 
-    /* 50. A menu or toolbar item does what its key does.  The two are wired to
-     * one dispatch, so what this pins is the wiring: the palette action must
-     * move the session exactly as '3' does (assertion 43), or the on-screen
-     * controls would be a second front end, free to drift from the keyboard.
-     * '1' first, so the palette is somewhere the action has to move it from. */
-    {
-        dyt_snapshot_t s{};
-        send_char('1');                             /* palette index 0 */
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-        const int before = s.palette;
-
-        if (win.act_palette_[2])
-            win.act_palette_[2]->trigger();
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-
-        const bool ok = win.act_palette_[2] && before == 0 && s.palette == 2;
-        std::printf("  %-4s a menu action reaches the session like its key "
-                    "(palette %d -> %d)\n", ok ? "ok" : "FAIL", before,
-                    s.palette);
-        if (!ok)
-            fails++;
-    }
-
-    /* 50b. A control-panel button does what its key does.  The same rule as
-     * 50, one layer out: the panel is the Windows shell's second route to the
-     * same actions and must not become a second implementation.  The Line
-     * button must move the session exactly as 'l' does, and None must clear
-     * exactly as 'n' does. */
+    /* 50b. A control-panel button does what its key does.  The panel is the
+     * Windows shell's route to the same actions the keyboard reaches and must
+     * not become a second implementation.  The Line button must move the
+     * session exactly as 'l' does, and None must clear exactly as 'n' does.
+     * (The menu bar this assertion was paired with is gone; the panel is now
+     * the only on-screen route for these, so the check stands on its own.) */
     {
         dyt_snapshot_t s{};
         send_char('p');                         /* start somewhere to move from */
@@ -6723,9 +6525,9 @@ static int selftest(const opts &o)
     }
 
     /* 51. The checkmarks follow the frame, not the click.  The flip is driven
-     * from a *key* here, so a sync that merely echoed the action's own toggled
+     * from a *key* here, so a sync that merely echoed the button's own toggled
      * state would leave the mark wrong — which is the failure this exists to
-     * catch, since a checkable action is the only place the app shows a state
+     * catch, since a checkable button is the only place the app shows a state
      * the engine owns. */
     {
         /* Read the session's own state rather than assuming where the flip
@@ -6737,22 +6539,24 @@ static int selftest(const opts &o)
             dyt_session_snapshot(sess, &s, nullptr, 0);
             return s.xform.flip_h != 0;
         };
+        QPushButton *mark = win.panel()
+            ? win.panel()->button(ControlPanel::FlipH) : nullptr;
 
         send_char('h');
         pm.step();                  /* a painted frame is what drives the sync */
         const bool a  = flip_h();
-        const bool c1 = win.act_flip_h_ && win.act_flip_h_->isChecked() == a;
+        const bool c1 = mark && mark->isChecked() == a;
 
         send_char('h');
         pm.step();
         const bool b  = flip_h();
-        const bool c2 = win.act_flip_h_ && win.act_flip_h_->isChecked() == b;
+        const bool c2 = mark && mark->isChecked() == b;
 
         /* The mark matched the frame both times *and* the two frames differed,
-         * so neither a sync that never ran nor one that echoed the action's own
+         * so neither a sync that never ran nor one that echoed the button's own
          * toggle can pass.  The two 'h' presses cancel, leaving the flip as it
          * was found. */
-        const bool ok = win.act_flip_h_ && a != b && c1 && c2;
+        const bool ok = mark && a != b && c1 && c2;
         std::printf("  %-4s the checkmarks follow the frame, not the click "
                     "(flip h %d then %d, matched %s / %s)\n",
                     ok ? "ok" : "FAIL", (int)a, (int)b, c1 ? "yes" : "NO",
@@ -6761,45 +6565,26 @@ static int selftest(const opts &o)
             fails++;
     }
 
-    /* 52. The Help item routes to the guide.  Observed through the callback, so
-     * no dialog opens: the modal belongs to the front end, and --selftest must
-     * never need a display. */
+    /* 53. The control panel cannot take the keyboard.  A focused button
+     * swallows the keys before keyPressEvent sees them, which would break every
+     * binding in the app the moment someone clicked one — and it stays
+     * invisible until a user reports that the keys stopped working after they
+     * clicked something.  (Assertion 53b covers the rail the same way; the menu
+     * bar and toolbars this used to check are gone.) */
     {
-        int help = 0;
-        win.on_help_ = [&]() { help++; };
-        if (win.act_help_)
-            win.act_help_->trigger();
-        const bool ok = help == 1;
-        std::printf("  %-4s the Help item opens the guide (%d)\n",
-                    ok ? "ok" : "FAIL", help);
-        if (!ok)
-            fails++;
-        win.on_help_ = nullptr;
-    }
-
-    /* 53. Neither bar can take the keyboard.  A focused tool button swallows
-     * the keys before keyPressEvent sees them, which would break every binding
-     * in the app the moment someone clicked a button — and it stays invisible
-     * until a user reports that the keys stopped working after they clicked
-     * something.  The bar's own focus policy is what stops it. */
-    {
-        QMenuBar *mb = win.findChild<QMenuBar *>();
-        const QList<QToolBar *> bars = win.findChildren<QToolBar *>();
-
-        bool ok = mb && mb->focusPolicy() == Qt::NoFocus && bars.size() == 2;
-        int  bad = 0;
-        for (QToolBar *tb : bars)
-            if (tb->focusPolicy() != Qt::NoFocus) {
-                ok = false;
+        ControlPanel *panel = win.panel();
+        const QList<QPushButton *> btns =
+            panel ? panel->findChildren<QPushButton *>()
+                  : QList<QPushButton *>();
+        int bad = 0;
+        for (QPushButton *b : btns)
+            if (b->focusPolicy() != Qt::NoFocus)
                 bad++;
-            }
 
-        std::printf("  %-4s neither bar can take the keyboard (menubar %s, "
-                    "%d toolbar row(s), %d that would)\n", ok ? "ok" : "FAIL",
-                    mb ? (mb->focusPolicy() == Qt::NoFocus ? "no focus"
-                                                           : "TAKES FOCUS")
-                       : "MISSING",
-                    (int)bars.size(), bad);
+        const bool ok = panel && !btns.isEmpty() && bad == 0;
+        std::printf("  %-4s the control panel cannot take the keyboard "
+                    "(%d control(s), %d that would)\n", ok ? "ok" : "FAIL",
+                    (int)btns.size(), bad);
         if (!ok)
             fails++;
     }
@@ -6917,11 +6702,10 @@ static int selftest(const opts &o)
     }
 
     /* 53d. Every tab of the control panel is reachable.  A QTabWidget whose
-     * tabs do not fit hides the overflow behind scroll arrows, which is the
-     * same "control the user cannot reach" failure assertion 56 guards against
-     * for the toolbar — and it is a live risk here, because the panel is a
-     * fixed 224 px and the tab count only grows (the Windows panel's four tabs
-     * need a much wider column than the two we have so far).
+     * tabs do not fit hides the overflow behind scroll arrows — the "control
+     * the user cannot reach" failure, and a live risk here because the tab
+     * count only grows (the Windows panel's four tabs need a much wider column
+     * than the two we have so far).  53h is the vertical twin of this.
      *
      * Measured *themed*, unlike every other assertion here.  The tabs' fit is a
      * property of the stylesheet's padding and font size, and the selftest runs
@@ -7332,30 +7116,70 @@ static int selftest(const opts &o)
             fails++;
     }
 
-    /* 56. No toolbar row is overflowing.  Qt hides the buttons that do not fit
-     * behind an extension arrow, which would put the on-screen controls the
-     * toolbar exists to provide back out of sight — the very thing the split
-     * into two rows is here to avoid.  Checked rather than assumed, because the
-     * rows' widths are whatever the platform's font metrics make them. */
+    /* 53h. The control panel's page is not squeezed.  A QScrollArea with
+     * widgetResizable() resizes its page to the viewport, so a window sized
+     * from the scroll area's own — much smaller — hint silently *clips* the
+     * page instead of scrolling it: the last group becomes a control the user
+     * cannot reach, with no scrollbar to hint that anything is missing.  That
+     * is the vertical twin of 53d's tab-bar fit, and it was a real bug: the
+     * Capture group was cut off at the bottom of the window.  Checked by
+     * measuring the page against its own hint rather than by counting rows, so
+     * it holds whatever the platform's font metrics make the rows. */
     {
-        const QList<QToolBar *> bars = win.findChildren<QToolBar *>();
-        int  hidden = 0, checked = 0;
+        ControlPanel *panel = win.panel();
+        QTabWidget   *tabs  = panel ? panel->tabs() : nullptr;
+        QWidget      *page  = nullptr;
+        QScrollArea  *sa    = qobject_cast<QScrollArea *>(
+            tabs ? tabs->currentWidget() : nullptr);
+        if (sa)
+            page = sa->widget();
 
-        for (QToolBar *tb : bars) {
-            checked++;
-            QWidget *ext = tb->findChild<QWidget *>(
-                QStringLiteral("qt_toolbar_ext_button"));
-            if (ext && ext->isVisible())
-                hidden++;
-        }
+        /* The panel must ask for its content's height.  Asserted on the
+         * panel's own hint rather than on the window's, because the window's is
+         * the max of the panel's and the canvas's — and the canvas can be tall
+         * for reasons of its own (a super-resolved frame, a zoom), which would
+         * hand the panel the room it needs even while the panel was reporting
+         * the scroll area's small hint.  The window's hint is the max, so
+         * covering the panel here is what makes the window tall enough. */
+        const int need = (tabs ? tabs->tabBar()->sizeHint().height() : 0) +
+                         (page ? page->sizeHint().height() : 0);
+        const bool room = panel && panel->sizeHint().height() >= need;
 
-        const bool ok = checked == 2 && hidden == 0;
-        std::printf("  %-4s no toolbar row hides its buttons behind the "
-                    "overflow arrow (%d row(s) checked, %d overflowing)\n",
-                    ok ? "ok" : "FAIL", checked, hidden);
+        /* And the window can still be made shorter than that: the scroll area
+         * is then what keeps the lower groups reachable.  A minimum that
+         * refused the shrink would leave the scroll area inert, and a window
+         * that cannot be made small enough for the screen is its own trap. */
+        const QSize was = win.size();
+        win.resize(was.width(), 260);
+        QApplication::processEvents();
+        const bool shrank = win.height() < was.height();
+        const bool scrolls = sa && sa->verticalScrollBar() &&
+                             sa->verticalScrollBar()->maximum() > 0;
+        /* The page must keep its height while the window is short — the scroll
+         * area is what gives the user the rest.  Squeezed to the viewport
+         * instead, the lower groups are clipped with no scrollbar to hint that
+         * anything is missing, which is exactly the bug this caught. */
+        const bool kept = page && page->height() >= page->sizeHint().height();
+        win.resize(was);
+        QApplication::processEvents();
+
+        const bool ok = room && shrank && kept && scrolls;
+        std::printf("  %-4s the control panel asks for its content's height "
+                    "(panel %d of %d, page %d of %d, shrinks %s, keeps %s, "
+                    "scrolls %s)\n", ok ? "ok" : "FAIL",
+                    panel ? panel->sizeHint().height() : -1, need,
+                    page ? page->height() : -1,
+                    page ? page->sizeHint().height() : -1,
+                    shrank ? "yes" : "NO", kept ? "yes" : "NO",
+                    scrolls ? "yes" : "NO");
         if (!ok)
             fails++;
     }
+
+    /* The toolbar-overflow assertion (56) is gone with the toolbars.  Its
+     * concern — an on-screen control hidden behind Qt's overflow arrow — did
+     * not go away, it moved: the tab bar is now the row that can outgrow its
+     * container, and assertion 53d measures that fit. */
 
     /* 54. The canvas is drawn at its natural size until the window is bigger
      * than it needs, and scales to fit after that.  Both halves matter: the
@@ -8376,6 +8200,22 @@ static int run_gui(const opts &o_in, QApplication &app)
         }
     }
 
+    if (!o.shot.empty()) {
+        /* The whole window, chrome and all: the shell is what --shot is for,
+         * where --png is the picture alone.  Same "needs a painted frame" rule
+         * as --png. */
+        if (pm.frames == 0) {
+            std::fprintf(stderr, "dytqt: no frame painted; nothing written\n");
+        } else {
+            const QPixmap grab = win.grab();
+            if (grab.save(QString::fromUtf8(o.shot.c_str())))
+                std::printf("dytqt: window written to %s\n", o.shot.c_str());
+            else
+                std::fprintf(stderr, "dytqt: could not write %s\n",
+                             o.shot.c_str());
+        }
+    }
+
     /* Hand the device back, if it can be handed back.
      *
      * A worker still running is wedged inside a libuvc call that has no timeout.
@@ -8439,6 +8279,12 @@ int main(int argc, char **argv)
     opts o;
     if (!parse_args(argc, argv, o))
         return 2;
+
+    /* "--png PATH / --shot PATH" both mean "write it and exit", so one frame
+     * is enough.  Without this the loop runs until the window is closed and the
+     * file is never written — which is what the README's own example did. */
+    if ((!o.png.empty() || !o.shot.empty()) && o.frames == 0)
+        o.frames = 1;
 
     /* The selftest must not need a display, and must not steal one if the
      * user has one.  This has to happen before QApplication exists. */

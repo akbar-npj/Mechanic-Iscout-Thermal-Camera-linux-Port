@@ -31,9 +31,6 @@ MainWindow : QWidget
     ├── IconRail    (stretch 0)   left rail: Palette / Mark / Rotate / Compare /
     │                             Reset, then Tutorials / Contact / Setting
     ├── centre column (stretch 1, QVBoxLayout)
-    │   ├── QMenuBar    (stretch 0)   File / View / Measure / Device / Help  (retiring)
-    │   ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide (retiring)
-    │   ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery (retiring)
     │   ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
     │   │   └── GalleryPanel          the saved-items list, an overlay child widget
     │   └── StatusStrip (stretch 0)   three left-aligned lines
@@ -43,14 +40,15 @@ MainWindow : QWidget
         └── "Super Resolution"    Off / Visible plane (2x) / Thermal plane (2x)
 ```
 
-The menu bar and the two toolbar rows are still present while the rail and the
-right panel grow to carry every action they expose; they are retired once they
-do. Every rail button runs the same `handle_key` the keyboard does, so the rail
-is a second route to the same actions — never a second set — and every rail
-button is `Qt::NoFocus`, because a focused button would swallow the keys before
-`keyPressEvent` sees them (assertion 53b pins it). The rail's own items are
-described under [The rail](#the-rail) below; assertion 53g clicks each one and
-checks the effect against the session.
+There is **no menu bar and no toolbar**: the reference has neither, and every
+action they carried now has a home on the rail, in the panel, or in the Settings
+dialog — see [The chrome](#the-chrome). Every rail button runs the same
+`handle_key` the keyboard does, so the rail is a second route to the same
+actions — never a second set — and every rail button is `Qt::NoFocus`, because a
+focused button would swallow the keys before `keyPressEvent` sees them
+(assertion 53b pins it). The rail's own items are described under
+[The rail](#the-rail) below; assertion 53g clicks each one and checks the effect
+against the session.
 
 ### The control panel
 
@@ -103,14 +101,13 @@ silently ineffective. Assertion 53c pins the radios, the status line and the
 `Off` row, on both a model-present and a model-absent run.
 
 A `QTabWidget` whose tabs do not fit hides the overflow behind scroll arrows —
-the same "control the user cannot reach" failure assertion 56 guards against for
-the toolbar, and a live risk here because the tab count only grows. The tab style
-therefore carries `font-size: 9px` (matching the rail and the panel rows), and
-assertion 53d measures the fit — it is the one assertion here that runs
-**themed**, because the fit is a property of the stylesheet's padding and font
-size and the selftest is unthemed on purpose. The stylesheet is restored
-immediately so the geometry assertions after it still see the unthemed metrics
-they were calibrated against.
+the "control the user cannot reach" failure, and a live risk here because the tab
+count only grows. The tab style therefore carries `font-size: 9px` (matching the
+rail and the panel rows), and assertion 53d measures the fit — it is the one
+assertion here that runs **themed**, because the fit is a property of the
+stylesheet's padding and font size and the selftest is unthemed on purpose. The
+stylesheet is restored immediately so the geometry assertions after it still see
+the unthemed metrics they were calibrated against.
 
 The column is sized for the **tab bar**, not for the rows: the Windows panel
 carries four horizontal tabs and ours carries those plus Super Resolution, so
@@ -121,6 +118,24 @@ panel is ~400 px by the same measure, so this is close to the reference rather
 than a departure from it. (It was 224 px, sized for a single Troubleshoot tab;
 that overflowed as soon as the second tab landed — the two wanted 239 px of the
 222 available — and assertion 53d is what caught it.)
+
+Its **height** is the same concern turned vertical, and it is subtler. Each page
+sits in a `QScrollArea` with `widgetResizable(true)`, which resizes the page to
+the viewport — so a page taller than the viewport is not scrolled, it is
+*squeezed*, and the last group is clipped with no scrollbar to say anything is
+missing. And `QScrollArea::sizeHint()` reports a small default rather than its
+widget's, so a window sized from it comes up short and hands the page a viewport
+it cannot fit in. `ControlPanel::sizeHint()` therefore asks the *page's own
+layout* for what it needs; the window's hint is the max over its columns, so
+covering the panel is what makes the window tall enough. That was a real bug —
+the Capture group was cut off at the bottom of the window — and assertion 53h
+pins it, on the panel's own hint rather than the window's, because the canvas can
+be tall for reasons of its own (a super-resolved frame, a zoom) and would
+otherwise hand the panel the room it needed while the panel was still
+under-reporting. `minimumSizeHint()` deliberately *doesn't* ask for the content's
+height: the panel may be squeezed, and the scroll area is then what keeps the
+lower groups reachable — a window that could not be made smaller than its tallest
+page could not be made to fit a small screen either. 53h checks both halves.
 
 ### The rail
 
@@ -235,51 +250,78 @@ runs. Without the flush the window would be sized from the *previous* layout —
 invisible while the chrome is small, and it clipped the canvas the moment the
 icon rail's fixed width made the chrome non-trivial (assertion 7 again).
 
-### Menus and the toolbar
+### The chrome
 
-The menu bar and the two toolbar rows are a second way to reach the same actions,
-not a second set of actions. Every item that has a key is built by
-`key_action()`, which connects its `triggered` to `handle_key(key)` — the one
-dispatch the keyboard uses — so a menu item runs exactly what its key runs and
-the two cannot drift. Assertion 50 pins it: triggering the third palette item
-moves the session exactly as the `3` key does.
+The window used to carry a menu bar (`File / View / Measure / Device / Help`) and
+two toolbar rows above the canvas. They are **gone**: the reference app has
+neither, and every action they carried has a home, so nothing was lost but the
+duplication.
+
+| what the menu bar carried | where it lives now |
+|---|---|
+| Save still / Record clip / Gallery | the Troubleshoot tab's **Capture** group |
+| Choose folder… | the gallery's **Folder…** button |
+| Quit | the window's close button, and `q` |
+| Full screen / Device panel | the Settings dialog's **Display** group |
+| Palette, and Next/Previous | the rail's **Palette** popup |
+| Unit, Fusion | the Settings dialog's **Display** group |
+| Zoom in / out | the Settings dialog's **Display** group |
+| Fixed range, Flip H, Flip V | the Troubleshoot tab's **Image Enhancement** group |
+| Super-resolution Off / Visible / Thermal | the **Super Resolution** tab |
+| Point / Line / Box / None, Alarm, Isotherm | the Troubleshoot tab's measurement and High Temperature groups |
+| Retry connection | the Settings dialog's **Device** group |
+| Keyboard shortcuts, About | the rail's **Tutorials**, and **About…** in Display |
+
+Quit is the one that is not a button: the reference has no in-app Quit either,
+and every desktop window already has a close button. It is documented in `--help`
+rather than given a control of its own.
+
+The rail, the panel and the palette popup are a second way to reach the same
+actions, not a second set of actions. Every control that has a key runs that key
+through `handle_key` — the one dispatch the keyboard uses — so a button runs
+exactly what its key runs and the two cannot drift. Assertion 50b pins it: the
+panel's Line button moves the session exactly as `l` does.
 
 **No `QAction` carries a shortcut.** Qt's shortcut map consumes a matching key
 *before* `keyPressEvent` runs, so a shortcut would fire while a runtime-parameter
 candidate is armed and break the ladder's swallow contract — every key but `q`
 must be swallowed until the candidate is confirmed or cancelled (assertion 30).
-The key's name therefore goes in the item's tooltip, not in its `shortcut`.
+The key's name therefore goes in the control's tooltip, not in a `shortcut`.
 
-Two menus are the exception, because they select an *absolute* value that no key
-can express: **Unit** (the `u` key cycles) and **Fusion** (the `f` key cycles).
-Each item is a single `dyt_session_set_*` call, so there is no rule for the two
-to disagree about. **File → Choose folder…** is the same kind of exception — it
-opens the directory dialog the panel's **Folder…** button opens, since no key
-can name a path — and it sets the one directory that browsing and saving share.
+The exceptions are the controls that select an *absolute* value no key can
+express: **Unit** and **Fusion** in the Settings dialog (the `u` and `f` keys
+cycle), the palette entries past the tenth in the rail's popup, and **Reset
+Image**. Each is a single session call, so there is no rule for the two to
+disagree about.
 
-The checkmarks come from the snapshot, not from the item's own toggle:
-`sync_actions()` runs after every painted frame and sets each action's state from
-`snap_`, so an action whose key was refused — a super-resolution plane with no
-model, a write the device rejected — cannot stay lit. It is called only from
-`set_frame_status`, never from `set_state_line`: the no-device path's snapshot is
-zeroed, and syncing from it would clear every checkmark. A stalled stream keeps
-the last real frame's states, which is what the canvas is still showing.
+The checkmarks come from the snapshot, not from the button's own toggle:
+`sync_actions()` runs after every painted frame and hands `snap_` to
+`ControlPanel::sync()`, so a control whose key was refused — a super-resolution
+plane with no model, a write the device rejected — cannot stay lit. It is called
+only from `set_frame_status`, never from `set_state_line`: the no-device path's
+snapshot is zeroed, and syncing from it would clear every checkmark. A stalled
+stream keeps the last real frame's states, which is what the canvas is still
+showing.
 
-Neither bar may take focus (`Qt::NoFocus`). A focused tool button swallows the
-keys before `keyPressEvent` sees them, which would silently break every binding
-the moment someone clicked a button; assertion 53 pins the policy. The toolbar
-is split into **two rows** and given an `Ignored` horizontal size policy, so it
-can never *widen* the window away from the picture: the package ships no icons,
-so a button is its text, and one row of these labels is wider than the canvas. If
-a row ever does outgrow the window, Qt shows its own overflow arrow rather than
-clipping silently — assertion 56 requires that neither row is overflowing at the
-default size, since a hidden button is the very thing the split exists to avoid.
+No control may take focus (`Qt::NoFocus`). A focused button swallows the keys
+before `keyPressEvent` sees them, which would silently break every binding the
+moment someone clicked one; assertions 53 and 53b pin the policy for the panel
+and the rail.
 
 `MainWindow` stays a plain `QWidget` rather than becoming a `QMainWindow`:
 `QMainWindow::sizeHint()` does not account for its menu and tool bar heights, so
 `fit_to_view()`'s `resize(sizeHint())` would size the window for the central
-widget alone and let the bars steal rows from the canvas. As rows of a
-`QVBoxLayout` they count towards `QWidget::sizeHint()` automatically.
+widget alone and let the bars steal rows from the canvas. The centre column's
+`QVBoxLayout` rows count towards `QWidget::sizeHint()` automatically, and so does
+the panel's own hint (see [The control panel](#the-control-panel)) — which is why
+the retirement did not change `MainWindow`'s class.
+
+`StatusStrip`'s horizontal size policy is `Ignored` for the same reason the old
+toolbar rows' was: the picture decides how wide the window is, never the text. A
+long status line — a saved file's full path, a device's notice — would otherwise
+widen the window the moment it appeared, and the window would jump as notices
+came and went. The strip elides each line to whatever width it is given, so
+nothing is lost, only shortened.
 
 ### Fit to window and full screen
 
@@ -880,6 +922,7 @@ feature takes, and the reason `make check` passes both ways. See
 ./build/dytqt --selftest               # headless check, needs no display
 ./build/dytqt --palette 5 --zoom 3
 ./build/dytqt --png /tmp/canvas.png    # save the canvas and exit
+./build/dytqt --shot /tmp/shell.png    # save the whole window and exit
 ./build/dytqt --live                   # stream from the camera
 ./build/dytqt --live --vid 0x0bda --pid 0x5840
 ```
@@ -906,7 +949,8 @@ is unaffected.
 | `--sr MODE` | super-resolution: `off` \| `visible` \| `thermal` (default `off`) |
 | `--frames N` | stop after N frames (default: run until closed) |
 | `--fps N` | timer rate (default 25) |
-| `--png PATH` | write the canvas here and exit |
+| `--png PATH` | write the canvas here and exit (implies `--frames 1` unless one is given) |
+| `--shot PATH` | write the whole window here and exit — the shell, rail and panel included; use `--png` for the picture alone |
 | `--capture-dir D` | where `s` (still), `v` (clip) and the gallery write/read (default the Pictures folder: `$XDG_PICTURES_DIR`, else `$HOME`, else `.`) |
 | `--prefs PATH` | preferences file (default `$DYT_PREFS`, else Qt's config location) |
 | `--no-prefs` | neither read nor write saved preferences |
@@ -943,10 +987,10 @@ or plays a clip; `space` pauses it), `d` shows the device panel, and with
 "The gallery". `F11` is full screen, and the picture scales up to fill a window
 enlarged by hand — see "Fit to window and full screen".
 
-Everything the keys do is also on the **menu bar and toolbar**, and **Help →
-Keyboard shortcuts** opens a scrollable guide (`F1` and `?` open About instead).
-A menu item runs exactly what its key runs, so the on-screen controls cannot
-drift from the keyboard — see "Menus and the toolbar".
+Everything the keys do is also on the **rail or in the right panel**, and the
+rail's **Tutorials** opens a scrollable guide (`F1` and `?` open About instead).
+A button runs exactly what its key runs, so the on-screen controls cannot drift
+from the keyboard — see "The chrome".
 
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
@@ -1008,19 +1052,17 @@ $ ./build/dytqt --selftest
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
   ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x533 yes)
-  ok   a menu action reaches the session like its key (palette 0 -> 2)
   ok   a panel button reaches the session like its key (line yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the Help item opens the guide (1)
-  ok   neither bar can take the keyboard (menubar no focus, 2 toolbar row(s), 0 that would)
+  ok   the control panel cannot take the keyboard (16 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, tutorials yes, pending yes)
-  ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
+  ok   the control panel asks for its content's height (panel 533 of 533, page 620 of 507, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
 === ALL PASS ===
@@ -1146,26 +1188,26 @@ the reason the factor is in the transform at all: with a 2× picture, mapping th
 two corner output pixels must land on the plane's two corners. It is written to
 skip (and say so) on a build with no model, where there is no 2× picture to map.
 
-49–56 cover the window chrome — the menu, the toolbar, full screen and the
-fit-to-window display layer. Each pins a failure that would otherwise stay
-invisible until a user hit it, so they are worth naming one by one:
+49–56 cover the window chrome — full screen, the fit-to-window display layer,
+and the on-screen controls the menu bar and toolbar gave way to. Each pins a
+failure that would otherwise stay invisible until a user hit it, so they are
+worth naming one by one:
 
 * **49** drives F11 in and out and requires the window to come back the size it
   went in at, which is what catches the fullscreen guard in `fit_to_view()`
   leaving `fitted_` advanced and the window stuck at the screen's size.
-* **50** triggers a palette action and reads the session back, so the on-screen
+* **50b** clicks a panel button and reads the session back, so the on-screen
   controls cannot become a second front end free to drift from the keyboard.
-* **51** flips from a *key*, not the action, and requires the checkmark to match
+* **51** flips from a *key*, not the button, and requires the checkmark to match
   the session both times *and* the two frames to differ — so neither a sync that
-  never ran nor one echoing the action's own toggle can pass.
-* **52** observes the Help item through its callback, so no modal opens and the
-  test needs no display.
-* **53** requires the menu bar and both toolbar rows to be `Qt::NoFocus`, which
-  is what stops a clicked button from swallowing every key afterwards.
-* **56** requires neither row to be hiding a button behind Qt's overflow arrow —
-  the very thing the two-row split exists to avoid. It prints before 54 and 55
-  because the numbers are the order the checks were written, not the order they
-  run.
+  never ran nor one echoing the button's own toggle can pass.
+* **53 / 53b** require the control panel's buttons and the rail's to be
+  `Qt::NoFocus`, which is what stops a clicked button from swallowing every key
+  afterwards.
+* **53d** requires the panel's tabs to fit its column with no scroll arrow, and
+  **53h** requires the panel to ask for its content's height so the last group is
+  not clipped — the two directions of "a control the user cannot reach". Both are
+  described under [The control panel](#the-control-panel).
 * **54** grows the window and requires the canvas to be 1:1 before, scaled and
   centred after, and 1:1 again when it shrinks back; the first half is what keeps
   the pixel assertions honest, since at the natural size the scale is exactly 1
@@ -1291,9 +1333,9 @@ those, and `%build`/`%install` only copy files). Details worth knowing:
 * **`%files` is an anti-drift guard.** Fedora sets
   `%_unpackaged_files_terminate_build`, so a file `make install` staged but the
   spec does not list fails the build rather than being silently dropped. The
-  window chrome added nothing to it: the menu bar, the toolbar and the Help
-  dialog are all built in the binary from `help_text()`, so `make install` stages
-  no new file and `%files` is unchanged.
+  window chrome added nothing to it: the rail, the panel, the dialogs and the
+  Help text are all built in the binary — the icons are `QPainter` vectors, not
+  assets — so `make install` stages no new file and `%files` is unchanged.
 
 `_topdir` and the stage default to `~/.cache/dytqt/{rpmbuild,stage}` — absolute
 and space-free by design, because this tree's path contains a space. A
