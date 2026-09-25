@@ -108,6 +108,15 @@ void dyt_display_set_mode(dyt_display_t *d, dyt_range_mode_t m)
         d->mode = m;
 }
 
+const char *dyt_range_mode_name(dyt_range_mode_t m)
+{
+    switch (m) {
+    case DYT_RANGE_AUTO:  return "auto";
+    case DYT_RANGE_FIXED: return "fixed";
+    default:              return "?";
+    }
+}
+
 void dyt_display_toggle_mode(dyt_display_t *d)
 {
     if (!d)

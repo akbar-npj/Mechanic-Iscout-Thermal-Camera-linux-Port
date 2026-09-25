@@ -75,6 +75,7 @@ typedef struct {
 
     dyt_frame_stats_t stats;  /* min/max/mean, extrema coords, filler flag */
     float lo, hi;             /* the display range resolved for this frame */
+    dyt_range_mode_t range_mode;  /* whether lo/hi are per-frame or latched */
     dyt_unit_t unit;          /* the selected display unit */
     int   palette, palette_n; /* active palette index and how many loaded */
     char  palette_name[32];   /* the active palette's name, for status lines */

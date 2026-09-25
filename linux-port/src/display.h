@@ -72,6 +72,11 @@ typedef enum {
     DYT_RANGE_FIXED       /* hold fixed_lo/fixed_hi (the vendor's "locked" bar) */
 } dyt_range_mode_t;
 
+/* "auto" / "fixed", or "?" for an out-of-range value.  Lives here rather than
+ * in the view model for the same reason dyt_fusion_name() lives in fusion.c:
+ * the enum is this module's, so the front ends do not each re-spell it. */
+const char *dyt_range_mode_name(dyt_range_mode_t m);
+
 typedef struct {
     dyt_range_mode_t mode;
     float fixed_lo, fixed_hi;   /* used while mode == DYT_RANGE_FIXED */

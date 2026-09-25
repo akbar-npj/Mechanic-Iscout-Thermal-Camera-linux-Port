@@ -327,6 +327,7 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
     out->ready     = !s->stats.all_filler;
     out->lo        = s->disp.lo;
     out->hi        = s->disp.hi;
+    out->range_mode = s->disp.mode;
     out->unit      = s->unit;
     out->palette   = s->disp.palette;
     out->palette_n = s->pal_n;
