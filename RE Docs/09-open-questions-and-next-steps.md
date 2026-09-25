@@ -532,9 +532,10 @@ write (`sendOrder`) is implemented and measured, the dual-half visible plane plu
 patterns are implemented and verified live, the DYT still container is written and read by the port
 with its bytes pinned against the vendor's own writer, video recording writes H.264 mp4 from both the
 device and a frozen fixture, and the vendor's 2× super-resolution model has been recovered from
-`libmnnmodel.so` with its shape contract pinned. The one thing that cannot be finished here is
-*executing* that model — there is no MNN runtime on this host (§6) — and the one thing that still
-needs the bench is §9's blackbody comparison, plus anything only a second hardware unit can answer.
+`libmnnmodel.so` with its shape contract pinned and now **executes** on this host — an upstream MNN
+build was made here, and its output is verified against the vendor's own `mnn_run_2` to within one
+LSB (§6). The things still needing the bench are §9's blackbody comparison and the optical
+registration offset, plus anything only a second hardware unit can answer.
 
 > The engine work is tracked as its own roadmap (display foundation → measurement/alarms → device
 > read-back → the one device write → visible-half fusion → DYT container → mp4 recording → MNN),
@@ -544,20 +545,22 @@ needs the bench is §9's blackbody comparison, plus anything only a second hardw
 ### Can be done now — no device required
 
 Three RE curiosity items remain, none on the critical path, and **all eight engine phases have
-landed** — the engine roadmap is closed. The only engine work left anywhere is *executing* the
-recovered super-resolution model, which needs an MNN runtime this host does not have (§6).
+landed** — the engine roadmap is closed. Nothing on the engine roadmap is outstanding: the
+super-resolution model executes and its output is pinned against the vendor's (§6). The only
+remaining items are the two bench measurements in the table below.
 
 | # | Action | Effort | Value |
 |---|---|---|---|
 | 1 | Decode `block_lut.dat` with a .NET decompiler (ILSpy/dnSpy) | hours | low — no native code reads it, so it does not affect the port |
 | 2 | Read `AES::DecryptionAES` key-schedule setup in `libDYTJpegAes.so` | minutes | low — §5, a licence check we do not reproduce |
-| 3 | Identify `libMNN*` / `M1.exe` / `M2.exe` / `blk205` | low priority | low — §6 |
+| 3 | Identify `M1.exe` / `M2.exe` / `blk205` (`libMNN*` was resolved 2026-09-25 — §6) | low priority | low — §6 |
 
-> **All three are curiosity items.** The next real step is the device.
+> **All three are curiosity items.** The next real step needs the bench.
 
-### Completed — static work, no hardware
+### Completed — static analysis and live-device work
 
 Recorded here for provenance, not as a to-do list. Each entry names where the evidence lives.
+Sessions 1–4 were static (no device); from session 5 on, the unit was attached.
 
 | Session | Item | Evidence |
 |---|---|---|
@@ -568,6 +571,9 @@ Recorded here for provenance, not as a to-do list. Each entry names where the ev
 | 4 | `tau_*.bin` / `MILI6_*.bin` decoded and extracted to `linux-port/calib/` | `10-calibration-tables.md` |
 | 4 | `src/calib.{h,c}` implemented + tested | `calib_test`, 14,904 checks |
 | 4 | τ-model divergence quantified; hardware experiment designed and dry-run-validated | `tools/taucmp.c`; `10-calibration-tables.md` §8.3, §8.4 |
+| 4 (2026-09-24) | **VID/PID identified, §4 closed**: the unit is `0bda:5840` / mode `1000` — **not** the inferred `1514:0001` / `0x44C`. `probe --descriptors` and `lsusb -v` agree | §4; `04-usb-protocol.md` §4.10 |
+| 4 (2026-09-24) | **§1's residual sub-questions answered, so §1 is fully closed**: the thermal stream is `bFormatIndex 1` (the only format — uncompressed YUY2, 16 bpp), 256×192 on `bFrameIndex 1` at 25 fps, and there is **no** UVC-level visible/thermal demux (the "dual vision" is an app-side composite). No `usbmon` capture was needed | §1; `04-usb-protocol.md` §4.5.6 |
+| 5 (2026-09-25) | **First live frame through the frame→temperature pipeline**, and the first real exercise of `capture.c`: live preview, a live DYT still, and live mp4 recording all verified against `0bda:5840` | `tools/dytview.cpp`, `tools/dytrec.cpp`; rows 7 and 8 of this table |
 | 5 (2026-09-25) | **Live device reads verified**: module serial, raw user serial, and the full 16-slot parameter map; `getTinyCUserData` corrected to 1 byte | `04-usb-protocol.md` §4.2/§4.8; `linux-port/tools/probe.c --info` |
 | 5 (2026-09-25) | **`DecryptSNE` corrected and the user-serial decode verified** (`DYCSTI09GG01292`) | `04-usb-protocol.md` §4.9 |
 | 5 (2026-09-25) | `src/params.{h,c}` (parameter codec + radiometry snapshot) and the read helpers in `src/control.{h,c}` | `params_test`, `control_test` |
@@ -577,7 +583,7 @@ Recorded here for provenance, not as a to-do list. Each entry names where the ev
 | 5 (2026-09-25) | **Parameters are volatile**: a device reset reverted reflected/ambient from 300 K to 273 K with no port write; the capture path does *not* reset them | `04-usb-protocol.md` §4.2 |
 | 6 (2026-09-25) | **Visible half + fusion implemented** (engine Phase 5): `src/visible.{h,c}` (YUYV luma extraction), `src/fusion.{h,c}` (all six patterns + X/Y alignment), the read-only `dyt_capture_plane_geometry()`, the `src/session_capture.{h,c}` adapter, and the session's visible-plane/fusion state | `visible_test`, `fusion_test` (+ golden PPM), `session_test`, `pipeline_test` |
 | 6 (2026-09-25) | **The two halves of the dual-half payload are asserted, not assumed**: `dyt_visible_is_grey()` says yes for the top half and no for the thermal bottom half — one predicate, opposite answers | `pipeline_test` (`test_dual_half_halves`), `visible_test`; `04-usb-protocol.md` §4.10 |
-| 6 (2026-09-25) | **Fusion verified live in all six patterns** and the alignment measured: `dx=+2` moved the visible plane exactly 2 source px left (cross-correlated at ×2 zoom), matching the vendor's `X_Coefficient` sense | `04-usb-protocol.md` §4.10; `03-android-app-architecture.md` §3.5.2 |
+| 6 (2026-09-25) | **Fusion verified live in all six patterns**, and the alignment **control** verified: `dx=+2` moved the visible plane exactly 2 source px left (cross-correlated at ×2 zoom), matching the vendor's `X_Coefficient` sense. This measures the control's *response*, not the registration offset — the grid is 1:1 by construction, the optics are unmeasured (§4.10) | `04-usb-protocol.md` §4.10; `03-android-app-architecture.md` §3.5.2 |
 | 6 (2026-09-25) | **AD-mode fallback verified live**: with no visible half the pattern is reported as `(no visible plane)` and the render falls back to thermal rather than fusing nothing | `04-usb-protocol.md` §4.10 |
 | 7 (2026-09-25) | **Engine Phase 6 — the DYT still container implemented**: `src/jpeg.{h,c}` (stb default, libjpeg optional), `src/dytjpeg.{h,c}` (container write/read, codec-free), the optional PNG writer, the session's own raw-payload copy, and `dytview`'s `s` (DYT still) / `w` (window PNG) | `jpeg_test`, `dytjpeg_test` (132 assertions), `imgwrite_test`, `session_test`, `pipeline_test` |
 | 7 (2026-09-25) | **The container is verified against the vendor's own writer**: the container `D_updateData` produces is byte-identical to `dyt_dyt_build`'s for the same inputs, and the port's reader recovers the vendor's blob/raw/JPEG exactly — with a synthetic multi-chunk payload and the frozen 196608-byte device frame | `06-asset-and-file-formats.md` §2.5; `tools/dytjpeg_diff/run.sh` |
@@ -590,7 +596,9 @@ Recorded here for provenance, not as a to-do list. Each entry names where the ev
 | 8 (2026-09-25) | **Live recording verified against `0bda:5840`**: default dual-half mode, filler cleared at frame 154, 5 s settle, then 75 frames — `ffprobe` reports h264 256×192 25/1 `nb_frames=75` and `duration=3.000000`, and decoded frames 0 and 74 differ, so the clip is live data and not a held frame | live run; `tools/dytrec.cpp` |
 | 8 (2026-09-25) | **Engine Phase 8 — the super-resolution model recovered**: the weights are embedded, XOR-obfuscated, in `libmnnmodel.so`; traced from the Java call sites into `sr1`, which decrypts and calls `MNN::Interpreter::createFromBuffer`. Extracted reproducibly to `linux-port/models/zoom2.mnn` (12,928 bytes) — an ESPCN-style ONNX export with `DepthToSpace(2)` | `RE Workspace/tools/extract_mnn_model.py`; `linux-port/models/README.md`; §6 |
 | 8 (2026-09-25) | **The super-resolution shape contract pinned from three sources**: `sr1`'s `resizeTensor([1,1,192,256])`, the app's `new byte[393216]` output buffer, and `DepthToSpace` block size 2 — 256×192 → 512×384 | `linux-port/models/README.md` |
-| 8 (2026-09-25) | **The Phase 8 seam landed and is optional**: `src/mnn.{h,c}` (contract as data, runtime-free flatbuffer validator, an upscale that refuses rather than inventing a frame) + `src/mnn_test.c` (23 checks) in `make check`. Running the model still needs an MNN runtime, which this host does not have — `mnn.c` records the six-call integration from `sr1` | `src/mnn_test.c`; `models/zoom2.mnn` |
+| 8 (2026-09-25) | **The Phase 8 seam landed and is optional**: `src/mnn.{h,c}` (contract as data, runtime-free flatbuffer validator, an upscale that refuses rather than inventing a frame) + `src/mnn_test.c` (23 checks) in `make check`. Without an MNN runtime the seam refuses; with one it runs — see the two rows below | `src/mnn_test.c`; `models/zoom2.mnn` |
+| 8 (2026-09-25) | **The super-resolution model now executes on this host**: `src/mnn_runtime.cpp` holds the MNN C++ integration behind `dyt_mnn_zoom2()`, compiled only when `HAVE_MNN` (build recipe in `linux-port/third_party/README.md`). Output verified against the vendor's own `mnn_run_2`, driven out of `libmnnmodel.so` by `tools/mnn_diff/`: **177081 / 196608 samples bit-exact, maximum error one LSB**, the residual being deterministic MNN 2.5.0 ↔ upstream drift, unchanged by thread count or precision mode | `src/mnn_test.c` (`test_differential`); `tools/mnn_diff/`; `make check` |
+| 8 (2026-09-25) | **The NC4HW4 layout trap found and documented**: the session tensor reports `getDimensionType() == CAFFE` but is actually NC4HW4 (channel padded to 4), so `elementSize()` is 4× the logical sample count and a naive `host<float>()` write scrambles the frame — peak error 255. Staging through plain-NCHW host tensors fixes it, and the differential has teeth: a layout regression moves the peak error to 253 | `models/README.md`; `src/mnn_runtime.cpp` |
 
 **Explicitly *not* completed, despite appearing in earlier revisions of this list:**
 
@@ -603,18 +611,30 @@ Recorded here for provenance, not as a to-do list. Each entry names where the ev
 * **`capture.c` is not test-covered.** It compiles and links, but no test drives it, because doing so
   requires a device. Do not read the `make check` gate as validating the capture path.
 
-### Requires the device
+### Requires the bench — a target, a second unit, or a lab
+
+**This table is down to two rows.** The previous revision listed eight, and six of them are now
+resolved — they are recorded in the Completed subsection below, not struck through here, per the
+discipline stated under *Verification discipline*:
+
+* **Row 1** (`lsusb -v`, identify VID/PID) — **done 2026-09-24**. The unit is `0bda:5840`, mode
+  `1000`; §4 is closed and `probe --descriptors` and `lsusb -v` agree.
+* **Row 2** (the `0x44C` serial-number handshake) — **did not apply**. The unit is mode `1000`, not
+  `0x44C`, so there is no such handshake to complete; the serial *reads* were verified separately on
+  2026-09-25 (Completed, session 5).
+* **Row 3** (first live frame through the frame→temperature pipeline) — **done**, along with the
+  first real exercise of `capture.c`. Live preview, live still and live mp4 recording all verified.
+* **Row 4** (`usbmon` capture of a live preview) — **moot**. §1's residual sub-questions were
+  answered without it: from the vendor library statically and from a Windows capture
+  (`MechaniscoutPcap/4.pcapng`), not from a `usbmon` capture of the port's own preview.
+* **Rows 5 and 7** were already struck through as done on 2026-09-25.
+
+Neither row below blocks the port.
 
 | # | Action | Effort | Unblocks |
 |---|---|---|---|
-| 1 | `lsusb -v` — identify VID/PID, interfaces, `bFormatIndex` per stream | minutes | §4, and Phase 0 of `08-linux-port-plan.md` |
-| 2 | **If the unit is `1514:0001` (mode `0x44C`), complete the serial-number handshake** — without it the device emits no thermal frames | hours | first live frame at all |
-| 3 | First live frame through the frame→temperature pipeline | hours | end-to-end validation, and the first real exercise of `capture.c` |
-| 4 | `usbmon` capture of a live preview | hours | the residual §1 sub-questions (stream demux) |
-| 5 | ~~Read a real `getTinyCParams` response~~ — **done 2026-09-25**: all 16 slots read, §4.2 | — | §2 (slots 1–5 identified; 6–15 still raw) |
-| 6 | **The 300 °C blackbody comparison** (§9) — resolves which τ model is correct | hours | §9, and whether `calib.c` should be wired in |
-| 7 | ~~Whether `sendTinyCParamsModification` actually changes the reading~~ — **done 2026-09-25**: it does (emissivity/distance dominate); spacing constraint measured | — | §2, §2a |
-| 8 | **Measure the true visible/thermal registration offset.** The port assumes the dual-half top half is already 1:1 with the thermal plane (alignment default `0,0`) — that is an *assumption*, not a measurement. Needs a scene with contrast in *both* planes (a hand in front of a warm background): find the offset that best aligns the visible edge to the thermal edge, then set the default. | hours | engine Phase 5's alignment default; §4.10 |
+| 1 | **The 300 °C blackbody comparison** (§9) — resolves which τ model is correct | hours | §9, and whether `calib.c` should be wired in |
+| 2 | **Measure the optical visible/thermal registration offset.** This is *narrower* than the previous revision of this row implied — see §4.10. The **grid** is already 1:1 by construction (both planes are 256×192 from the same dual-half payload, and `dyt_visible_extract()` is a 1:1 luma slice), and `0,0` is the vendor's own `X_Coefficient`/`Y_Coefficient` default, so the port is faithful regardless. What is unmeasured is the **optical boresight**: whether the two *lenses* put the same scene point on the same cell. Needs a scene with contrast in both planes (a hand against a warm background). | hours | engine Phase 5's alignment default; §4.10 |
 
 ---
 

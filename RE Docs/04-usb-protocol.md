@@ -1138,5 +1138,20 @@ else                                                           mode = 0;
 > so the adapter extracts nothing; a fusion pattern that needs the plane is reported as
 > `(no visible plane)` and the render falls back to plain thermal rather than fusing a stale plane.
 >
-> **Open:** the default alignment is `0,0`, which *assumes* the top half is already pixel-registered
-> with the thermal plane. That has not been measured — see `09-open-questions-and-next-steps.md` §8.
+> **Open — but only in the optical sense.** The default alignment is `0,0`. Three separate claims
+> hide behind that, and only the third is unproven:
+>
+> * **Grid registration — [V].** The two planes come from the *same* 256×192 payload, and
+>   `dyt_visible_extract()` (`src/visible.c:21`) is a 1:1 luma slice — `grey[i] = bytes[2*i]`, no
+>   scaling or resampling. So the offset is structurally zero in *grid* terms, and
+>   `dyt_visible_is_grey()` asserts which half is which.
+> * **Vendor fidelity — [V].** `0,0` is the vendor's own default: `X_Coefficient`/`Y_Coefficient`
+>   start at 0 and are clamped to ±40 (`03-android-app-architecture.md` §3.5.2). The port's default
+>   matches the vendor's, so it is faithful whatever the optics do.
+> * **Optical boresight — [?].** Whether the two *lenses* put the same scene point on the same cell
+>   has **not** been measured. The live `dx = +2` test above measures the alignment *control's
+>   response*, not this.
+>
+> "The offset is an assumption" is therefore true only of the third claim — and it is the one claim
+> no amount of reading the vendor's code can settle. See the *Requires the bench* table in
+> `09-open-questions-and-next-steps.md`.

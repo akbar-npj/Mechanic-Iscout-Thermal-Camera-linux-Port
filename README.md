@@ -17,9 +17,10 @@ output matches the vendor's own model to within one LSB.
 
 **Not yet established:** absolute temperature accuracy — nothing has been compared
 against a calibrated reference, so the atmospheric-transmittance model is still `[?]`
-(`RE Docs/09` §9). The visible/thermal registration offset is an assumption (1:1,
-alignment `0,0`) rather than a measurement (§4.10). The remaining `[?]` items are
-listed in `RE Docs/09`.
+(`RE Docs/09` §9). The visible and thermal planes are 1:1 in grid terms by construction,
+and `0,0` is the vendor's own alignment default, but the **optical boresight** of the two
+lenses has not been measured (`RE Docs/04` §4.10). The remaining `[?]` items are listed
+in `RE Docs/09`.
 
 ## Layout
 

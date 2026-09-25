@@ -366,7 +366,9 @@ thermal ROI rect held at `+0xb70` inside the decoded **640×480** visible frame,
 >    (`+0x1e0`/`+0x1f0`), decoded by `yuy2_rgba`. It is **not** the 256×192 grayscale top half of the
 >    dual-half payload (RE Docs 04 §4.10). So the vendor's geometry (640×480 visible + a 240×240
 >    thermal ROI) does not map onto the port's device-default frame; the port fuses the **top half**
->    with the thermal plane, which are both 256×192 and therefore already 1:1.
+>    with the thermal plane, which are both 256×192 and therefore already 1:1 **in grid terms** —
+>    same payload, same grid, no resampling. That is *not* a claim about the two lenses' optical
+>    boresight, which is unmeasured; see `04-usb-protocol.md` §4.10 for the split.
 > 2. **Case 5's kernels are not statically recoverable.** The two `dilate` structuring elements live
 >    at `+0x870`/`+0x810` and are built outside this function; their size/shape is `[?]`. As with
 >    §3.5.1, the port implements the **recovered structure** with documented constants rather than

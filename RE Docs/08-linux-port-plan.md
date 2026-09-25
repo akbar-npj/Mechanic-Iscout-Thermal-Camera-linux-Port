@@ -245,11 +245,14 @@ There is no reference band and no LUT. The conversion is `raw/64 − 273.15` ove
 samples (`FrameImage::adValueArray2FloatTempArray`). That is the easiest possible bring-up path
 and is worth trying first if `lsusb` reports a `0BDA:*` device. **[V]**
 
-### Still needs the device
+### Frame facts — all resolved
 
-Only one frame-related fact remains: **which `bFormatIndex` carries the thermal stream** (and
-therefore whether visible and thermal arrive as two interfaces or two formats on one). `lsusb -v`
-answers it. Everything needed to *parse* the frame is already known.
+Nothing frame-related remains. The `bFormatIndex` question this section used to leave open is
+answered: the thermal stream is **`bFormatIndex 1`** — the *only* format, uncompressed YUY2 at
+16 bpp, 256×192 on `bFrameIndex 1` at 25 fps — and there is no UVC-level visible/thermal demux
+(the "dual vision" is an app-side composite). Note `bFrameIndex 2` (256×384) is a **synthetic
+decoy** — one distinct row and 3 values in a 4-pixel cycle — so always select frame 1.
+(`09-…` §1; `04-usb-protocol.md` §4.5.6.)
 
 ---
 
