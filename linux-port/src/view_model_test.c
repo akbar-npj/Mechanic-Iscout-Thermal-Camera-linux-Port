@@ -237,6 +237,95 @@ static void test_status_line(void)
              "x1HV | 154 frames");
 }
 
+/* The notice a super-resolution key press produces.  It is the only feedback a
+ * refused key gets — the status line stays silent while the mode is off — so
+ * each reason the mode can fail to take effect has its own exact wording, and
+ * the wording names the one thing to change. */
+static void test_sr_notice(void)
+{
+    dyt_snapshot_t s;
+    char           b[128];
+
+    base_snapshot(&s);
+
+    /* A key that is not one of the SR bindings says nothing, so a front end can
+     * call this after every view key. */
+    intcheck("sr notice: a non-SR key is silent",
+             dyt_vm_sr_notice('u', &s, b, sizeof b), 0);
+    intcheck("sr notice: 'x' is not an SR key",
+             dyt_vm_sr_notice('x', &s, b, sizeof b), 0);
+    /* ...but a NULL snapshot on an SR key is still an error, not silence. */
+    intcheck("sr notice: a NULL snapshot is refused",
+             dyt_vm_sr_notice('z', NULL, b, sizeof b), -1);
+
+    /* No upscaler behind the mode: the session refused it, and the notice says
+     * why rather than leaving the key looking dead. */
+    s.sr_cap = 0;
+    s.sr     = DYT_SR_OFF;
+    intcheck("sr notice: a refusal is reported",
+             dyt_vm_sr_notice('z', &s, b, sizeof b), 1);
+    strcheck("sr notice: no model", b, "super-resolution: no model loaded");
+
+    /* An upscaler is present from here on. */
+    s.sr_cap = 1;
+
+    /* Turning it off is confirmed, because the status line drops the field
+     * entirely when the mode is off. */
+    intcheck("sr notice: 'off' is reported",
+             dyt_vm_sr_notice('z', &s, b, sizeof b), 1);
+    strcheck("sr notice: off", b, "sr:off");
+
+    /* Active: the factor, read from the transform the render will use. */
+    s.sr        = DYT_SR_VISIBLE;
+    s.sr_active = 1;
+    s.xform.sr  = 2;
+    snprintf(s.sr_name, sizeof s.sr_name, "visible");
+    intcheck("sr notice: an active mode is reported",
+             dyt_vm_sr_notice('z', &s, b, sizeof b), 1);
+    strcheck("sr notice: visible x2", b, "sr:visible x2");
+
+    s.sr = DYT_SR_THERMAL;
+    snprintf(s.sr_name, sizeof s.sr_name, "thermal");
+    intcheck("sr notice: the thermal mode is reported",
+             dyt_vm_sr_notice('Z', &s, b, sizeof b), 1);
+    strcheck("sr notice: thermal x2", b, "sr:thermal x2");
+
+    /* Selected but not taking effect, one reason at a time.  The order mirrors
+     * sr_factor_locked() so the advice matches the refusal. */
+    s.sr        = DYT_SR_VISIBLE;
+    s.sr_active = 0;
+    s.xform.sr  = 1;
+    snprintf(s.sr_name, sizeof s.sr_name, "visible");
+    s.width = 384;
+    intcheck("sr notice: a wrong geometry is reported",
+             dyt_vm_sr_notice('z', &s, b, sizeof b), 1);
+    strcheck("sr notice: geometry", b, "sr:visible needs a 256x192 frame");
+
+    s.width = 256;                 /* geometry matches again */
+    s.fusion = DYT_FUSION_INFRARED;
+    intcheck("sr notice: the infrared pattern is reported",
+             dyt_vm_sr_notice('z', &s, b, sizeof b), 1);
+    strcheck("sr notice: fusion",
+             b, "sr:visible needs a fusion pattern that shows it");
+
+    /* A pattern that does show the visible half, but a frame with no visible
+     * half in it. */
+    s.fusion       = DYT_FUSION_EDGE;
+    s.have_visible = 0;
+    intcheck("sr notice: a missing visible half is reported",
+             dyt_vm_sr_notice('z', &s, b, sizeof b), 1);
+    strcheck("sr notice: no visible half", b, "sr:visible needs a visible half");
+
+    /* The thermal mode has no visible-plane gate, so with the geometry right
+     * the only reading left is the fallback. */
+    s.sr = DYT_SR_THERMAL;
+    snprintf(s.sr_name, sizeof s.sr_name, "thermal");
+    s.have_visible = 1;
+    intcheck("sr notice: a thermal fallback is reported",
+             dyt_vm_sr_notice('Z', &s, b, sizeof b), 1);
+    strcheck("sr notice: thermal inactive", b, "sr:thermal inactive");
+}
+
 static void test_readout_line(void)
 {
     dyt_snapshot_t s;
@@ -1448,6 +1537,7 @@ int main(void)
     printf("=== view_model_test ===\n");
     test_temp();
     test_status_line();
+    test_sr_notice();
     test_readout_line();
     test_hover_label();
     test_roi_label();

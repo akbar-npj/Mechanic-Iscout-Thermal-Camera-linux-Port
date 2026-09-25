@@ -1020,10 +1020,33 @@ int dyt_vm_gallery_label(const dyt_vm_gallery_t *g, char *out, size_t n)
 
 /* ------------------------------------------------------------- view keys */
 
+/* Which super-resolution mode a key selects, or DYT_SR_OFF when the key is not
+ * one of them.  One function so the binding and the notice cannot disagree
+ * about which letters are SR: "z" is the vendor's own plane, "Z" the thermal
+ * extension (sr.h), tied together by case as h/H are. */
+static dyt_sr_t sr_key_mode(int key)
+{
+    if (key == 'z')
+        return DYT_SR_VISIBLE;
+    if (key == 'Z')
+        return DYT_SR_THERMAL;
+    return DYT_SR_OFF;
+}
+
 int dyt_vm_view_key(dyt_session_t *s, int key)
 {
+    dyt_sr_t sr = sr_key_mode(key);
+
     if (!s)
         return 0;
+
+    /* Super-resolution: one feature with two planes.  The mode is a single
+     * value, so turning one on turns the other off — both describe the same 2x
+     * render, and there is no coherent reading of "both". */
+    if (sr != DYT_SR_OFF) {
+        dyt_session_set_sr(s, dyt_session_get_sr(s) == sr ? DYT_SR_OFF : sr);
+        return 1;
+    }
 
     /* Palette: the ten digits pick one directly, and the two brackets either
      * side of the keyboard's full stop step through all of them. */
@@ -1052,23 +1075,54 @@ int dyt_vm_view_key(dyt_session_t *s, int key)
     case ']': dyt_session_adjust_fusion_align(s, +1, 0); return 1;
     case ';': dyt_session_adjust_fusion_align(s, 0, -1); return 1;
     case '\'': dyt_session_adjust_fusion_align(s, 0, +1); return 1;
-
-    /* Super-resolution: one feature with two planes, so the bindings are tied
-     * together by case (the h/H precedent).  "z" is the vendor's own plane,
-     * "Z" the thermal extension (sr.h).  The mode is a single value, so
-     * turning one on turns the other off — both describe the same 2x render,
-     * and there is no coherent reading of "both". */
-    case 'z':
-        dyt_session_set_sr(s, dyt_session_get_sr(s) == DYT_SR_VISIBLE
-                                  ? DYT_SR_OFF : DYT_SR_VISIBLE);
-        return 1;
-    case 'Z':
-        dyt_session_set_sr(s, dyt_session_get_sr(s) == DYT_SR_THERMAL
-                                  ? DYT_SR_OFF : DYT_SR_THERMAL);
-        return 1;
     default: break;
     }
     return 0;
+}
+
+/* The notice a super-resolution key press deserves, or 0 when the key was not
+ * one of them.  See view_model.h for why the wording lives here. */
+int dyt_vm_sr_notice(int key, const dyt_snapshot_t *snap, char *out, size_t n)
+{
+    if (sr_key_mode(key) == DYT_SR_OFF)
+        return 0;
+    if (!snap || !out || n == 0)
+        return -1;
+
+    /* No upscaler was installed (no runtime in this build, or no model found),
+     * so the session refused the mode rather than remembering it.  Say so: the
+     * status line stays silent while the mode is off, and a key that does
+     * nothing at all is the one thing this notice exists to prevent. */
+    if (!snap->sr_cap) {
+        snprintf(out, n, "super-resolution: no model loaded");
+        return 1;
+    }
+
+    if (snap->sr == DYT_SR_OFF) {
+        snprintf(out, n, "sr:off");
+        return 1;
+    }
+
+    if (snap->sr_active) {
+        snprintf(out, n, "sr:%s x%d", snap->sr_name, snap->xform.sr);
+        return 1;
+    }
+
+    /* Selected but not taking effect.  Name the one thing to change, in the
+     * same order sr_factor_locked() checks it, so the advice matches the
+     * refusal. */
+    if (snap->width != DYT_SR_IN_W || snap->height != DYT_SR_IN_H)
+        snprintf(out, n, "sr:%s needs a %dx%d frame", snap->sr_name,
+                 DYT_SR_IN_W, DYT_SR_IN_H);
+    else if (snap->sr == DYT_SR_VISIBLE &&
+             snap->fusion == DYT_FUSION_INFRARED)
+        snprintf(out, n, "sr:%s needs a fusion pattern that shows it",
+                 snap->sr_name);
+    else if (snap->sr == DYT_SR_VISIBLE && !snap->have_visible)
+        snprintf(out, n, "sr:%s needs a visible half", snap->sr_name);
+    else
+        snprintf(out, n, "sr:%s inactive", snap->sr_name);
+    return 1;
 }
 
 /* -------------------------------------------------------------- utilities */

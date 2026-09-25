@@ -116,6 +116,68 @@ nearest-neighbour, matching `map()`'s integer division and the OpenCV viewer's
 shared pointer mapping does not agree with. `QImage::flipped()` is used rather
 than the deprecated `mirrored()`.
 
+### Super-resolution
+
+`z` and `Z` run the recovered 2× model (`models/zoom2.mnn`, through
+`dyt_mnn_zoom2`) over one of the frame's two planes and render a 512×384
+picture. They are one feature with two planes, so they are tied together by
+case the way `h`/`H` are, and turning one on turns the other off — both
+describe the same 2× render, so there is no coherent reading of "both":
+
+| key | plane the model upscales |
+|---|---|
+| `z` | the visible half — the vendor's own plane and arithmetic |
+| `Z` | the thermal display grey — the port's documented extension |
+
+Both bindings live in `dyt_vm_view_key()`, beside palette and fusion, so the
+OpenCV viewer and the Qt app cannot disagree about which letter does what. The
+model is fixed 256×192 → 512×384, so only a 256-wide sensor can use it at all;
+a 240/384/640 frame leaves the render alone rather than feeding the model the
+wrong geometry. Mode `z` additionally needs a visible half *and* a fusion
+pattern that shows it — with the default infrared pattern there is nothing on
+screen for it to upscale, so it is inactive there rather than doing invisible
+work.
+
+The **factor is carried in the view transform**, not by the window: `sr` joins
+`zoom` (`display.h`), and `map`/`project`/`size` use `zoom * sr`. The window
+still hands them the native source size and the transformed destination size,
+so a click at 2× maps back to the native pixel with no arithmetic in the GUI —
+thermometry and measurement stay in native pixels, which is the invariant the
+2× must not break. Because the engine renders *before* the window snapshots, the
+factor the snapshot reports is the one the render just used, so the mapping and
+the picture agree; the one case where they can differ is the failed-allocation
+fallback noted under "What is not established".
+
+Feedback is deliberately doubled up, because a key that appears to do nothing
+is the one thing this feature must not be:
+
+* the **status line** carries `sr:visible x2` / `sr:thermal x2` while it is on,
+  and `sr:<name> (inactive)` when it is selected but cannot take effect;
+* a **transient notice** says which of those it is and, when it is refused or
+  inactive, the one thing to change — `dyt_vm_sr_notice()` builds the wording
+  from the snapshot, so it cannot drift from the render's own refusal. The
+  status line stays silent while the mode is off, so without the notice a
+  refused `z` would be completely invisible.
+
+Super-resolution is optional at every layer, and the app reports which layer is
+missing rather than pretending. At start-up `setup_super_resolution()` finds the
+model (`--model`, else the tree or the installed data dir), loads it, and hands
+the session `dyt_mnn_zoom2` as its upscaler; a build without MNN, or a host
+without the model, leaves the session with no upscaler, and the SR keys then
+refuse with `super-resolution: no model loaded`. The About box reports the same
+state — "built with: MNN" says a runtime is linked, which is not the same as a
+model being loaded, so it says which separately. An explicit `--model` that
+cannot be read is refused outright rather than falling through to the search: a
+model is not interchangeable the way a directory of palettes is.
+
+Two things the 2× reaches beyond the picture. A still's embedded PNG is the 2×
+picture while the DYT container keeps recording the **native** geometry and the
+raw payload, so a vendor tool still re-renders from the raw data — the best of
+both. And the isotherm overlay goes through
+`dyt_vm_apply_isotherm_scaled()`, which samples the temperature plane each
+image pixel was magnified from; the unscaled pass would refuse at 2× and
+silently dim nothing.
+
 ### Measurement and alarm
 
 The window places measurements with the mouse and picks the tool with the
@@ -480,6 +542,13 @@ make build/dytqt
 `-reduce-relocations`, so an executable linking them must itself be
 position-independent.
 
+Unlike `dytview` and `dytrec`, the Qt app **does** link the MNN runtime when the
+build has one: it installs the super-resolution upscaler at start-up, so it is
+the one front end that references the seam. With no MNN install the link simply
+drops `-lMNN` and the app reports no model — the same shape every other optional
+feature takes, and the reason `make check` passes both ways. See
+`third_party/README.md` for how to produce the MNN install.
+
 ## Run
 
 ```
@@ -500,6 +569,8 @@ position-independent.
 | `--zoom N` | window magnification (default 2) |
 | `--unit N` | temperature unit: 0 = C, 1 = F, 2 = K (default C) |
 | `--fusion N` | fusion pattern index (default 0 = infrared only) |
+| `--model PATH` | super-resolution model (default: search for `zoom2.mnn`) |
+| `--sr MODE` | super-resolution: `off` \| `visible` \| `thermal` (default `off`) |
 | `--frames N` | stop after N frames (default: run until closed) |
 | `--fps N` | timer rate (default 25) |
 | `--png PATH` | write the canvas here and exit |
@@ -531,10 +602,11 @@ reading the flat plane; it is the path the vendor's AD-mode tools use, and is
 only there because the port's super-resolution model was recovered against it.
 
 Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
-alarm and `i` shows the isotherm, `s` saves a still and `v` records a clip, `g`
-browses what has been saved, and with `--live` the window reconnects on its own
-while `R` retries immediately — see "Measurement and alarm", "Capture: stills
-and clips" and "The gallery".
+alarm and `i` shows the isotherm, `z`/`Z` turn on super-resolution, `s` saves a
+still and `v` records a clip, `g` browses what has been saved, and with `--live`
+the window reconnects on its own while `R` retries immediately — see
+"Measurement and alarm", "Super-resolution", "Capture: stills and clips" and
+"The gallery".
 
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
@@ -583,11 +655,15 @@ $ ./build/dytqt --selftest
   ok   q quits and is never swallowed (idle yes, armed yes)
   ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
   ok   a still writes the container and the PNG (wrote yes, 1 + 1, sized yes)
+  ok   a still with SR on is written at 512x384 (wrote yes, PNG 512x384)
   ok   the gallery opens a saved still (scan 1, still 0, frame 256x192, temps 31.41..32.41 C)
   ok   a clip starts, takes frames, and stops (start yes, label yes, fed yes, 5 frames, 1 file, gone yes)
   ok   a clip is refused where there is no disk (refused yes, says why yes)
   ok   the capture keys route (still 1, record 1)
   ok   the gallery keys browse and open (open yes, move yes, swallow yes, opened 1, exported 1, closed yes, back to live yes)
+  ok   the About text names the app and its version (0.1.0), the SR keys and the model state
+  ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
+  ok   a 2x render maps a click back to the native pixel (both corners)
 === ALL PASS ===
 ```
 
@@ -673,7 +749,8 @@ reaching the tool, and closing returns to the live view. What they cannot pin is
 the mp4's playability and the container's parse — those were checked by hand
 against a real run (below).
 
-43–46 cover the view keys, the preferences and the About box. 43 drives the
+43–48 cover the view keys, the preferences, the About box and
+super-resolution. 43 drives the
 bindings the reference viewer's letters map to — palette digits, `.`/`,`, `u`,
 `t`, `h`/`H`, `+`/`-` — through the real window and reads the session back, and
 pins that `h` and `H` move *different* axes (an unconditional fold would make
@@ -684,7 +761,18 @@ beats a stored one; it runs under `--no-prefs` so it cannot touch a developer's
 own file. 45 pins that `?` and F1 both reach the About action. 46 checks the
 About text names the app and the version the package carries — which is what a
 stale About box would fail, and, through `-DDYT_VERSION`, what ties the box to
-the Makefile's `VERSION`.
+the Makefile's `VERSION` — and that it reports the model state the feature
+macros cannot. 47 drives both SR keys and pins that they keep their case, reach
+the session, and post the notice that is a refused key's only feedback. 48 pins
+the reason the factor is in the transform at all: with a 2× picture, mapping the
+two corner output pixels must land on the plane's two corners. It is written to
+skip (and say so) on a build with no model, where there is no 2× picture to map.
+
+37b is the still writer's 2× case: `save_still()` sizes its buffer from the
+snapshot's factor, so the assertion reads the written PNG's own IHDR back and
+requires 512×384 — and, without a model, requires the native 256×192 still
+instead of a failure. It is what would catch the buffer-size bug the 2× work
+introduced, which would otherwise make every still silently fail.
 
 The capture and the gallery were checked end to end through the real window as
 well: a fixture run driven with `s`/`v`/`v`/`q` wrote a `.dyt.jpg` (219 KB), a
@@ -916,10 +1004,28 @@ only when the session wrote a parameter — then abandons it the same way.
   driven by the pump's tick counter, so a stream that stalls while a result is
   showing leaves it up until frames resume. Minor, and the reference viewer's
   poll-driven TTL behaves the same way.
-* **No view keys.** Palette, unit, range, flip, zoom and fusion are reachable from
-  the command line (`--zoom`) but not from the window, so the mirror is still
-  unexercised interactively — which is why assertion 16 drives the transform
-  directly.
+* **The super-resolution model is pinned, not judged.** `mnn_test` compares its
+  output against the vendor's own `mnn_run_2` to within one LSB, so the
+  arithmetic is verified — but whether 2× of a 256×192 plane *looks* better is
+  not measured here. Mode `Z` has no vendor counterpart at all: it is the same
+  model and the same arithmetic applied to a plane the vendor never fed it, and
+  that (not a quality claim) is the whole of what the port establishes about it.
+  Nor has SR been run against the camera: the live dual-half frame splits to
+  exactly 256×192, so it is expected to apply, but the verification here is the
+  fixture's, and the rate the model adds to the live path is unmeasured.
+* **The package does not ship the model or the MNN runtime yet.** `install`
+  copies the binary, the desktop entry, the icon and the palettes. The model
+  search also looks in `<datadir>/dytqt/models/zoom2.mnn`, but nothing puts it
+  there, so an installed app finds no model and the SR keys refuse with the
+  notice that says so. Running from the source tree — where `models/zoom2.mnn`
+  is — is unaffected.
+* **A failed 2× allocation would report active while rendering plain.** The
+  snapshot's `sr_active` is the *predicate* — the factor the next render will
+  use — rather than "what the last render did", which is what lets a front end
+  size its buffer for the frame it is about to be handed. The cost is that if
+  the session cannot allocate the 2× buffers it renders plain for that frame
+  while the status line still says `x2`. It takes a failed `realloc` on a
+  512×384 frame to reach, and is not reachable from a test.
 * **No clip playback.** The gallery lists `.mp4` clips and reports their size,
   but the window has no mp4 decoder wired in, so opening one says so instead of
   playing it. Export refuses a clip for the same reason. A recorded clip is

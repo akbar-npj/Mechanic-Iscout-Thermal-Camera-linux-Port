@@ -228,8 +228,11 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
 # and any consumer that calls the seam and links libdyt.a alone fails with
 # undefined references.  Archive semantics keep this cheap: a member is only
 # extracted when something references it, so a front end that never touches the
-# seam (dytqt, dytrec, dytview) still links no MNN — verified by there being no
+# seam (dytrec, dytview) still links no MNN — verified by there being no
 # dyt_mnn symbol and no libMNN NEEDED entry in those binaries.
+#
+# dytqt is the exception: it installs the upscaler at start-up, so it references
+# the seam and does link libMNN.  That is why its rule carries $(MNN_LIBS).
 ifdef HAVE_MNN
 LIB_OBJS += $(BUILD)/mnn_runtime.o
 endif
@@ -504,12 +507,14 @@ $(BUILD)/dytrec: tools/dytrec.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_sou
 # libuvc it is the live camera, and the GUI code does not change between them.
 # $(UVC_LINK) is empty when libusb is absent, exactly as for dytrec.  $(REC_OBJ)
 # and $(CV_LIBS) are empty when OpenCV is: the app then has no `v` key and says
-# so, rather than failing at the first recorded frame.
+# so, rather than failing at the first recorded frame.  $(MNN_LIBS) is empty
+# when there is no MNN runtime: the app then reports no model at start-up and
+# the SR keys refuse, which is the same shape the other optional features take.
 #
 # -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
 # it relatively, whereas gui/dytqt.cpp does not.
 $(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(QT_DEFS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(QT6_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(QT_DEFS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(MNN_LIBS) $(QT6_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.

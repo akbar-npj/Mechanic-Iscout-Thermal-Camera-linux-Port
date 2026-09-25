@@ -50,6 +50,7 @@
 #include "capture.h"
 #include "frame_source.h"
 #include "imgwrite.h"    /* dyt_write_png — the still's shareable half */
+#include "mnn.h"         /* the optional super-resolution model */
 #include "palette.h"
 #include "session.h"
 #include "session_capture.h"
@@ -89,11 +90,13 @@ struct opts {
     std::string palette_dir;
     std::string png;                 /* save the canvas here, then exit */
     std::string capture_dir = ".";   /* where 's' and 'v' put their files */
+    std::string model;               /* --model: the super-resolution model */
     int  width   = 256;
     int  palette = 1;
     int  zoom    = 2;
     int  unit    = -1;               /* -1 = leave the engine's default (C) */
     int  fusion  = -1;               /* -1 = leave the engine's default (ir) */
+    int  sr      = -1;               /* -1 = leave the engine's default (off) */
     int  frames  = 0;                /* 0 = run until closed */
     int  fps     = 25;
     bool selftest = false;
@@ -148,6 +151,7 @@ struct prefs {
     int         unit    = -1;
     int         zoom    = -1;
     int         fusion  = -1;
+    int         sr      = -1;
     std::string capture_dir;
 };
 
@@ -174,6 +178,7 @@ static void prefs_load(const std::string &path, prefs &p)
     p.unit    = s->value(QStringLiteral("view/unit"),    -1).toInt();
     p.zoom    = s->value(QStringLiteral("view/zoom"),    -1).toInt();
     p.fusion  = s->value(QStringLiteral("view/fusion"),  -1).toInt();
+    p.sr      = s->value(QStringLiteral("view/sr"),      -1).toInt();
     p.capture_dir =
         s->value(QStringLiteral("capture/dir")).toString().toStdString();
 }
@@ -185,6 +190,7 @@ static void prefs_save(const std::string &path, const prefs &p)
     s->setValue(QStringLiteral("view/unit"),    p.unit);
     s->setValue(QStringLiteral("view/zoom"),    p.zoom);
     s->setValue(QStringLiteral("view/fusion"),  p.fusion);
+    s->setValue(QStringLiteral("view/sr"),      p.sr);
     s->setValue(QStringLiteral("capture/dir"),
                 QString::fromStdString(p.capture_dir));
     s->sync();
@@ -205,6 +211,8 @@ static void opts_apply_prefs(opts &eff, const prefs &p)
         eff.unit = p.unit;
     if (eff.fusion < 0)
         eff.fusion = p.fusion;
+    if (eff.sr < 0)
+        eff.sr = p.sr;
 }
 
 /* The preferences as the session currently stands, ready to be saved. */
@@ -218,6 +226,7 @@ static prefs prefs_from_session(dyt_session_t *sess, const std::string &dir)
         p.unit    = (int)snap.unit;
         p.zoom    = snap.xform.zoom;
         p.fusion  = (int)snap.fusion;
+        p.sr      = (int)snap.sr;
     }
     p.capture_dir = dir;
     return p;
@@ -235,6 +244,9 @@ static void usage(const char *prog)
         "  --zoom N         window magnification (default 2)\n"
         "  --unit N         0=C, 1=F, 2=K (default C)\n"
         "  --fusion N       fusion pattern index (default 0 = ir)\n"
+        "  --model PATH     super-resolution model (default: search for\n"
+        "                   zoom2.mnn in the tree or beside the installed app)\n"
+        "  --sr MODE        super-resolution: off|visible|thermal (default off)\n"
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
         "  --png PATH       write the canvas here and exit\n"
@@ -256,6 +268,17 @@ static void usage(const char *prog)
         "\n"
         "with --live the window reconnects on its own; press r to retry now\n",
         prog, opts{}.fixture.c_str());
+}
+
+/* "off" / "visible" / "thermal" -> the engine's mode, or -1 when the word is
+ * not a mode.  The names are dyt_sr_name()'s, so the flag, the status line and
+ * the About box all say the same words. */
+static int sr_mode_arg(const char *s)
+{
+    if (!std::strcmp(s, "off"))     return DYT_SR_OFF;
+    if (!std::strcmp(s, "visible")) return DYT_SR_VISIBLE;
+    if (!std::strcmp(s, "thermal")) return DYT_SR_THERMAL;
+    return -1;
 }
 
 static bool parse_args(int argc, char **argv, opts &o)
@@ -293,6 +316,17 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--zoom")                    { const char *v = next("--zoom"); if (!v) return false; o.zoom = std::atoi(v); o.zoom_set = true; }
         else if (a == "--unit")                    { const char *v = next("--unit"); if (!v) return false; o.unit = std::atoi(v); }
         else if (a == "--fusion")                  { const char *v = next("--fusion"); if (!v) return false; o.fusion = std::atoi(v); }
+        else if (a == "--model")                   { const char *v = next("--model"); if (!v) return false; o.model = v; }
+        else if (a == "--sr") {
+            const char *v = next("--sr");
+            if (!v) return false;
+            o.sr = sr_mode_arg(v);
+            if (o.sr < 0) {
+                std::fprintf(stderr, "dytqt: --sr must be off, visible or "
+                                     "thermal (got '%s')\n", v);
+                return false;
+            }
+        }
         else if (a == "--frames")                  { const char *v = next("--frames"); if (!v) return false; o.frames = std::atoi(v); }
         else if (a == "--fps")                     { const char *v = next("--fps"); if (!v) return false; o.fps = std::atoi(v); }
         else {
@@ -354,6 +388,54 @@ static dyt_session_t *setup_session(const opts &o)
         dyt_session_set_fusion(sess, (dyt_fusion_t)o.fusion);
 
     return sess;
+}
+
+/* Install the optional super-resolution upscaler, then apply the mode the
+ * command line or a saved preference asked for.
+ *
+ * Deliberately *not* part of setup_session(): that function is "the view state
+ * from the options" and is also used for the throwaway session that re-renders
+ * a saved still, where an upscaler would be pointless and the start-up message
+ * would be printed on every open.  This is a front-end capability step, so the
+ * two callers that want it (run_gui and --selftest) ask for it.
+ *
+ * It is optional at every layer — this build may have no MNN runtime, and the
+ * model may not be installed — so both failures are reported rather than
+ * silently ignored, and either way the session simply has no upscaler behind
+ * it.  That is what makes the SR keys refuse instead of pretending, and it is
+ * what the About box reports. */
+static void setup_super_resolution(dyt_session_t *sess, const opts &o)
+{
+    const char *opt = o.model.empty() ? nullptr : o.model.c_str();
+    char        model[4096];
+
+    /* An explicit --model that cannot be read is refused here rather than
+     * falling through to the search.  dyt_vm_find_model() does fall through —
+     * it mirrors the palette-directory search, where a directory of
+     * interchangeable ramps makes that the right answer — but a model is not
+     * interchangeable: loading a different one than the user named would make
+     * the flag a lie.  The refusal belongs here, where the flag is known. */
+    if (opt && access(opt, R_OK) != 0) {
+        std::fprintf(stderr, "dytqt: --model %s is not readable; no "
+                             "super-resolution model loaded\n", opt);
+        return;
+    }
+
+    if (dyt_vm_find_model(opt, model, sizeof model)) {
+        if (dyt_mnn_load(model) == 0) {
+            dyt_session_set_sr_upscaler(sess, dyt_mnn_zoom2);
+            std::fprintf(stderr, "dytqt: super-resolution model %s\n", model);
+        } else {
+            std::fprintf(stderr, "dytqt: cannot load the model at %s\n", model);
+        }
+    } else {
+        std::fprintf(stderr, "dytqt: no super-resolution model found\n");
+    }
+
+    /* A mode with no upscaler behind it is refused by the session, so this is
+     * safe to apply either way. */
+    if (o.sr >= 0)
+        dyt_session_set_sr(sess, (dyt_sr_t)o.sr);
 }
 
 /* -------------------------------------------------------------- frame rate */
@@ -807,7 +889,13 @@ static bool save_still(dyt_session_t *sess, const std::string &dir,
         return false;
     }
     {
-        std::vector<uint8_t> rgb((size_t)snap.width * (size_t)snap.height * 3);
+        /* Size from the factor the *next* render will use, which is what the
+         * snapshot reports (session.h): with super-resolution on the PNG is 2x
+         * the temperature plane, and a buffer sized from the native geometry
+         * would make render_rgb() refuse with -2. */
+        const int f = snap.xform.sr >= 1 ? snap.xform.sr : 1;
+        std::vector<uint8_t> rgb((size_t)snap.width * f *
+                                 (size_t)snap.height * f * 3);
         if (dyt_session_render_rgb(sess, rgb.data(), (int)rgb.size(), &w, &h)
                 != 0) {
             msg = "still: render failed";
@@ -907,16 +995,28 @@ public:
         return 1;
     }
 
-    /* Apply a view key — palette, unit, range, flip, zoom, fusion.  The
-     * bindings are the view model's, so the two front ends cannot disagree
-     * about which letter does what; the frame itself is re-rendered by the
-     * pump on its next tick.  Returns 1 if the key was one of these. */
+    /* Apply a view key — palette, unit, range, flip, zoom, fusion,
+     * super-resolution.  The bindings are the view model's, so the two front
+     * ends cannot disagree about which letter does what; the frame itself is
+     * re-rendered by the pump on its next tick.  Returns 1 if the key was one
+     * of these.
+     *
+     * A super-resolution key can be refused or take no effect — no model, a
+     * frame the model cannot take — and the status line says nothing while the
+     * mode is off, so a key that appeared to do nothing would be the only
+     * feedback.  dyt_vm_sr_notice() builds the wording from the fresh snapshot
+     * and reports 0 for every other key, so nothing here duplicates the
+     * binding. */
     int view_key(int k)
     {
         if (!dyt_vm_view_key(sess_, k))
             return 0;
-        if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0)
+        if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0) {
+            char why[128];
+            if (on_notice_ && dyt_vm_sr_notice(k, &snap_, why, sizeof why) == 1)
+                on_notice_(why);
             update();
+        }
         return 1;
     }
 
@@ -1037,6 +1137,11 @@ public:
      * was accepted for sending. */
     std::function<bool(dyt_order_type_t, float)> on_param_send_;
     std::function<void(dyt_order_type_t)>        on_param_cancel_;
+
+    /* A transient notice a view key produced — the super-resolution reasons,
+     * which the status line cannot carry because it stays silent while the
+     * mode is off.  Owned by the front end, like the parameter notices. */
+    std::function<void(const std::string &)>     on_notice_;
 
     /* -- what --selftest pins.  The state the overlays draw from, without a
      * canvas grab, plus the info rows the panel would show. */
@@ -1981,15 +2086,23 @@ struct pump {
          * as the reference viewer does, so the dimming follows the data rather
          * than the zoom.  A private copy, because the engine's buffer is not
          * ours to scribble on; and a std::vector rather than QImage::bits(),
-         * because Qt may pad bytesPerLine while dyt_vm_apply_isotherm assumes
-         * tightly packed w*3 rows.  The buffer is RGB, not BGR, but the pass
-         * halves every channel, so the order does not matter. */
+         * because Qt may pad bytesPerLine while the pass assumes tightly
+         * packed w*3 rows.  The buffer is RGB, not BGR, but the pass halves
+         * every channel, so the order does not matter.
+         *
+         * The scaled entry point is the one that matters here: with
+         * super-resolution on the image is 2x the temperature plane, so the
+         * pass has to sample the plane it was magnified from.  The unscaled
+         * one would refuse (its `temps_n >= w*h` guard) and silently dim
+         * nothing. */
         std::vector<uint8_t> iso_buf;
         const uint8_t       *pix = rgb;
-        if (snap.iso_on && scr.temps && scr.cap >= w * h) {
+        if (snap.iso_on && scr.temps &&
+            scr.cap >= snap.width * snap.height) {
             iso_buf.assign(rgb, rgb + (size_t)w * (size_t)h * 3);
-            dyt_vm_apply_isotherm(iso_buf.data(), w, h, scr.temps, scr.cap,
-                                  snap.iso_lo, snap.iso_hi);
+            dyt_vm_apply_isotherm_scaled(iso_buf.data(), w, h, scr.temps,
+                                         scr.cap, snap.width, snap.height,
+                                         snap.iso_lo, snap.iso_hi);
             pix = iso_buf.data();
         }
 
@@ -2048,8 +2161,8 @@ static double retry_delay_s(int attempt)
  */
 
 /* Defined with the About action below; the selftest reads it to check the
- * version it reports. */
-static std::string about_text();
+ * version it reports and the super-resolution line. */
+static std::string about_text(bool have_model = false);
 
 static int selftest(const opts &o)
 {
@@ -2062,6 +2175,7 @@ static int selftest(const opts &o)
     dyt_session_t *sess = setup_session(o);
     if (!sess)
         return 1;
+    setup_super_resolution(sess, o);
 
     dyt_frame_source_t *fs = dyt_frame_source_open_fixture(
         sess, o.fixture.c_str(), o.width, DYT_MODE_1000,
@@ -2338,12 +2452,16 @@ static int selftest(const opts &o)
 
     /* 15. Zoom is applied to the frame, and the layout follows it.  z > 1 is
      * part of the assertion on purpose: at zoom 1 the relation below would
-     * hold for an untransformed frame too, and would prove nothing. */
+     * hold for an untransformed frame too, and would prove nothing.  The
+     * super-resolution factor is in the rendered size as well — the engine
+     * renders 2x and the window magnifies that by zoom — so it is read from
+     * the snapshot rather than assumed to be 1. */
     {
         const int   z    = snap.xform.zoom;
+        const int   sr   = snap.xform.sr >= 1 ? snap.xform.sr : 1;
         const QSize is   = win.view()->imageSize();
         const QSize hint = win.view()->sizeHint();
-        const bool  ok   = z > 1 && is == QSize(256 * z, 192 * z) &&
+        const bool  ok   = z > 1 && is == QSize(256 * z * sr, 192 * z * sr) &&
                            hint.height() >= is.height();
         std::printf("  %-4s zoom %d is applied to the frame (%dx%d, hint %dx%d)\n",
                     ok ? "ok" : "FAIL", z, is.width(), is.height(),
@@ -2997,6 +3115,35 @@ static int selftest(const opts &o)
             closedir(dp);
             return best;
         };
+        /* The one PNG in the directory, with its IHDR's width and height read
+         * back.  Reading the header rather than trusting a size the writer
+         * reported is what makes "the still is 2x" a claim about the bytes on
+         * disk. */
+        auto png_size = [&](const char *dir, int &pw, int &ph) {
+            DIR *dp = opendir(dir);
+            pw = ph = 0;
+            if (!dp)
+                return;
+            for (struct dirent *e; (e = readdir(dp)) != nullptr;) {
+                const size_t l = strlen(e->d_name);
+                if (l < 4 || strcmp(e->d_name + l - 4, ".png") != 0)
+                    continue;
+                char full[600];
+                snprintf(full, sizeof full, "%s/%s", dir, e->d_name);
+                FILE *f = fopen(full, "rb");
+                if (f) {
+                    unsigned char h[24] = {0};
+                    if (fread(h, 1, sizeof h, f) == sizeof h &&
+                        memcmp(h + 12, "IHDR", 4) == 0) {
+                        pw = (h[16] << 24) | (h[17] << 16) | (h[18] << 8) | h[19];
+                        ph = (h[20] << 24) | (h[21] << 16) | (h[22] << 8) | h[23];
+                    }
+                    fclose(f);
+                }
+                remove(full);
+            }
+            closedir(dp);
+        };
 
         /* 37. A still writes both halves: the DYT container and the PNG. */
         {
@@ -3012,6 +3159,50 @@ static int selftest(const opts &o)
                         "(wrote %s, %d + %d, sized %s)\n",
                         ok ? "ok" : "FAIL", wrote ? "yes" : "NO", nd, np,
                         sized ? "yes" : "NO");
+            if (!ok) {
+                fails++;
+                if (!msg.empty())
+                    std::printf("       %s\n", msg.c_str());
+            }
+        }
+
+        /* 37b. With super-resolution on, the still's PNG is 2x — and without a
+         * model the same call must still write a native still rather than fail.
+         * The 2x case is what save_still()'s buffer sizing has to get right:
+         * sized from the native geometry, render_rgb() refuses with -2 and
+         * nothing is written at all.  The thermal mode is used because it is
+         * the one that applies whatever the fusion pattern is, so this does not
+         * depend on the run's own fusion state. */
+        {
+            char  st[] = "/tmp/dytqt-sr-XXXXXX";
+            char *sd   = mkdtemp(st);
+            const std::string ds = sd ? sd : ".";
+            const dyt_sr_t    was = dyt_session_get_sr(sess);
+            dyt_snapshot_t    sr_snap{};
+            int  pw = 0, ph = 0;
+            bool wrote = false;
+            std::string msg;
+
+            dyt_session_snapshot(sess, &sr_snap, nullptr, 0);
+            const bool have_model = sr_snap.sr_cap != 0;
+
+            dyt_session_set_sr(sess, DYT_SR_THERMAL);
+            wrote = save_still(sess, ds, msg);
+            png_size(ds.c_str(), pw, ph);
+            rmdir(sd);
+
+            /* Leave the mode as the run found it. */
+            dyt_session_set_sr(sess, was);
+
+            /* 512x384 with a model (the 2x render); 256x192 without one, where
+             * the mode is refused and the still must still be written. */
+            const bool ok = wrote && (have_model ? (pw == 512 && ph == 384)
+                                                 : (pw == 256 && ph == 192));
+            std::printf("  %-4s a still with SR %s is written at %dx%d "
+                        "(wrote %s, PNG %dx%d)\n", ok ? "ok" : "FAIL",
+                        have_model ? "on" : "unavailable",
+                        have_model ? 512 : 256, have_model ? 384 : 192,
+                        wrote ? "yes" : "NO", pw, ph);
             if (!ok) {
                 fails++;
                 if (!msg.empty())
@@ -3076,7 +3267,8 @@ static int selftest(const opts &o)
             std::vector<uint8_t> rgb;
 
             if (dyt_session_snapshot(sess, &snap, nullptr, 0) == 0 && snap.ready) {
-                rgb.resize((size_t)snap.width * (size_t)snap.height * 3);
+                const int f = snap.xform.sr >= 1 ? snap.xform.sr : 1;
+                rgb.resize((size_t)snap.width * f * (size_t)snap.height * f * 3);
                 if (dyt_session_render_rgb(sess, rgb.data(), (int)rgb.size(),
                                            &rw, &rh) != 0)
                     rgb.clear();
@@ -3310,21 +3502,22 @@ static int selftest(const opts &o)
             path = std::string(dir) + "/prefs.ini";
 
             prefs p;
-            p.palette = 4; p.unit = 1; p.zoom = 3; p.fusion = 2;
+            p.palette = 4; p.unit = 1; p.zoom = 3; p.fusion = 2; p.sr = 2;
             p.capture_dir = "/tmp/elsewhere";
             prefs_save(path, p);
 
             prefs q;
             prefs_load(path, q);
             round = q.palette == 4 && q.unit == 1 && q.zoom == 3 &&
-                    q.fusion == 2 && q.capture_dir == "/tmp/elsewhere";
+                    q.fusion == 2 && q.sr == 2 &&
+                    q.capture_dir == "/tmp/elsewhere";
 
             opts eff;                       /* --palette named, --zoom not */
             eff.palette = 2; eff.palette_set = true;
             opts_apply_prefs(eff, q);
             prec = eff.palette == 2 && eff.zoom == 3 &&
                    eff.capture_dir == "/tmp/elsewhere" &&
-                   eff.unit == 1 && eff.fusion == 2;
+                   eff.unit == 1 && eff.fusion == 2 && eff.sr == 2;
 
             prefs cur = prefs_from_session(sess, ".");
             from = cur.palette >= 0 && cur.zoom >= 1 &&
@@ -3357,18 +3550,142 @@ static int selftest(const opts &o)
         win.on_about_ = nullptr;
     }
 
-    /* 46. The About text names the app and the version the package carries.
-     * kAppVersion is the Makefile's VERSION when built that way, so this is
-     * also what a stale About box would fail. */
+    /* 46. The About text names the app and the version the package carries, and
+     * reports the one thing the build's feature macros cannot: whether a model
+     * was actually loaded.  kAppVersion is the Makefile's VERSION when built
+     * that way, so this is also what a stale About box would fail. */
     {
-        const std::string t = about_text();
-        const bool ok = kAppVersion[0] != '\0' &&
-                        t.find("dytqt") != std::string::npos &&
-                        t.find(kAppVersion) != std::string::npos;
+        const std::string t  = about_text(true);
+        const std::string t0 = about_text(false);
+        const bool named = kAppVersion[0] != '\0' &&
+                           t.find("dytqt") != std::string::npos &&
+                           t.find(kAppVersion) != std::string::npos;
+        const bool keys  = t.find("z Z") != std::string::npos;
+        const bool model = t.find("a model is loaded") != std::string::npos &&
+                           t0.find("no model loaded") != std::string::npos;
+        const bool ok = named && keys && model;
         std::printf("  %-4s the About text names the app and its version "
-                    "(%s)\n", ok ? "ok" : "FAIL", kAppVersion);
+                    "(%s), the SR keys and the model state\n",
+                    ok ? "ok" : "FAIL", kAppVersion);
         if (!ok)
             fails++;
+    }
+
+    /* 47. The super-resolution keys route to the session and post the notice
+     * that is their only feedback — the status line says nothing while the mode
+     * is off, so a refused key would otherwise be invisible.  Both cases are
+     * exercised because the window must keep them apart, exactly as it keeps
+     * 'e' from 'A'.  The *wording* is view_model_test's; what this pins is that
+     * the window delivers it at all, through the same callback the pump's
+     * notice uses. */
+    {
+        std::string got;
+        fv->on_notice_ = [&](const std::string &s) { got = s; };
+
+        dyt_snapshot_t s0{};
+        dyt_session_snapshot(sess, &s0, nullptr, 0);
+        const dyt_sr_t before = s0.sr;
+        const bool     cap    = s0.sr_cap != 0;
+
+        /* What each key must do, read from where the mode already was rather
+         * than assumed, so a run that started with --sr already on is tested
+         * too: with a model the key selects its own plane unless that plane is
+         * already selected, in which case it turns it off; without one it is
+         * refused. */
+        const dyt_sr_t want_z =
+            !cap                    ? DYT_SR_OFF :
+            s0.sr == DYT_SR_VISIBLE ? DYT_SR_OFF : DYT_SR_VISIBLE;
+
+        send_char('z');
+        dyt_snapshot_t s1{};
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool z_ok = s1.sr == want_z && !got.empty();
+
+        const dyt_sr_t want_Z =
+            !cap                       ? DYT_SR_OFF :
+            s1.sr == DYT_SR_THERMAL    ? DYT_SR_OFF : DYT_SR_THERMAL;
+
+        got.clear();
+        send_char('Z');
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+        const bool Z_ok = s2.sr == want_Z && !got.empty();
+
+        const bool ok = z_ok && Z_ok;
+        std::printf("  %-4s the super-resolution keys route, keep their case "
+                    "and post a notice ('z'->%s, 'Z'->%s, \"%s\")\n",
+                    ok ? "ok" : "FAIL", dyt_sr_name(s1.sr), dyt_sr_name(s2.sr),
+                    got.c_str());
+        if (!ok)
+            fails++;
+
+        /* Leave the mode as the run found it, so the frames the earlier
+         * assertions painted are what a run without this block would have. */
+        dyt_session_set_sr(sess, before);
+        fv->on_notice_ = nullptr;
+    }
+
+    /* 48. A 2x render maps a click back to the native pixel.  This is the whole
+     * point of carrying the factor in the view transform (display.h): the
+     * window hands map() the native source size and the transformed destination
+     * size, and sr is what makes the two agree.  Without it a click on a 2x
+     * picture would land at half the coordinate and every measurement would be
+     * placed wrong — silently, since the picture would still look right.
+     *
+     * Skipped, and says so, on a build with no model: the mode is refused and
+     * there is no 2x picture to map. */
+    {
+        dyt_snapshot_t s{};
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const dyt_sr_t was = s.sr;
+
+        dyt_session_set_sr(sess, DYT_SR_THERMAL);    /* applies at any fusion */
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+
+        bool ok = false, skipped = false;
+        if (!s2.sr_active) {
+            skipped = true;
+            ok      = true;
+        } else {
+            int sw = 0, sh = 0, ax = -1, ay = -1, bx = -1, by = -1;
+
+            /* The destination the window actually has: the rendered picture
+             * (native x sr) magnified by the window's zoom. */
+            const int dw = s2.width * s2.xform.sr * s2.xform.zoom;
+            const int dh = s2.height * s2.xform.sr * s2.xform.zoom;
+
+            dyt_view_transform_size(&s2.xform, s2.width, s2.height, &sw, &sh);
+
+            const bool a =
+                dyt_view_transform_map(&s2.xform, s2.width, s2.height, dw, dh,
+                                       0, 0, &ax, &ay) == 0;
+            const bool b =
+                dyt_view_transform_map(&s2.xform, s2.width, s2.height, dw, dh,
+                                       dw - 1, dh - 1, &bx, &by) == 0;
+
+            /* The two corner output pixels are the plane's two corners,
+             * whichever way the mirror sends them — so the check is on the
+             * span, not on which corner is which.  A transform that scaled by
+             * zoom alone would send the last output pixel past the plane and
+             * map() would refuse it. */
+            const int xlo = a && b ? (ax < bx ? ax : bx) : -1;
+            const int xhi = a && b ? (ax > bx ? ax : bx) : -1;
+            const int ylo = a && b ? (ay < by ? ay : by) : -1;
+            const int yhi = a && b ? (ay > by ? ay : by) : -1;
+
+            ok = sw == dw && sh == dh &&
+                 xlo == 0 && xhi == s2.width - 1 &&
+                 ylo == 0 && yhi == s2.height - 1;
+        }
+
+        std::printf("  %-4s a 2x render maps a click back to the native pixel "
+                    "(%s)\n", ok ? "ok" : "FAIL",
+                    skipped ? "skipped: no model" : "both corners");
+        if (!ok)
+            fails++;
+
+        dyt_session_set_sr(sess, was);
     }
 
     /* Leave the view model's state as the rest of the run found it. */
@@ -3711,8 +4028,13 @@ private:
 
 /* The About box's text.  Kept here rather than in a resource so it can be
  * built from the same feature macros the build actually used — an About box
- * that claims OpenCV in a build without it is worse than none. */
-static std::string about_text()
+ * that claims OpenCV in a build without it is worse than none.
+ *
+ * `have_model` is the one thing the feature macros cannot answer: "built with
+ * MNN" says a runtime is linked, not that a model was found and loaded.  The
+ * two are separate failures and the SR keys behave differently under each, so
+ * the box says which one it is. */
+static std::string about_text(bool have_model)
 {
     std::string s;
 
@@ -3732,7 +4054,9 @@ static std::string about_text()
 #ifdef DYT_HAVE_MNN
     s += " MNN";
 #endif
-    s += "\n\nkeys\n";
+    s += "\nsuper-resolution: ";
+    s += have_model ? "a model is loaded (2x)\n" : "no model loaded\n";
+    s += "\nkeys\n";
     s += "  p l b n       point / line / box / clear\n";
     s += "  a i           alarm / isotherm\n";
     s += "  e A R D y     emissivity / ambient / reflected / distance, send\n";
@@ -3743,6 +4067,7 @@ static std::string about_text()
     s += "  t             range auto/fixed\n";
     s += "  h H           flip horizontally / vertically\n";
     s += "  + -           zoom\n";
+    s += "  z Z           super-resolve the visible / thermal plane\n";
     s += "  f [ ] ; '     fusion pattern, alignment\n";
     s += "  q             quit\n";
     return s;
@@ -3762,6 +4087,7 @@ static int run_gui(const opts &o_in, QApplication &app)
     dyt_session_t *sess = setup_session(o);
     if (!sess)
         return 1;
+    setup_super_resolution(sess, o);
 
     MainWindow win;
     win.view()->set_session(sess);
@@ -3955,6 +4281,11 @@ static int run_gui(const opts &o_in, QApplication &app)
         pm.msg_ttl = 90;
     };
 
+    /* A view key's own notice (super-resolution), shown the same way a
+     * parameter write's outcome is.  Held longer than a param result because
+     * it usually names something the user has to change. */
+    win.view()->on_notice_ = [&](const std::string &s) { pm.notice(s, 200); };
+
     /* Capture.  `s` writes a still straight away — it is a few milliseconds of
      * work and has nothing to keep between keypresses — while `v` toggles the
      * one clip, which the pump then feeds a frame per tick. */
@@ -3995,8 +4326,14 @@ static int run_gui(const opts &o_in, QApplication &app)
     };
 
     win.on_about_ = [&]() {
+        /* Read the model state now rather than remembering it from start-up:
+         * a failed upscale withdraws the capability (session.c), and the box
+         * must not keep claiming a model that is no longer there. */
+        dyt_snapshot_t snap{};
+        const bool have_model =
+            dyt_session_snapshot(sess, &snap, nullptr, 0) == 0 && snap.sr_cap;
         QMessageBox::about(&win, QStringLiteral("About dytqt"),
-                           QString::fromStdString(about_text()));
+                           QString::fromStdString(about_text(have_model)));
     };
 
     /* Render a still at the source's own size with the app's palette, into

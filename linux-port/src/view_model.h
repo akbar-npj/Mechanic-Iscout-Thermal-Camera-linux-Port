@@ -451,6 +451,19 @@ int dyt_vm_gallery_label(const dyt_vm_gallery_t *g, char *out, size_t n);
  */
 int dyt_vm_view_key(dyt_session_t *s, int key);
 
+/* The transient notice a super-resolution key press deserves.
+ *
+ * `key` is the unfolded character (dyt_vm_view_key's own input).  Returns 1 and
+ * fills `out` when the key is one of the SR bindings, 0 otherwise — so a front
+ * end can call it after every view key without duplicating the binding.
+ *
+ * The wording is here rather than in the front end because the *reason* a mode
+ * does not take effect is a fact about the snapshot (sr_factor_locked in
+ * session.c), and a front end that re-derived it would eventually disagree with
+ * the render.  The status line shows the mode while it is on; this is what
+ * says why a key that appeared to do nothing did nothing. */
+int dyt_vm_sr_notice(int key, const dyt_snapshot_t *snap, char *out, size_t n);
+
 /* -------------------------------------------------------------- utilities */
 
 /* The directory the running executable lives in, or "" when it cannot be
