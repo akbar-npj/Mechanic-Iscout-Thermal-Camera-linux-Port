@@ -7,9 +7,19 @@ The unit is a UVC "dual-vision" module — 256×192 radiometric thermal plus a v
 camera, 8–14 µm, −15 °C … 600 °C — sold under many OEM brands (Mechanic-Ti, iScout,
 Xtherm, Aixun, MaAnt, MileSeey, QianLi, …).
 
-**Status:** the frame→temperature pipeline is ported and byte-verified against the
-vendor's own `libthermometry.so`, and the read-only bring-up path is complete.
-Everything requiring a live device is still open — see `RE Docs/09`.
+**Status (v0.1.0):** the eight-phase engine roadmap (`RE Docs/08` §8) is complete —
+units and display, measurement and alarms, device read-back and the one parameter
+write, the visible half and fusion, stills and the DYT container, mp4 recording, and
+the 2× super-resolution zoom. The frame→temperature pipeline is byte-verified against
+the vendor's own `libthermometry.so` for all four sensor widths in both `fix_mode`
+configurations, live capture and recording work on hardware, and the super-resolution
+output matches the vendor's own model to within one LSB.
+
+**Not yet established:** absolute temperature accuracy — nothing has been compared
+against a calibrated reference, so the atmospheric-transmittance model is still `[?]`
+(`RE Docs/09` §9). The visible/thermal registration offset is an assumption (1:1,
+alignment `0,0`) rather than a measurement (§4.10). The remaining `[?]` items are
+listed in `RE Docs/09`.
 
 ## Layout
 
@@ -29,15 +39,22 @@ make check      # regression gate — exits non-zero on any failure
 make clean
 ```
 
-`make check` runs the four unit-test binaries, the `probe --selftest` safety check, and
+`make check` runs the unit-test binaries, the `probe --selftest` safety check, and
 byte-compares the frame pipeline against frozen vendor ground truth for all four sensor
-widths in both `fix_mode` configurations.
+widths in both `fix_mode` configurations. It needs no camera attached.
 
-Requires `cc`, `make`, and `ar`. `libusb-1.0` is **optional**: with it, the live-capture
-tools `capture_demo` and `probe` (and the vendored libuvc they build on) are included;
-without it, the byte-verified pipeline and its unit tests build and `make check` still
-passes — only the live-capture tools are omitted. No network access is needed — libuvc is
-vendored and built from source when libusb is present.
+Requires `cc`, `make`, and `ar`. Three dependencies are **optional**, each detected at
+build time:
+
+| | with it | without it |
+|---|---|---|
+| `libusb-1.0` | the live-capture tools `capture_demo` and `probe`, and the vendored libuvc they build on | the byte-verified pipeline and its unit tests still build and `make check` still passes; only the live-capture tools are omitted |
+| OpenCV | the live viewer `dytview` and the mp4 recorder `dytrec` | both tools are omitted |
+| MNN | the Phase 8 super-resolution upscale; set `MNN_ROOT` to an install (recipe in `linux-port/third_party/README.md`) | `dyt_mnn_zoom2()` reports unavailable and refuses rather than inventing a frame |
+
+The JPEG backend is the vendored stb, so it is always present; `make JPEG=libjpeg`
+selects libjpeg as an accelerator instead. No network access is needed — libuvc and stb
+are vendored and built from source.
 
 ## Where to start reading
 
@@ -71,6 +88,8 @@ opcode whose table entry is marked `WRITE` (`linux-port/tools/probe.c:279`), and
 
 ## Not tracked
 
-The vendor installer (294 MB) and APK (169 MB), everything derived from them, and all
-build output. This repository tracks *work only* — roughly 7.5 MB. See `.gitignore`, which
-documents each rule.
+The vendor installer (294 MB) and APK (169 MB), everything derived from them, all build
+output, and the reference material kept beside the repo for cross-checking
+(`Thermal-Camera-Redux/`, and `MechaniscoutPcap/` — 1.1 GB of USB captures). This
+repository tracks *work only* — 9.6 MB across 245 files. See `.gitignore`, which documents
+each rule.
