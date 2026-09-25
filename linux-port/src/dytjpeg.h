@@ -129,6 +129,12 @@ int dyt_dyt_write(const char *path,
  * receives a copy of the container with every APP2 segment removed — the
  * original image — which is what a viewer needs to display it.
  *
+ * A container the vendor wrote is read the same way.  Its blob has the vendor's
+ * fixed part and no extension record, so it carries no thermal geometry — which
+ * is a property of the file, not a failure: the JPEG and the payload are both
+ * recovered, and `dyt_dyt_blob_geometry()` reports the geometry as absent
+ * rather than guessing it.
+ *
  * Returns 0, or -1 on a bad argument, an unreadable file, or a file that is
  * not a DYT container. */
 int dyt_dyt_read(const char *path,

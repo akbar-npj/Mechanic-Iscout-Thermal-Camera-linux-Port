@@ -505,6 +505,114 @@ static void test_plain_jpeg_is_not_a_container(void)
     free(raw);
 }
 
+/* A container written from a *vendor* blob: the vendor's 0x668-byte fixed part
+ * and nothing else.  The port's reader has to accept it — it is a perfectly
+ * valid container — and report the one thing the blob does not carry (the
+ * thermal geometry) as absent rather than guessing it.  This is the fallback a
+ * gallery needs: a still that can be displayed from its JPEG even when it
+ * cannot be re-rendered thermally.
+ *
+ * The blob's own size field is what makes the container readable at all: it is
+ * the raw-data offset, and it is the same field a vendor file carries. */
+static void test_vendor_blob_container(const uint8_t *fixture, size_t fix_len)
+{
+    const char *path = "build/dytjpeg_test_vendor.jpg";
+    uint8_t *jpg = NULL, *blob = NULL, *rblob = NULL, *rraw = NULL, *rjpg = NULL;
+    size_t   jlen = 0, ins = 0;
+    size_t   rblen = 0, rrlen = 0, rjlen = 0;
+    int      w = 123, ar = 123, tr = 123;
+    unsigned fl = 0x1234u;
+
+    printf("\n-- a vendor blob (fixed part only, no extension) --\n");
+
+    jpg = make_jpeg(1, &jlen, &ins);
+    blob = calloc(1, DYT_DYT_HDR_FIXED);
+    if (!jpg || !blob) { fail("allocate", "out of memory"); goto out; }
+
+    /* The vendor's fixed part: only the size field is set, exactly as the
+     * port's own blob_init leaves the vendor half. */
+    blob[DYT_DYT_OFF_SIZE]     = (uint8_t)(DYT_DYT_HDR_FIXED & 0xFF);
+    blob[DYT_DYT_OFF_SIZE + 1] = (uint8_t)(DYT_DYT_HDR_FIXED >> 8);
+
+    if (dyt_dyt_write(path, jpg, jlen, blob, DYT_DYT_HDR_FIXED,
+                      fixture, fix_len) != 0) {
+        fail("write a vendor-blob container", "returned -1");
+        goto out;
+    }
+    ok("the container writes");
+
+    if (dyt_dyt_read(path, &rblob, &rblen, &rraw, &rrlen, &rjpg, &rjlen) != 0) {
+        fail("the reader accepts it", "returned -1");
+        goto out;
+    }
+    ok("the reader accepts a vendor blob");
+
+    sizecheck("vendor blob length", rblen, DYT_DYT_HDR_FIXED);
+    intcheck("vendor blob is byte-identical",
+             rblen == DYT_DYT_HDR_FIXED && memcmp(rblob, blob, rblen) == 0, 1);
+    intcheck("the payload is byte-identical",
+             rrlen == fix_len && memcmp(rraw, fixture, fix_len) == 0, 1);
+    intcheck("the JPEG is the original",
+             rjlen == jlen && memcmp(rjpg, jpg, jlen) == 0, 1);
+
+    /* The size field still reads — it is the raw-data offset, and it is what a
+     * vendor file carries instead of an extension. */
+    sizecheck("the size field still reads",
+              dyt_dyt_blob_size(rblob, rblen), DYT_DYT_HDR_FIXED);
+
+    /* The geometry is *absent*, and reported as such: the outputs must not be
+     * touched, so a caller cannot mistake a stale value for a real one. */
+    intcheck("no geometry record",
+             dyt_dyt_blob_geometry(rblob, rblen, &w, &ar, &tr, &fl), 0);
+    intcheck("the width is untouched", w, 123);
+    intcheck("the active rows are untouched", ar, 123);
+    intcheck("the total rows are untouched", tr, 123);
+    intcheck("the flags are untouched", (int)fl, 0x1234);
+
+    /* A vendor blob may be longer than the fixed part — shape geometry follows
+     * at 0x668 — so the extension check must be an exact magic match, not "the
+     * blob is long enough".  A near-miss byte pattern must not be mistaken for
+     * the record. */
+    {
+        uint8_t  *vb = NULL, *rb = NULL, *rr = NULL;
+        size_t    vblen = DYT_DYT_HDR_FIXED + 0x34, rbl = 0, rrl = 0;
+        int       gw = 0, gar = 0, gtr = 0;
+        unsigned  gfl = 0;
+
+        vb = calloc(1, vblen);
+        if (!vb) { fail("allocate", "out of memory"); goto out; }
+        memcpy(vb, blob, DYT_DYT_HDR_FIXED);
+        vb[DYT_DYT_OFF_SIZE]     = (uint8_t)(vblen & 0xFF);
+        vb[DYT_DYT_OFF_SIZE + 1] = (uint8_t)(vblen >> 8);
+        /* One rect's worth of shape data, whose first four bytes are the magic
+         * plus one — the check has to be exact. */
+        vb[DYT_DYT_EXT_OFF + 0] = 0x45;
+        vb[DYT_DYT_EXT_OFF + 1] = 0x58;
+        vb[DYT_DYT_EXT_OFF + 2] = 0x54;
+        vb[DYT_DYT_EXT_OFF + 3] = 0x31;
+
+        if (dyt_dyt_write(path, jpg, jlen, vb, vblen, fixture, fix_len) != 0) {
+            fail("write a longer vendor blob", "returned -1");
+            free(vb);
+            goto out;
+        }
+        if (dyt_dyt_read(path, &rb, &rbl, &rr, &rrl, NULL, NULL) != 0) {
+            fail("read the longer vendor blob", "returned -1");
+            free(vb);
+            goto out;
+        }
+        sizecheck("the longer blob round-trips", rbl, vblen);
+        intcheck("the near-miss is not the magic",
+                 dyt_dyt_blob_geometry(rb, rbl, &gw, &gar, &gtr, &gfl), 0);
+        free(vb); free(rb); free(rr);
+    }
+
+out:
+    remove(path);
+    free(jpg); free(blob);
+    free(rblob); free(rraw); free(rjpg);
+}
+
 int main(int argc, char **argv)
 {
     const char *fixture_path = argc > 1 ? argv[1]
@@ -532,6 +640,7 @@ int main(int argc, char **argv)
         fails++;
     } else {
         test_roundtrip_file(fixture, fix_len);
+        test_vendor_blob_container(fixture, fix_len);
     }
     free(fixture);
 
