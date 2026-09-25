@@ -36,6 +36,7 @@
 #include "fusion.h"
 #include "measure.h"
 #include "palette.h"
+#include "sr.h"
 #include "units.h"
 #include "visible.h"
 
@@ -128,6 +129,22 @@ typedef struct {
     int          have_raw;
     int          raw_n;
     int          raw_total_rows;
+
+    /* ---- super-resolution (the optional 2x model) -----------------------
+     * What the user asked for, whether a model is actually loaded, and whether
+     * this frame can be super-resolved at all.  `sr_active` is the one a front
+     * end keys its status line off: the mode can be VISIBLE while the AD
+     * output mode has no visible half to upscale, in which case render_rgb()
+     * renders the plain picture and the UI should say so rather than silently
+     * showing something the user did not ask for — exactly the treatment
+     * `fusion_active` gets.
+     *
+     * `xform.sr` carries the factor the render produced (1 or 2), so a front
+     * end needs no arithmetic of its own to map a pointer back. */
+    dyt_sr_t sr;                  /* the selected mode */
+    char     sr_name[16];         /* "off" / "visible" / "thermal" */
+    int      sr_cap;              /* a model is loaded and can run */
+    int      sr_active;           /* this frame really is super-resolved */
 } dyt_snapshot_t;
 
 /* --------------------------------------------------------------- lifecycle */
@@ -195,14 +212,50 @@ int dyt_session_raw(dyt_session_t *s, uint16_t *out, int cap);
 int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
                          float *temps_out, int temps_cap);
 
-/* Render the latest frame through the active palette and range at source
- * size.  The mirror/zoom in the snapshot is *not* applied here — the caller
- * applies it when it presents, and uses dyt_view_transform_map() to map
- * pointer coordinates back.  Returns 0 and writes the dimensions through
- * `w` and `h` on success, -1 if there is no frame, -2 if out_rgb is too
- * small. */
+/* Render the latest frame through the active palette and range.  The
+ * mirror/zoom in the snapshot is *not* applied here — the caller applies it
+ * when it presents, and uses dyt_view_transform_map() to map pointer
+ * coordinates back.
+ *
+ * With super-resolution active the render is at 2x: `w`/`h` come back doubled
+ * and the picture is the model's, not a scaled copy of the 1x one.  The
+ * snapshot's `xform.sr` reports the factor the render will use, so a caller
+ * sizes its buffer from `snapshot width * xform.sr` and needs no other
+ * arithmetic.  Returns 0 and writes the dimensions through `w` and `h` on
+ * success, -1 if there is no frame, -2 if out_rgb is too small. */
 int dyt_session_render_rgb(dyt_session_t *s, uint8_t *out_rgb, int rgb_cap,
                            int *w, int *h);
+
+/* ------------------------------------------------------ super-resolution */
+
+/* The 2x upscaler a front end hands the session.
+ *
+ * It is the seam's own signature (mnn.h's dyt_mnn_zoom2) carried as a
+ * *pointer*, and that is the point: the engine holds no reference to MNN, so
+ * a binary that never enables super-resolution still links no runtime at all.
+ * The seam makes the same promise at the object level (mnn.h); this keeps it
+ * true at the library level too, which matters because the session is the
+ * module every front end links.
+ *
+ * A front end that wants the feature loads the model and hands the seam in:
+ *
+ *     if (dyt_mnn_load(path) == 0 && dyt_mnn_available())
+ *         dyt_session_set_sr_upscaler(sess, dyt_mnn_zoom2);
+ *
+ * Passing NULL withdraws it, which forces the mode back to OFF. */
+typedef int (*dyt_sr_upscale_fn)(const uint8_t *in, uint8_t *out,
+                                 int out_cap, int *out_n);
+
+void dyt_session_set_sr_upscaler(dyt_session_t *s, dyt_sr_upscale_fn fn);
+
+/* Which plane to upscale.  DYT_SR_OFF, or DYT_SR_VISIBLE / DYT_SR_THERMAL
+ * (sr.h).  Selecting a mode on a session with no upscaler installed is refused
+ * — the mode stays OFF — because the seam's rule is never to invent a frame.
+ * An out-of-range value is ignored rather than clamped. */
+void dyt_session_set_sr(dyt_session_t *s, dyt_sr_t m);
+
+/* The mode the session is holding (OFF when it cannot run one). */
+dyt_sr_t dyt_session_get_sr(dyt_session_t *s);
 
 /* ------------------------------------------------------------------ state */
 

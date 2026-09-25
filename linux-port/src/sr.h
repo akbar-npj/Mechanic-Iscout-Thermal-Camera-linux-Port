@@ -52,6 +52,19 @@ typedef enum {
     DYT_SR_N       = 3
 } dyt_sr_t;
 
+/* The model's fixed input geometry, and the magnification it produces.
+ *
+ * These mirror mnn.h's dyt_mnn_contract_t, and the duplication is deliberate:
+ * the session must not call into mnn.o to read the contract, because mnn.o is
+ * the one object that references the MNN runtime — calling it would drag
+ * libMNN into every binary that uses the session, and the whole point of the
+ * seam is that a build without a runtime still links and passes `make check`.
+ * mnn_test asserts the two agree (it links the runtime anyway), so they cannot
+ * drift apart unnoticed. */
+#define DYT_SR_IN_W   256
+#define DYT_SR_IN_H   192
+#define DYT_SR_FACTOR 2
+
 /* Stable short name for the status line: "off", "visible", "thermal".  Never
  * NULL; an unknown value yields "?". */
 const char *dyt_sr_name(dyt_sr_t m);

@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "mnn.h"
+#include "sr.h"
 
 /* Where tools/mnn_diff/ froze the vendor's answer.  Overridable so the test can
  * be pointed at a different reference tree. */
@@ -124,6 +125,16 @@ static void test_contract(void)
     check_int("in_bytes",                      c->in_bytes, 256 * 192 * 2);
     check_int("out_bytes is out_samples * 2",  c->out_bytes, c->out_samples * 2);
     check_int("in_bytes is in_samples * 2",    c->in_bytes, c->in_samples * 2);
+
+    /* sr.h mirrors this geometry as plain macros, because the session must not
+     * call into mnn.o to read the contract — doing so would drag the runtime
+     * into every binary that links the session.  The duplication is checked
+     * here, where the runtime is linked anyway, so the two cannot drift. */
+    check_int("sr.h's in_w matches the contract", DYT_SR_IN_W, c->in_w);
+    check_int("sr.h's in_h matches the contract", DYT_SR_IN_H, c->in_h);
+    check_int("sr.h's factor matches",            DYT_SR_FACTOR, c->factor);
+    check_int("sr.h's factor is the contract's out/in",
+              DYT_SR_FACTOR, c->out_w / c->in_w);
 }
 
 static void test_validator(const uint8_t *model, size_t n)

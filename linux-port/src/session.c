@@ -74,9 +74,32 @@ struct dyt_session {
 
     dyt_palette_t pal[DYT_PALETTE_MAX];
     int           pal_n;
+
+    /* Super-resolution (the optional 2x model).  `sr_mode` is what the user
+     * asked for and `sr_fn` the upscaler a front end handed in — the engine
+     * holds no reference to MNN itself, so a binary that never enables the
+     * feature links no runtime (session.h).
+     *
+     * The buffers are sized together for one frame geometry — `sr_n` is the
+     * pixel count they hold — and are grown on the first super-resolved frame
+     * or after a mode switch.  `sr_in` is filled under the lock, the model runs
+     * with no lock held, and the rest is read back under the lock, so no
+     * inference ever happens inside the critical section. */
+    dyt_sr_t           sr_mode;
+    dyt_sr_upscale_fn  sr_fn;
+    int                sr_n;
+    uint8_t           *sr_in;    /* 2n: the model's packed input                */
+    uint8_t           *sr_out;   /* 8n: its packed output (2x, two B a sample)  */
+    uint8_t           *sr_work;  /* 4n: the 2x grey plane fusion is handed      */
+    float             *sr_t2;    /* 4n: the 2x temperature plane the render eats */
+    uint8_t           *sr_g1;    /* n:  the 1x display grey the thermal mode makes */
 };
 
 /* --------------------------------------------------------------- lifecycle */
+
+/* Defined with the rest of the super-resolution code below; the snapshot needs
+ * the factor the next render will use, and the render needs it first. */
+static int sr_factor_locked(const dyt_session_t *s);
 
 dyt_session_t *dyt_session_create(void)
 {
@@ -124,6 +147,11 @@ void dyt_session_free(dyt_session_t *s)
     free(s->grey);
     free(s->raw);
     free(s->temps);
+    free(s->sr_in);
+    free(s->sr_out);
+    free(s->sr_work);
+    free(s->sr_t2);
+    free(s->sr_g1);
     free(s);
 }
 
@@ -332,6 +360,20 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
     out->palette   = s->disp.palette;
     out->palette_n = s->pal_n;
     out->xform     = s->xform;
+
+    /* The factor the *next* render will use.  Reported here so a front end can
+     * size its buffer for the frame it is about to be handed, and map a
+     * pointer back through the same scale as the picture it holds. */
+    {
+        const int srf = sr_factor_locked(s);
+
+        out->sr_active = (srf == 2);
+        dyt_view_transform_set_sr(&out->xform, srf);
+    }
+    out->sr     = s->sr_mode;
+    out->sr_cap = s->sr_fn != NULL;
+    snprintf(out->sr_name, sizeof out->sr_name, "%s",
+             dyt_sr_name(s->sr_mode));
     snprintf(out->palette_name, sizeof out->palette_name, "%s",
              s->pal[s->disp.palette].name);
 
@@ -436,14 +478,211 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
     return 0;
 }
 
+/* ------------------------------------------------------- super-resolution */
+
+/* The factor the next render will use: 2 when super-resolution is on, a model
+ * is loaded, the frame matches the model's fixed geometry, and — for the
+ * visible mode — the plane it upscales is actually being shown; 1 otherwise.
+ *
+ * This is a *predicate*, not "what the last render did", and that is what lets
+ * a front end size its buffer for the frame it is about to be handed: a caller
+ * that sized from the last render could never grow into the first
+ * super-resolved frame.  The snapshot reports it, and the render obeys it.
+ *
+ * Caller holds the lock. */
+static int sr_factor_locked(const dyt_session_t *s)
+{
+    if (!s->sr_fn || s->sr_mode == DYT_SR_OFF)
+        return 1;
+
+    /* The model is fixed 256x192 -> 512x384, so a 240/384/640-wide sensor
+     * cannot use it at all.  Refusing here is what keeps a differently sized
+     * frame from being fed to it. */
+    if (s->width != DYT_SR_IN_W || s->height != DYT_SR_IN_H)
+        return 1;
+
+    if (s->sr_mode == DYT_SR_VISIBLE) {
+        /* The vendor's plane.  It is only worth upscaling when it is shown, so
+         * the infrared pattern (which draws no visible channel) and a frame
+         * with no visible half both leave the render alone rather than
+         * upscaling a plane nobody sees. */
+        if (s->fusion.mode == DYT_FUSION_INFRARED)
+            return 1;
+        if (!s->have_grey || s->grey_w != s->width || s->grey_h != s->height)
+            return 1;
+    }
+
+    return 2;
+}
+
+/* Grow the super-resolution buffers for an n-pixel frame.  Called under the
+ * lock, on the first super-resolved frame or after a geometry change — never
+ * from the frame callback, so the one-off allocation is not in the per-frame
+ * path.
+ *
+ * Returns 0, or -1 when an allocation failed, in which case the render falls
+ * back to the plain picture rather than failing. */
+static int sr_grow_locked(dyt_session_t *s, int n)
+{
+    uint8_t *in, *out, *work, *g1;
+    float   *t2;
+
+    if (s->sr_n == n)
+        return 0;
+
+    in   = realloc(s->sr_in,   (size_t)n * 2);
+    out  = realloc(s->sr_out,  (size_t)n * 8);
+    work = realloc(s->sr_work, (size_t)n * 4);
+    t2   = realloc(s->sr_t2,   (size_t)n * 4 * sizeof *t2);
+    g1   = realloc(s->sr_g1,   (size_t)n);
+
+    /* Keep whatever succeeded, so a later frame retries only what failed.
+     * `sr_n` is left alone, so nothing here is used until all five are big
+     * enough. */
+    if (in)   s->sr_in   = in;
+    if (out)  s->sr_out  = out;
+    if (work) s->sr_work = work;
+    if (t2)   s->sr_t2   = t2;
+    if (g1)   s->sr_g1   = g1;
+
+    if (!in || !out || !work || !t2 || !g1)
+        return -1;
+
+    s->sr_n = n;
+    return 0;
+}
+
+/* Pack the plane this mode upscales into sr_in.  Caller holds the lock.
+ * Returns 0, or -1 when the plane is not there (the render then falls back to
+ * the plain picture rather than upscaling something else). */
+static int sr_fill_input_locked(dyt_session_t *s, int n)
+{
+    if (s->sr_mode == DYT_SR_VISIBLE) {
+        /* The vendor's plane: the dual-half grey picture.  It is already in
+         * the form the model reads (low byte = luma, high byte = neutral
+         * chroma), so packing just re-states that layout. */
+        if (!s->have_grey || s->grey_w != s->width || s->grey_h != s->height)
+            return -1;
+        return dyt_sr_pack(s->grey, n, s->sr_in);
+    }
+
+    /* The thermal mode: the *display-domain* grey, which is the picture the
+     * user is looking at, not the 14-bit raw whose low byte is a sawtooth
+     * (sr.h).  Encoding it through the display range is also what lets the
+     * result be rendered by the ordinary palette path below. */
+    if (dyt_sr_thermal_grey(s->temps, n, s->disp.lo, s->disp.hi,
+                            s->sr_g1) != 0)
+        return -1;
+    return dyt_sr_pack(s->sr_g1, n, s->sr_in);
+}
+
+/* The plain render: source size, thermal RGB, then fusion in place.  Caller
+ * holds the lock.  Shared by the normal path and the fallback. */
+static int render_plain_locked(dyt_session_t *s, uint8_t *out_rgb, int rgb_cap,
+                               int w, int h, int *out_w, int *out_h)
+{
+    int rc;
+
+    if (w <= 0 || h <= 0)
+        return -1;
+    if (rgb_cap < w * h * 3)
+        return -2;
+
+    rc = dyt_render_rgb(s->temps, w, h, &s->pal[s->disp.palette],
+                        s->disp.lo, s->disp.hi, out_rgb);
+    if (rc != 0)
+        return rc;
+
+    /* dyt_fusion_apply() validates its arguments before writing anything, so a
+     * pattern that cannot be honoured leaves the thermal render intact and
+     * this falls back to plain thermal rather than failing the whole render. */
+    if (s->fusion.mode != DYT_FUSION_INFRARED) {
+        const uint8_t *grey =
+            (s->have_grey && s->grey_w == w && s->grey_h == h) ? s->grey : NULL;
+        dyt_fusion_apply(&s->fusion, out_rgb, grey, w, h, out_rgb);
+    }
+
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 0;
+}
+
+/* Build the 2x picture from the model's output in sr_out.  Caller holds the
+ * lock and has already checked the geometry still matches.
+ *
+ * Whichever channel was *not* super-resolved gets a plain nearest 2x, so the
+ * two planes fusion is handed are the same size.  Returns 0, or -1. */
+static int render_sr_locked(dyt_session_t *s, uint8_t *out_rgb, int w, int h,
+                            int *out_w, int *out_h)
+{
+    int             n2 = 4 * w * h;
+    const uint8_t  *vis2 = NULL;   /* the 2x visible plane, when one is shown */
+    int             rc;
+
+    /* The model's output carries the upscaled grey in every even byte (sr.h),
+     * so unpacking it is the whole 2x grey plane. */
+    if (dyt_sr_unpack(s->sr_out, n2, s->sr_work) != 0)
+        return -1;
+
+    if (s->sr_mode == DYT_SR_THERMAL) {
+        /* The super-resolved channel is the thermal one, so the palette has to
+         * come from it: turn the grey back into temperatures through the same
+         * range and render through the ordinary path, so a temperature gets
+         * the colour it would have had at 1x. */
+        if (dyt_sr_grey_to_temps(s->sr_work, n2, s->disp.lo, s->disp.hi,
+                                 s->sr_t2) != 0)
+            return -1;
+
+        /* sr_work has been consumed, so it is free to hold the visible plane
+         * for fusion — and only when a pattern actually shows it. */
+        if (s->fusion.mode != DYT_FUSION_INFRARED &&
+            s->have_grey && s->grey_w == w && s->grey_h == h) {
+            if (dyt_sr_nearest2(s->grey, w, h, s->sr_work) != 0)
+                return -1;
+            vis2 = s->sr_work;
+        }
+    } else {
+        /* The visible channel was super-resolved, so it is the thermal plane
+         * that gets the plain 2x — as a float plane, so the palette path is
+         * unchanged. */
+        if (dyt_sr_nearest2_f(s->temps, w, h, s->sr_t2) != 0)
+            return -1;
+        vis2 = s->sr_work;
+    }
+
+    rc = dyt_render_rgb(s->sr_t2, 2 * w, 2 * h, &s->pal[s->disp.palette],
+                        s->disp.lo, s->disp.hi, out_rgb);
+    if (rc != 0)
+        return rc;
+
+    if (s->fusion.mode != DYT_FUSION_INFRARED && vis2) {
+        /* The alignment is in *source* pixels, so at 2x it is twice as many
+         * output pixels.  Without this the planes would sit half as far apart
+         * as the user set them. */
+        dyt_fusion_cfg_t cfg = s->fusion;
+
+        cfg.dx *= 2;
+        cfg.dy *= 2;
+        dyt_fusion_apply(&cfg, out_rgb, vis2, 2 * w, 2 * h, out_rgb);
+    }
+
+    if (out_w) *out_w = 2 * w;
+    if (out_h) *out_h = 2 * h;
+    return 0;
+}
+
 int dyt_session_render_rgb(dyt_session_t *s, uint8_t *out_rgb, int rgb_cap,
                            int *w, int *h)
 {
-    int npix, rc;
+    int rc, src_w, src_h, npix, f;
 
     if (!s || !out_rgb)
         return -1;
 
+    /* ---- phase 1: under the lock, decide and stage the model's input ------
+     * The model itself runs in phase 2, with no lock held: inference inside
+     * the critical section would stall the capture callback for its whole
+     * duration. */
     pthread_mutex_lock(&s->m);
 
     if (!s->have) {
@@ -451,30 +690,61 @@ int dyt_session_render_rgb(dyt_session_t *s, uint8_t *out_rgb, int rgb_cap,
         return -1;
     }
 
-    npix = s->width * s->height;
-    if (rgb_cap < npix * 3) {
-        pthread_mutex_unlock(&s->m);
-        return -2;
+    src_w = s->width;
+    src_h = s->height;
+    npix  = src_w * src_h;
+    f     = sr_factor_locked(s);
+
+    if (f == 2) {
+        /* The caller sizes from the snapshot, which reports this same factor,
+         * so a short buffer here is a caller error and -2 is what it already
+         * handles. */
+        if (rgb_cap < npix * 4 * 3) {
+            pthread_mutex_unlock(&s->m);
+            return -2;
+        }
+        if (sr_grow_locked(s, npix) != 0 ||
+            sr_fill_input_locked(s, npix) != 0)
+            f = 1;                      /* no memory, or no plane: render plain */
     }
 
-    rc = dyt_render_rgb(s->temps, s->width, s->height,
-                        &s->pal[s->disp.palette], s->disp.lo, s->disp.hi,
-                        out_rgb);
-    if (rc == 0) {
-        /* Fusion runs on the rendered RGB, in place: dyt_fusion_apply()
-         * validates its arguments before writing anything, so a pattern that
-         * cannot be honoured (no visible plane in the AD output mode) leaves
-         * the thermal render intact and this falls back to plain thermal
-         * rather than failing the whole render. */
-        if (s->fusion.mode != DYT_FUSION_INFRARED) {
-            const uint8_t *grey =
-                (s->have_grey && s->grey_w == s->width &&
-                 s->grey_h == s->height) ? s->grey : NULL;
-            dyt_fusion_apply(&s->fusion, out_rgb, grey, s->width, s->height,
-                             out_rgb);
-        }
-        if (w) *w = s->width;
-        if (h) *h = s->height;
+    if (f == 1) {
+        rc = render_plain_locked(s, out_rgb, rgb_cap, src_w, src_h, w, h);
+        pthread_mutex_unlock(&s->m);
+        return rc;
+    }
+
+    /* ---- phase 2: the model, with no lock held --------------------------- */
+    pthread_mutex_unlock(&s->m);
+    {
+        int n = 0;
+        rc = s->sr_fn(s->sr_in, s->sr_out, npix * 8, &n);
+    }
+    pthread_mutex_lock(&s->m);
+
+    /* ---- phase 3: back under the lock ------------------------------------
+     * The geometry cannot change on a single front-end thread, but a capture
+     * mode switch on the other thread could have changed it while the model
+     * ran — and a 2x picture built from a plane that no longer matches would
+     * mix two frames.  That is not the upscaler's fault, so the capability
+     * stays and only this frame falls back.  The *current* geometry is used,
+     * because the new frame is what s->temps now holds. */
+    if (!s->have || s->width != src_w || s->height != src_h)
+        rc = render_plain_locked(s, out_rgb, rgb_cap, s->width, s->height,
+                                 w, h);
+    else if (rc == 0)
+        rc = render_sr_locked(s, out_rgb, src_w, src_h, w, h);
+
+    if (rc != 0) {
+        /* An upscaler that fails at run time will not start working on the
+         * next frame, so withdraw it rather than paying for it every frame:
+         * the snapshot then reports sr 1, and the front end's mapping stays
+         * consistent with the picture it actually gets.  The frame still
+         * renders — plain — because a failed upscale is not a reason to show
+         * nothing. */
+        s->sr_fn   = NULL;
+        s->sr_mode = DYT_SR_OFF;
+        rc = render_plain_locked(s, out_rgb, rgb_cap, src_w, src_h, w, h);
     }
 
     pthread_mutex_unlock(&s->m);
@@ -624,8 +894,49 @@ void dyt_session_zoom(dyt_session_t *s, int delta)
     pthread_mutex_unlock(&s->m);
 }
 
-/* ----------------------------------------------------------------- fusion */
+/* ------------------------------------------------------- super-resolution */
 
+void dyt_session_set_sr_upscaler(dyt_session_t *s, dyt_sr_upscale_fn fn)
+{
+    if (!s)
+        return;
+
+    pthread_mutex_lock(&s->m);
+    s->sr_fn = fn;
+    /* Withdrawing the upscaler withdraws the mode with it: a mode with nothing
+     * behind it is exactly what the seam refuses to pretend about. */
+    if (!s->sr_fn)
+        s->sr_mode = DYT_SR_OFF;
+    pthread_mutex_unlock(&s->m);
+}
+
+void dyt_session_set_sr(dyt_session_t *s, dyt_sr_t m)
+{
+    if (!s || m < 0 || m >= DYT_SR_N)
+        return;
+
+    pthread_mutex_lock(&s->m);
+    /* A mode with no upscaler behind it is refused rather than remembered: the
+     * seam's rule is that the caller gets the real upscale or a refusal, and
+     * "selected but impossible" is neither. */
+    s->sr_mode = s->sr_fn ? m : DYT_SR_OFF;
+    pthread_mutex_unlock(&s->m);
+}
+
+dyt_sr_t dyt_session_get_sr(dyt_session_t *s)
+{
+    dyt_sr_t m;
+
+    if (!s)
+        return DYT_SR_OFF;
+
+    pthread_mutex_lock(&s->m);
+    m = s->sr_mode;
+    pthread_mutex_unlock(&s->m);
+    return m;
+}
+
+/* ----------------------------------------------------------------- fusion */
 void dyt_session_set_fusion(dyt_session_t *s, dyt_fusion_t f)
 {
     if (!s || f < 0 || f >= DYT_FUSION_N)

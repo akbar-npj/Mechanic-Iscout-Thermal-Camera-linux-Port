@@ -330,6 +330,20 @@ static dyt_fs_status_t next_fixture(dyt_frame_source_t *fs,
                                         fs->plane_y);
     }
 
+    /* Size from the snapshot's factor, exactly as the live path does, so a
+     * super-resolved frame is accommodated rather than refused. */
+    {
+        dyt_snapshot_t snap;
+        int            need;
+
+        if (dyt_session_snapshot(fs->sess, &snap, NULL, 0) == 0) {
+            need = snap.width * snap.xform.sr *
+                   snap.height * snap.xform.sr * 3;
+            if (need > 0 && grow(&fs->rgb, &fs->rgb_cap, need) != 0)
+                return DYT_FS_ERROR;
+        }
+    }
+
     if (dyt_session_render_rgb(fs->sess, fs->rgb, fs->rgb_cap, w, h) != 0) {
         fprintf(stderr, "frame_source: the fixture frame did not render\n");
         return DYT_FS_ERROR;
@@ -354,7 +368,10 @@ static dyt_fs_status_t next_live(dyt_frame_source_t *fs,
     if (!snap.ready)
         return DYT_FS_WAIT;
 
-    need = snap.width * snap.height * 3;
+    /* The snapshot reports the factor the render will use — 1, or 2 with
+     * super-resolution on — so the buffer is sized for the frame before it is
+     * asked for, and the render never has to report -2 here. */
+    need = snap.width * snap.xform.sr * snap.height * snap.xform.sr * 3;
     if (need <= 0)
         return DYT_FS_WAIT;
     if (grow(&fs->rgb, &fs->rgb_cap, need) != 0)

@@ -861,6 +861,223 @@ static void test_raw_payload(void)
     dyt_session_free(s);
 }
 
+/* --- super-resolution ---------------------------------------------------
+ *
+ * The 2x render is fully exercisable here because the seam is a function
+ * pointer (session.h): the engine holds no reference to MNN, so the test can
+ * hand in its own upscaler and check the whole path — the packing, the 2x
+ * render, the snapshot's factor, the refusal with nothing installed, and the
+ * fallback when the upscaler fails — with no runtime, no model and no camera.
+ */
+
+/* A stand-in for the model: a nearest-neighbour 2x written in the model's own
+ * packing (low byte = value, high byte = 0x80).  Because it duplicates each
+ * source pixel, the super-resolved picture must come out *exactly* the
+ * nearest-2x of the plain one, which is what the test asserts. */
+static int fake_upscale(const uint8_t *in, uint8_t *out, int out_cap, int *out_n)
+{
+    const int w = DYT_SR_IN_W, h = DYT_SR_IN_H;
+    const int stride = (2 * w) * 2;      /* one output row, in bytes */
+    int x, y;
+
+    if (!in || !out || !out_n || out_cap < w * h * 4 * 2)
+        return -1;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t v = in[2 * (y * w + x)];
+            int     o = (2 * y) * stride + 2 * x * 2;
+
+            out[o]                = v;   /* (2x,   2y)   */
+            out[o + 2]            = v;   /* (2x+1, 2y)   */
+            out[o + stride]       = v;   /* (2x,   2y+1) */
+            out[o + stride + 2]   = v;   /* (2x+1, 2y+1) */
+            out[o + 1]                  = DYT_SR_PACK_HIGH;
+            out[o + 3]                  = DYT_SR_PACK_HIGH;
+            out[o + stride + 1]         = DYT_SR_PACK_HIGH;
+            out[o + stride + 3]         = DYT_SR_PACK_HIGH;
+        }
+    }
+    *out_n = w * h * 4 * 2;
+    return 0;
+}
+
+/* An upscaler that always fails, to pin the fallback. */
+static int bad_upscale(const uint8_t *in, uint8_t *out, int cap, int *n)
+{
+    (void)in; (void)out; (void)cap; (void)n;
+    return -1;
+}
+
+/* Nearest 2x of an RGB image, so the test can state what a duplicated 2x must
+ * look like pixel for pixel. */
+static void nearest2_rgb(const uint8_t *in, int w, int h, uint8_t *out)
+{
+    int x, y;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            const uint8_t *p = in + ((size_t)y * w + x) * 3;
+            uint8_t       *r0 = out + ((size_t)(2 * y) * (2 * w) + 2 * x) * 3;
+            uint8_t       *r1 = r0 + (size_t)(2 * w) * 3;
+
+            memcpy(r0, p, 3);       memcpy(r0 + 3, p, 3);
+            memcpy(r1, p, 3);       memcpy(r1 + 3, p, 3);
+        }
+    }
+}
+
+static void test_super_resolution(void)
+{
+    dyt_session_t  *s = dyt_session_create();
+    dyt_snapshot_t  snap;
+    dyt_frame_info_t fi;
+    const int       W = DYT_SR_IN_W, H = DYT_SR_IN_H;
+    const size_t    native = (size_t)W * H * 3;
+    const size_t    big    = (size_t)W * H * 4 * 3;
+    float          *img  = malloc((size_t)W * H * sizeof *img);
+    uint8_t        *grey = malloc((size_t)W * H);
+    uint8_t        *one  = malloc(native);
+    uint8_t        *two  = malloc(big);
+    uint8_t        *want = malloc(big);
+    int             w = 0, h = 0, i;
+
+    printf("-- super-resolution --\n");
+    if (!img || !grey || !one || !two || !want) {
+        fail("allocate", "out of memory");
+        goto out;
+    }
+
+    /* A gentle vertical ramp, so every row has its own temperature and the
+     * palette has something to say about each. */
+    for (i = 0; i < W * H; i++)
+        img[i] = 25.0f + (float)(i / W) * 0.02f;
+    memset(grey, 128, (size_t)W * H);
+
+    fi.temps = img; fi.width = W; fi.height = H;
+    intcheck("process", dyt_session_process(s, &fi), 0);
+    intcheck("visible", dyt_session_process_visible(s, grey, W, H), 0);
+
+    /* ---- with nothing installed, the mode is refused --------------------- */
+    dyt_session_set_sr(s, DYT_SR_THERMAL);
+    intcheck("a mode with no upscaler is refused",
+             dyt_session_get_sr(s), DYT_SR_OFF);
+    intcheck("native render",
+             dyt_session_render_rgb(s, one, (int)native, &w, &h), 0);
+    intcheck("native width", w, W);
+    intcheck("native height", h, H);
+    intcheck("snapshot: no capability",
+             dyt_session_snapshot(s, &snap, NULL, 0) == 0 && snap.sr_cap == 0, 1);
+    intcheck("snapshot: not active", snap.sr_active, 0);
+    intcheck("snapshot: factor 1", snap.xform.sr, 1);
+
+    /* ---- hand the session a 2x upscaler ---------------------------------- */
+    dyt_session_set_sr_upscaler(s, fake_upscale);
+
+    dyt_session_set_sr(s, DYT_SR_THERMAL);
+    intcheck("thermal mode accepted", dyt_session_get_sr(s), DYT_SR_THERMAL);
+    intcheck("snapshot: capability",
+             dyt_session_snapshot(s, &snap, NULL, 0) == 0 && snap.sr_cap == 1, 1);
+    intcheck("snapshot: active", snap.sr_active, 1);
+    intcheck("snapshot: factor 2", snap.xform.sr, 2);
+    intcheck("snapshot: name", strcmp(snap.sr_name, "thermal") == 0, 1);
+
+    /* A buffer sized for 1x is reported, not overrun — the caller sizes from
+     * snapshot width * xform.sr, and a caller that forgot gets -2. */
+    intcheck("short buffer for 2x",
+             dyt_session_render_rgb(s, two, (int)native, &w, &h), -2);
+
+    intcheck("2x render",
+             dyt_session_render_rgb(s, two, (int)big, &w, &h), 0);
+    intcheck("2x width",  w, 2 * W);
+    intcheck("2x height", h, 2 * H);
+
+    /* The picture must be the *upscale* of the same picture, not a differently
+     * coloured one: with an upscaler that duplicates each pixel, the 2x frame
+     * has to equal the nearest-2x of the 1x frame exactly.  That also pins the
+     * display-domain encoding — the round trip through the grey plane and back
+     * must land on the same palette entry the temperature had. */
+    nearest2_rgb(one, W, H, want);
+    if (memcmp(two, want, big) == 0)
+        ok("the 2x frame is the 1x frame at 2x, colour for colour");
+    else
+        fail("2x matches the nearest-2x of 1x", "the pictures differ");
+
+    /* ---- the visible mode needs the plane, and needs it shown ------------ */
+    dyt_session_set_fusion(s, DYT_FUSION_BLEND);
+    dyt_session_set_sr(s, DYT_SR_VISIBLE);
+    intcheck("visible mode accepted", dyt_session_get_sr(s), DYT_SR_VISIBLE);
+    intcheck("snapshot: active with a plane shown",
+             dyt_session_snapshot(s, &snap, NULL, 0) == 0 && snap.sr_active == 1, 1);
+
+    /* The infrared pattern draws no visible channel, so upscaling it would be
+     * work nobody sees: the factor must drop back to 1 rather than upscale a
+     * plane that is not on screen. */
+    dyt_session_set_fusion(s, DYT_FUSION_INFRARED);
+    intcheck("snapshot: inactive under infrared",
+             dyt_session_snapshot(s, &snap, NULL, 0) == 0 && snap.sr_active == 0, 1);
+    intcheck("snapshot: factor back to 1", snap.xform.sr, 1);
+    dyt_session_set_fusion(s, DYT_FUSION_BLEND);
+
+    /* A session with no visible plane has nothing for the visible mode to
+     * upscale, so it too falls back. */
+    {
+        dyt_session_t *s2 = dyt_session_create();
+        dyt_session_set_sr_upscaler(s2, fake_upscale);
+        dyt_session_set_sr(s2, DYT_SR_VISIBLE);
+        dyt_session_process(s2, &fi);          /* a frame, but no visible half */
+        intcheck("snapshot: inactive with no plane",
+                 dyt_session_snapshot(s2, &snap, NULL, 0) == 0 &&
+                 snap.sr_active == 0, 1);
+        intcheck("no-plane render stays native",
+                 dyt_session_render_rgb(s2, two, (int)big, &w, &h) == 0 &&
+                 w == W && h == H, 1);
+        dyt_session_free(s2);
+    }
+
+    /* ---- a frame that is not the model's geometry is refused ------------- */
+    {
+        dyt_session_t *s3 = dyt_session_create();
+        float          small[8 * 4];
+        uint8_t        buf[8 * 4 * 3];
+
+        for (i = 0; i < 32; i++) small[i] = 20.0f + (float)i;
+        dyt_session_set_sr_upscaler(s3, fake_upscale);
+        dyt_session_set_sr(s3, DYT_SR_THERMAL);
+        fi.temps = small; fi.width = 8; fi.height = 4;
+        dyt_session_process(s3, &fi);
+        intcheck("snapshot: 8x4 cannot be upscaled",
+                 dyt_session_snapshot(s3, &snap, NULL, 0) == 0 &&
+                 snap.sr_active == 0, 1);
+        intcheck("8x4 render stays native",
+                 dyt_session_render_rgb(s3, buf, sizeof buf, &w, &h) == 0 &&
+                 w == 8 && h == 4, 1);
+        dyt_session_free(s3);
+    }
+
+    /* ---- an upscaler that fails is withdrawn, not retried forever -------- */
+    dyt_session_set_sr(s, DYT_SR_THERMAL);
+    dyt_session_set_sr_upscaler(s, bad_upscale);
+    intcheck("failed upscaler: the frame still renders",
+             dyt_session_render_rgb(s, two, (int)big, &w, &h), 0);
+    intcheck("failed upscaler: the render is native", w == W && h == H, 1);
+    intcheck("failed upscaler: capability withdrawn",
+             dyt_session_snapshot(s, &snap, NULL, 0) == 0 && snap.sr_cap == 0, 1);
+    intcheck("failed upscaler: mode cleared", snap.sr, DYT_SR_OFF);
+    intcheck("failed upscaler: factor 1", snap.xform.sr, 1);
+
+    /* Withdrawing the upscaler withdraws the mode with it. */
+    dyt_session_set_sr_upscaler(s, fake_upscale);
+    dyt_session_set_sr(s, DYT_SR_THERMAL);
+    dyt_session_set_sr_upscaler(s, NULL);
+    intcheck("withdrawing the upscaler clears the mode",
+             dyt_session_get_sr(s), DYT_SR_OFF);
+
+out:
+    free(img); free(grey); free(one); free(two); free(want);
+    dyt_session_free(s);
+}
+
 int main(void)
 {
     printf("=== session_test ===\n");
@@ -874,6 +1091,7 @@ int main(void)
     test_alarm();
     test_fusion();
     test_raw_payload();
+    test_super_resolution();
     test_concurrency();
     printf("=== %s ===\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
