@@ -311,6 +311,56 @@ thermometry: the host conversion's ambient is fixed at open, so a write to
 ambient does not by itself re-scale the picture the window is showing — the
 device's own reading changes, which is exactly what the read-back confirms.
 
+### Capture: stills and clips
+
+| key | effect |
+|---|---|
+| `s` | save the current frame — a `.dyt.jpg` container and a `.png` |
+| `v` | start a clip; press it again to stop and finalise |
+
+Files land in `--capture-dir` (default `.`), named `dyt_<timestamp>.<ext>` by
+`dyt_vm_capture_name()` so a still and the clip started in the same second do not
+collide. `s` is a few milliseconds of work with nothing to keep between
+keypresses, so it writes straight away; `v` toggles the one clip, which the pump
+then feeds a frame per tick.
+
+**The still is the container, not just a picture.** `dyt_vm_write_still()` (which
+predates the window — `dytrec --still` uses it too) writes the DYT container: the
+rendered frame as a JPEG, then the APP2 blob describing the payload, then the raw
+samples themselves. So a `.dyt.jpg` is a normal JPEG that also carries the
+radiometric data — the port's own `dyt_dyt_read()` parses it back (rc 0, blob
+1656 B, 196608 raw bytes, geometry 256×192 total 384 flags 0x1 via the `DXT1`
+extension record). The `.png` is the same frame for a viewer that knows nothing
+about the format. The still is rendered *before* either file is opened, so a
+frame that cannot be rendered does not leave half a still behind.
+
+**The clip shares `dytrec`'s writer.** `tools/recorder.h` is the one OpenCV mp4
+writer, extracted so the app and `dytrec` cannot drift; the app opens it at the
+window's `--fps`, writes the same RGB buffer the canvas is painting, and closes
+it to finalise. A frame whose dimensions differ from the clip's is refused rather
+than written, because an mp4's dimensions are fixed at open. The whole thing is
+OpenCV-gated: without OpenCV the target is still built, and `v` reports
+`cannot record: built without OpenCV` rather than failing silently.
+
+**A recording is visible while it runs.** The strip's last line carries a `REC
+0:07  175 frames` badge (`dyt_vm_rec_label()`), on its own rather than as part of
+a line, because the transient notices come and go and a recording must not. The
+outcome of each keypress is a notice like every other action — `saved
+dyt_…dyt.jpg + .png`, `recording dyt_….mp4`, `clip stopped: … (n frames)`.
+
+**The disk guard is a guard, not a hope.** Starting a clip needs 64 MB free and
+a running one is stopped if free falls below 16 MB, checked every 25 frames
+(`dyt_vm_disk_room()` on `statvfs`'s `f_bavail * f_frsize` — the space a
+non-root user can actually use, not `f_bfree`). The refusal names the reason —
+`cannot record: /path is not writable` or `only N MB free, need 64 MB` — because
+"recording failed" with no cause is the kind of message that makes a user retry
+the same thing.
+
+The state lives in the pump (`CaptureCtl`), and the two keys reach it through
+`on_still_`/`on_record_` — `std::function` callbacks like the parameter ladder's,
+for the same no-moc reason. `--selftest` drives both callbacks against a
+temporary directory and looks at the files that land.
+
 ## The toolkit decision — Qt6 Widgets
 
 Qt6 was chosen as the toolkit, and within Qt6, **Widgets** rather than Quick/QML.
@@ -410,6 +460,7 @@ position-independent.
 | `--frames N` | stop after N frames (default: run until closed) |
 | `--fps N` | timer rate (default 25) |
 | `--png PATH` | write the canvas here and exit |
+| `--capture-dir D` | where `s` (still) and `v` (clip) write (default `.`) |
 | `--selftest` | headless check over the fixture; needs no display |
 | `--live` | stream from the camera instead of replaying a fixture |
 | `--vid V --pid P` | USB vendor/product id (`0x0000 0x0000` = first matching device) |
@@ -430,8 +481,9 @@ reading the flat plane; it is the path the vendor's AD-mode tools use, and is
 only there because the port's super-resolution model was recovered against it.
 
 Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
-alarm and `i` shows the isotherm, and with `--live` the window reconnects on its
-own while `R` retries immediately — see "Measurement and alarm".
+alarm and `i` shows the isotherm, `s` saves a still and `v` records a clip, and
+with `--live` the window reconnects on its own while `R` retries immediately —
+see "Measurement and alarm" and "Capture: stills and clips".
 
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
@@ -479,6 +531,10 @@ $ ./build/dytqt --selftest
   ok   the confirmation is painted only while armed (idle 0, armed 7048, cancelled 0)
   ok   q quits and is never swallowed (idle yes, armed yes)
   ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
+  ok   a still writes the container and the PNG (wrote yes, 1 + 1, sized yes)
+  ok   a clip starts, takes frames, and stops (start yes, label yes, fed yes, 5 frames, 1 file, gone yes)
+  ok   a clip is refused where there is no disk (refused yes, says why yes)
+  ok   the capture keys route (still 1, record 1)
 === ALL PASS ===
 ```
 
@@ -545,6 +601,25 @@ pins `param_raw_matches()`, the verdict the deferred read-back reaches: that
 not `0.80`, that an exact step does not tolerate a one-LSB error, and that the
 two Celsius types compare as whole kelvin.
 
+37–40 cover capture. They write into a `mkdtemp` directory and look at what
+landed, which is why the fixture now installs the raw payload: 37 asserts that
+`save_still()` writes *both* halves — one `.dyt.jpg` and one `.png`, each over a
+kilobyte — and that its message starts with `saved `; 38 drives the `CaptureCtl`
+state machine through start/feed/stop, checks the indicator is non-empty while
+running and empty after, and confirms one `.mp4` was written (or, in a build
+without OpenCV, that the refusal names OpenCV — the gate is the point); 39 points
+the guard at a directory that cannot exist and pins that it refuses *and* says
+why; 40 pins that `s` and `v` reach `on_still_`/`on_record_` at all. What they
+cannot pin is the mp4's playability and the container's parse — those were
+checked by hand against a real run (below).
+
+The capture was checked end to end through the real window as well: a fixture
+run driven with `s`/`v`/`v`/`q` wrote a `.dyt.jpg` (219 KB), a `.png` (70 KB,
+`file` says `PNG image data, 256 x 192, 8-bit/color RGB`) and an `.mp4` (31 KB,
+`ffprobe` says `h264 256x192 25/1 50 frames`, 2.0 s), and the port's own
+`dyt_dyt_read()` parsed the container back (rc 0, blob 1656 B, 196608 raw bytes,
+geometry 256×192 total 384 flags 0x1).
+
 What these cannot pin is the write's real return code, the worker's `SetParam`
 branch, and the read-back itself, because all three need a live `dyt_capture_t`.
 Those were verified against the camera instead. Arming emissivity with `e` and
@@ -560,8 +635,12 @@ by read-back.
 Both the window and `--selftest` replay a frozen fixture through
 `tools/frame_source.c`, which runs the real device-free pipeline
 (`dyt_pipeline_resolve/frame`, `dyt_visible_extract`, `dyt_session_process`)
-exactly as the live capture adapter does. So the app needs no camera to be
-built, run or tested.
+exactly as the live capture adapter does. The fixture also hands the session its
+own copy of the payload (`dyt_session_process_raw`), the same call the adapter
+makes — a still is written from the GUI thread long after the frame callback has
+returned, so the session must own the raw, and keeping the fixture faithful is
+what lets `--selftest` exercise the still writer and the recorder with no
+camera. So the app needs no camera to be built, run or tested.
 
 `--live` swaps the fixture source for `dyt_frame_source_open_live()`, which
 pulls from the session the adapter (`src/session_capture.c`) installs frames
@@ -718,3 +797,6 @@ only when the session wrote a parameter — then abandons it the same way.
   pointer handler), but synthetic pointer drags proved unreliable on this
   compositor — the window manager slides the window, so a drag's absolute
   coordinates go stale — and the overlay was verified by a fixture render instead.
+  Driving the window with XTEST needs `QT_QPA_PLATFORM=xcb`: under the Wayland
+  platform plugin the window is a native Wayland surface that X11 cannot see, and
+  the key sender reports "no window matching" for a window that is plainly there.

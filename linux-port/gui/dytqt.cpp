@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>     /* the selftest counts what a capture actually wrote */
 #include <functional>
 #include <memory>
 #include <string>
@@ -46,10 +47,15 @@
 
 #include "capture.h"
 #include "frame_source.h"
+#include "imgwrite.h"    /* dyt_write_png — the still's shareable half */
 #include "palette.h"
 #include "session.h"
 #include "session_capture.h"
 #include "view_model.h"
+
+#ifdef DYT_HAVE_OPENCV
+#include "recorder.h"    /* the shared mp4 writer, when OpenCV is present */
+#endif
 
 /* ---------------------------------------------------------------- layout */
 
@@ -71,6 +77,7 @@ struct opts {
     std::string fixture = "testdata/mode1000_256x384_default.raw";
     std::string palette_dir;
     std::string png;                 /* save the canvas here, then exit */
+    std::string capture_dir = ".";   /* where 's' and 'v' put their files */
     int  width   = 256;
     int  palette = 1;
     int  zoom    = 2;
@@ -113,6 +120,7 @@ static void usage(const char *prog)
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
         "  --png PATH       write the canvas here and exit\n"
+        "  --capture-dir D  where 's' (still) and 'v' (clip) write (default .)\n"
         "  --selftest       headless check over the fixture; needs no display\n"
         "\n"
         "live capture (replaces the fixture):\n"
@@ -148,6 +156,7 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--fixture")                 { const char *v = next("--fixture"); if (!v) return false; o.fixture = v; o.fixture_set = true; }
         else if (a == "--palette-dir")             { const char *v = next("--palette-dir"); if (!v) return false; o.palette_dir = v; }
         else if (a == "--png")                     { const char *v = next("--png"); if (!v) return false; o.png = v; }
+        else if (a == "--capture-dir")             { const char *v = next("--capture-dir"); if (!v) return false; o.capture_dir = v; }
         /* --width is the sensor width in both modes: the fixture's, and the
          * capture width override when live.  One flag, because a user who says
          * "the sensor is 384 wide" means it whichever source they picked. */
@@ -483,6 +492,217 @@ static int param_raw_matches(dyt_order_type_t type, float value, uint16_t raw)
                            ? (int)dyt_param_encode_ratio(value)
                            : (int)dyt_param_encode_kelvin(value);
     return (int)raw == expect;
+}
+
+/* ------------------------------------------------- capture and recording
+ *
+ * The still writer and the disk guard are the view model's; what a *window*
+ * adds is the state between keypresses — which directory, and the one clip
+ * that can be running at a time.  That is all this is.
+ *
+ * Two decisions worth stating, because both could reasonably go the other way:
+ *
+ *  - A still writes *two* files: the DYT container, which keeps the device's
+ *    raw payload so a vendor tool can re-render it, and a PNG of the same
+ *    render, which is what anything else can actually display.  Both are the
+ *    clean source-resolution render, not the zoomed canvas with its overlays,
+ *    so the picture and the data always agree.
+ *  - A clip records the frame *as displayed* — isotherm dimming included when
+ *    it is on — because that is what a record button is understood to do.
+ *
+ * The disk guard is checked before a clip starts and then periodically while
+ * one runs, because the two failures are different: refusing to start loses
+ * nothing, while a clip that fills the disk has to be stopped and its frames
+ * finalised rather than left as a truncated file.
+ */
+
+static const long long kRecStartMin  = 64LL << 20;  /* refuse to start below */
+static const long long kRecStopMin   = 16LL << 20;  /* stop a running clip below */
+static const int       kRecDiskEvery = 25;          /* frames between checks */
+
+struct CaptureCtl {
+    std::string dir = ".";       /* where stills and clips go */
+    std::string path;            /* the clip being written, for the notices */
+    bool        recording = false;
+    long long   frames    = 0;
+    std::chrono::steady_clock::time_point t0{};
+
+#ifdef DYT_HAVE_OPENCV
+    dyt_recorder_t *writer = nullptr;
+#endif
+
+    double elapsed_s() const
+    {
+        if (!recording)
+            return 0.0;
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t0).count();
+    }
+
+    /* The strip's recording indicator, empty when nothing is running. */
+    std::string label() const
+    {
+        char b[64];
+
+        if (!recording)
+            return std::string();
+        dyt_vm_rec_label(elapsed_s(), frames, b, sizeof b);
+        return b;
+    }
+
+    /* Start a clip.  Returns false and fills `why` when it cannot. */
+    bool start(double fps, std::string &why)
+    {
+        char      name[512];
+        char      ts[32];
+        long long free_b = -1;
+
+        if (recording)
+            return true;                     /* already running */
+
+        if (dyt_vm_disk_room(dir.c_str(), kRecStartMin, &free_b) != 1) {
+            char b[192];
+            if (free_b < 0)
+                snprintf(b, sizeof b, "cannot record: %s is not writable",
+                         dir.c_str());
+            else
+                snprintf(b, sizeof b,
+                         "cannot record: only %lld MB free, need %lld MB",
+                         free_b >> 20, kRecStartMin >> 20);
+            why = b;
+            return false;
+        }
+
+        if (dyt_vm_timestamp(ts, sizeof ts) != 0 ||
+            dyt_vm_capture_name(name, sizeof name, dir.c_str(), ts, "mp4") != 0) {
+            why = "cannot record: no usable file name";
+            return false;
+        }
+
+#ifdef DYT_HAVE_OPENCV
+        writer = dyt_recorder_open(name, fps, "avc1");
+        if (!writer) {
+            why = "cannot record: the mp4 writer did not start";
+            return false;
+        }
+        why = std::string("recording ") + name;
+#else
+        (void)name;
+        why = "cannot record: built without OpenCV";
+        return false;
+#endif
+        path      = name;
+        recording = true;
+        frames    = 0;
+        t0        = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    /* Feed one displayed frame.  Returns false when the clip stopped itself
+     * (the disk filled), with `why` set; true otherwise, recording or not. */
+    bool feed(const uint8_t *rgb, int w, int h, std::string &why)
+    {
+        if (!recording)
+            return true;
+
+#ifdef DYT_HAVE_OPENCV
+        if (dyt_recorder_write(writer, rgb, w, h) != 0) {
+            stop();
+            why = "recording stopped: the writer refused a frame";
+            return false;
+        }
+#else
+        (void)rgb;
+        (void)w;
+        (void)h;
+#endif
+        frames++;
+
+        if (frames % kRecDiskEvery == 0) {
+            long long free_b = -1;
+            if (dyt_vm_disk_room(dir.c_str(), kRecStopMin, &free_b) == 0) {
+                char b[192];
+                snprintf(b, sizeof b,
+                         "recording stopped: disk full (%lld MB free)",
+                         free_b >> 20);
+                stop();
+                why = b;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /* Stop and finalise.  Returns the number of frames the clip holds. */
+    long long stop()
+    {
+        const long long n = frames;
+
+        if (!recording)
+            return 0;
+        recording = false;
+#ifdef DYT_HAVE_OPENCV
+        if (writer)
+            dyt_recorder_close(writer);
+        writer = nullptr;
+#endif
+        frames = 0;
+        return n;
+    }
+
+    ~CaptureCtl() { stop(); }
+};
+
+/* Write a still: the container and the PNG.  Returns true on success; on
+ * failure `msg` says why. */
+static bool save_still(dyt_session_t *sess, const std::string &dir,
+                       std::string &msg)
+{
+    char           ts[32], dyt_path[512], png_path[512], why[256] = { 0 };
+    dyt_snapshot_t snap;
+    int            w = 0, h = 0;
+    const char    *base;
+
+    if (!sess) {
+        msg = "still: no session";
+        return false;
+    }
+
+    /* Render before writing anything, so a frame that cannot be rendered does
+     * not leave half a still behind. */
+    if (dyt_session_snapshot(sess, &snap, nullptr, 0) != 0 || !snap.ready) {
+        msg = "still: no live frame yet";
+        return false;
+    }
+    {
+        std::vector<uint8_t> rgb((size_t)snap.width * (size_t)snap.height * 3);
+        if (dyt_session_render_rgb(sess, rgb.data(), (int)rgb.size(), &w, &h)
+                != 0) {
+            msg = "still: render failed";
+            return false;
+        }
+        if (dyt_vm_timestamp(ts, sizeof ts) != 0 ||
+            dyt_vm_capture_name(dyt_path, sizeof dyt_path, dir.c_str(), ts,
+                                "dyt.jpg") != 0 ||
+            dyt_vm_capture_name(png_path, sizeof png_path, dir.c_str(), ts,
+                                "png") != 0) {
+            msg = "still: no usable file name";
+            return false;
+        }
+        if (dyt_vm_write_still(sess, dyt_path, why, sizeof why) != 0) {
+            msg = why[0] ? why : "still: the container was not written";
+            return false;
+        }
+        if (dyt_write_png(png_path, rgb.data(), w, h) != 0) {
+            msg = "still: the PNG was not written";
+            return false;
+        }
+    }
+
+    base = strrchr(dyt_path, '/');
+    base = base ? base + 1 : dyt_path;
+    msg  = std::string("saved ") + base + " + .png";
+    return true;
 }
 
 /* ------------------------------------------------------------- the canvas */
@@ -1047,6 +1267,17 @@ public:
         update();
     }
 
+    /* The recording indicator — "REC 0:07  175 frames" — or empty when
+     * nothing is running.  Its own badge rather than part of a line, because a
+     * recording must stay visible while the transient notices come and go. */
+    void set_recording(const QString &s)
+    {
+        rec_ = s;
+        update();
+    }
+
+    const QString &recording_label() const { return rec_; }
+
     QSize sizeHint() const override
     {
         int w = 0;
@@ -1084,10 +1315,23 @@ protected:
             p.setPen(QColor(255, 255, 255));
             p.drawText(r, Qt::AlignCenter, a);
         }
+
+        /* Recording, on the last line so the two badges cannot collide. */
+        if (!rec_.isEmpty()) {
+            const int   bw = 12 + fontMetrics().horizontalAdvance(rec_);
+            const QRect r(width() - bw - kStripPad,
+                          kStripPad + 2 * kLineH, bw, kLineH + 4);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0xb0, 0x10, 0x10));
+            p.drawRect(r);
+            p.setPen(QColor(255, 255, 255));
+            p.drawText(r, Qt::AlignCenter, rec_);
+        }
     }
 
 private:
     QString line_[3];
+    QString rec_;
     bool    alarm_on_ = false;
     dyt_alarm_state_t alarm_ = DYT_ALARM_NONE;
 };
@@ -1124,6 +1368,11 @@ public:
     /* Quit is a callback rather than close() inline so --selftest can observe
      * `q` without tearing the window down.  run_gui installs it as close(). */
     std::function<void()> on_quit_;
+
+    /* Capture and recording, callbacks for the same reason quit is one:
+     * --selftest drives the real keys and then looks at what changed. */
+    std::function<void()> on_still_;
+    std::function<void()> on_record_;
 
     /* Size the window to the canvas it has to show.  Called once before the
      * window is shown, and again whenever the canvas changes size.
@@ -1232,6 +1481,18 @@ protected:
             return;
         }
 
+        /* Capture: 's' saves a still, 'v' toggles a clip.  Both are free of
+         * the device keys (r/d), the measurement keys (p/l/b/n/a/i) and the
+         * parameter ladder (e/A/R/D/y), and both are lowercase. */
+        if (raw == 's' && on_still_) {
+            on_still_();
+            return;
+        }
+        if (raw == 'v' && on_record_) {
+            on_record_();
+            return;
+        }
+
         /* Everything else is the measurement bindings, which are lowercase —
          * so fold the unfolded character back down before consulting them.
          * The return value decides, rather than a list of letters here, so
@@ -1291,6 +1552,18 @@ struct pump {
     std::string msg;
     int         msg_ttl = 0;
 
+    /* The still writer and the one clip.  It lives here rather than in
+     * run_gui because step() is what feeds it a frame. */
+    CaptureCtl capture;
+
+    /* Post a transient notice.  A method so the callers cannot set one without
+     * the other and leave a message that never expires. */
+    void notice(const std::string &s, int ttl = 150)
+    {
+        msg     = s;
+        msg_ttl = ttl;
+    }
+
     long long ticks  = 0;   /* timer callbacks */
     long long frames = 0;   /* frames actually painted */
     int       fails  = 0;
@@ -1314,6 +1587,10 @@ struct pump {
         /* Expire the transient notice before anything can re-set it. */
         if (msg_ttl > 0 && --msg_ttl == 0)
             msg.clear();
+
+        /* Keep the recording badge current even on a tick that paints nothing:
+         * the clock has to advance whether or not a frame arrived. */
+        win->strip()->set_recording(QString::fromStdString(capture.label()));
 
         if (!fs) {
             /* Bring-up failed, so there is no source to pull from — but the
@@ -1386,6 +1663,16 @@ struct pump {
             dyt_vm_apply_isotherm(iso_buf.data(), w, h, scr.temps, scr.cap,
                                   snap.iso_lo, snap.iso_hi);
             pix = iso_buf.data();
+        }
+
+        /* Record the frame as displayed — the same buffer the canvas gets,
+         * isotherm dimming included.  A clip that stopped itself (the disk
+         * filled) leaves its reason in the notice, so the strip says why rather
+         * than the badge just vanishing. */
+        if (capture.recording) {
+            std::string why;
+            if (!capture.feed(pix, w, h, why))
+                notice(why);
         }
 
         /* The engine's buffer is tightly packed RGB, so QImage wraps it with
@@ -2328,6 +2615,188 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* ---- capture: a still, a clip, and the disk guard --------------------
+     *
+     * The still writer and the recorder are real here — the fixture has given
+     * the session a frame — so these write actual files into a temporary
+     * directory and look at what landed.  What they cannot cover is the live
+     * payload; the fixture's raw is the same shape, and the writer's own
+     * format is dytjpeg_test's subject, not this one. */
+    {
+        char  tmpl[] = "/tmp/dytqt-selftest-XXXXXX";
+        char *dir    = mkdtemp(tmpl);
+        const std::string d = dir ? dir : ".";
+
+        /* Count the files a capture left, by extension. */
+        auto count_files = [&](const char *ext) {
+            DIR *dp = opendir(d.c_str());
+            int  n  = 0;
+            if (!dp)
+                return -1;
+            for (struct dirent *e; (e = readdir(dp)) != nullptr;) {
+                const size_t l = strlen(e->d_name);
+                const size_t x = strlen(ext);
+                if (l > x && strcmp(e->d_name + l - x, ext) == 0)
+                    n++;
+            }
+            closedir(dp);
+            return n;
+        };
+        auto any_size = [&](const char *ext) {
+            DIR *dp = opendir(d.c_str());
+            long long best = -1;
+            if (!dp)
+                return best;
+            for (struct dirent *e; (e = readdir(dp)) != nullptr;) {
+                const size_t l = strlen(e->d_name);
+                const size_t x = strlen(ext);
+                if (l <= x || strcmp(e->d_name + l - x, ext) != 0)
+                    continue;
+                char full[600];
+                snprintf(full, sizeof full, "%s/%s", d.c_str(), e->d_name);
+                FILE *f = fopen(full, "rb");
+                if (!f)
+                    continue;
+                fseek(f, 0, SEEK_END);
+                best = ftell(f);
+                fclose(f);
+            }
+            closedir(dp);
+            return best;
+        };
+
+        /* 37. A still writes both halves: the DYT container and the PNG. */
+        {
+            std::string msg;
+            const bool  wrote = save_still(sess, d, msg);
+            const int   nd    = count_files(".dyt.jpg");
+            const int   np    = count_files(".png");
+            const bool  sized = any_size(".dyt.jpg") > 1000 && any_size(".png") > 1000;
+
+            const bool ok = wrote && nd == 1 && np == 1 && sized &&
+                            msg.find("saved ") == 0;
+            std::printf("  %-4s a still writes the container and the PNG "
+                        "(wrote %s, %d + %d, sized %s)\n",
+                        ok ? "ok" : "FAIL", wrote ? "yes" : "NO", nd, np,
+                        sized ? "yes" : "NO");
+            if (!ok) {
+                fails++;
+                if (!msg.empty())
+                    std::printf("       %s\n", msg.c_str());
+            }
+        }
+
+        /* 38. The clip state machine: start, feed, stop — and the indicator
+         * tracks it.  Needs OpenCV, which is the point of the gate. */
+        {
+            dyt_snapshot_t snap;
+            int            rw = 0, rh = 0;
+            std::vector<uint8_t> rgb;
+
+            if (dyt_session_snapshot(sess, &snap, nullptr, 0) == 0 && snap.ready) {
+                rgb.resize((size_t)snap.width * (size_t)snap.height * 3);
+                if (dyt_session_render_rgb(sess, rgb.data(), (int)rgb.size(),
+                                           &rw, &rh) != 0)
+                    rgb.clear();
+            }
+
+            CaptureCtl  c;
+            std::string why;
+            c.dir = d;
+
+            const bool started = c.start(25.0, why);
+            const bool labelled = !c.label().empty();
+            bool       fed = true;
+            for (int i = 0; started && rgb.size() && i < 5; i++) {
+                std::string f;
+                if (!c.feed(rgb.data(), rw, rh, f)) {
+                    fed = false;
+                    break;
+                }
+            }
+            const bool was_recording = c.recording;
+            const long long stopped  = c.stop();
+            const int  clips = count_files(".mp4");
+            const bool gone  = !c.recording && c.label().empty();
+
+#ifdef DYT_HAVE_OPENCV
+            const bool ok = started && labelled && fed && was_recording &&
+                            stopped == 5 && gone && clips == 1 &&
+                            any_size(".mp4") > 1000;
+            std::printf("  %-4s a clip starts, takes frames, and stops "
+                        "(start %s, label %s, fed %s, %lld frames, "
+                        "%d file, gone %s)\n",
+                        ok ? "ok" : "FAIL", started ? "yes" : "NO",
+                        labelled ? "yes" : "NO", fed ? "yes" : "NO",
+                        stopped, clips, gone ? "yes" : "NO");
+#else
+            /* Without OpenCV the refusal has to be the defined one, not a
+             * crash and not a silent no-op. */
+            const bool ok = !started && !labelled && clips == 0 && gone &&
+                            why.find("OpenCV") != std::string::npos;
+            std::printf("  %-4s recording is refused without OpenCV "
+                        "(refused %s, says why %s)\n",
+                        ok ? "ok" : "FAIL", !started ? "yes" : "NO",
+                        why.find("OpenCV") != std::string::npos ? "yes" : "NO");
+#endif
+            if (!ok) {
+                fails++;
+                if (!why.empty())
+                    std::printf("       %s\n", why.c_str());
+            }
+        }
+
+        /* 39. The disk guard refuses a directory it cannot examine, and says
+         * which one. */
+        {
+            CaptureCtl  c;
+            std::string why;
+            c.dir = "/nonexistent-dir-xyz/sub";
+            const bool started = c.start(25.0, why);
+            const bool ok = !started && why.find("not writable") != std::string::npos;
+            std::printf("  %-4s a clip is refused where there is no disk "
+                        "(refused %s, says why %s)\n",
+                        ok ? "ok" : "FAIL", !started ? "yes" : "NO",
+                        why.find("not writable") != std::string::npos ? "yes"
+                                                                     : "NO");
+            if (!ok)
+                fails++;
+        }
+
+        /* Clean up, so a selftest run leaves nothing behind. */
+        {
+            DIR *dp = opendir(d.c_str());
+            for (struct dirent *e; dp && (e = readdir(dp)) != nullptr;) {
+                if (e->d_name[0] == '.')
+                    continue;
+                char full[600];
+                snprintf(full, sizeof full, "%s/%s", d.c_str(), e->d_name);
+                unlink(full);
+            }
+            if (dp)
+                closedir(dp);
+        }
+        if (dir)
+            rmdir(dir);
+    }
+
+    /* 40. The capture keys reach the front end.  's' and 'v' are new bindings
+     * and must not have been swallowed by the measurement set. */
+    {
+        int stills = 0, toggles = 0;
+        win.on_still_  = [&]() { stills++; };
+        win.on_record_ = [&]() { toggles++; };
+        send_char('s');
+        send_char('v');
+        const bool ok = stills == 1 && toggles == 1;
+        std::printf("  %-4s the capture keys route (still %d, record %d)\n",
+                    ok ? "ok" : "FAIL", stills, toggles);
+        if (!ok)
+            fails++;
+        win.on_still_  = nullptr;
+        win.on_record_ = nullptr;
+    }
+
     /* Leave the view model's state as the rest of the run found it. */
     fv->clear_info();
     win.on_quit_  = nullptr;
@@ -2862,6 +3331,36 @@ static int run_gui(const opts &o, QApplication &app)
         const dyt_vm_ladder_t *lad = dyt_vm_ladder(type);
         pm.msg     = std::string("cancelled: ") + (lad ? lad->name : "?");
         pm.msg_ttl = 90;
+    };
+
+    /* Capture.  `s` writes a still straight away — it is a few milliseconds of
+     * work and has nothing to keep between keypresses — while `v` toggles the
+     * one clip, which the pump then feeds a frame per tick. */
+    pm.capture.dir = o.capture_dir;
+
+    win.on_still_ = [&]() {
+        std::string m;
+        save_still(sess, pm.capture.dir, m);
+        pm.notice(m, 150);
+    };
+
+    win.on_record_ = [&]() {
+        std::string why;
+
+        if (pm.capture.recording) {
+            const std::string     path = pm.capture.path;
+            const long long       n    = pm.capture.stop();
+            const char           *base = strrchr(path.c_str(), '/');
+            char                  b[192];
+            base = base ? base + 1 : path.c_str();
+            snprintf(b, sizeof b, "clip stopped: %s (%lld frame%s)", base, n,
+                     n == 1 ? "" : "s");
+            pm.notice(b, 150);
+        } else if (pm.capture.start((double)o.fps, why)) {
+            pm.notice(why, 90);           /* "recording <path>" */
+        } else {
+            pm.notice(why, 200);          /* the refusal, held longer */
+        }
     };
 
     win.on_close_ = [&]() {

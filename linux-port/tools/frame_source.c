@@ -239,6 +239,18 @@ static dyt_fs_status_t next_fixture(dyt_frame_source_t *fs,
     if (dyt_session_process(fs->sess, &fi) != 0)
         return DYT_FS_ERROR;
 
+    /* Hand the session its own copy of the payload, exactly as the live path
+     * does (session_capture.c): a still is written from the GUI thread long
+     * after the frame callback has returned, so the session must own it.  The
+     * fixture has the whole payload in hand, so this keeps fixture mode a
+     * faithful stand-in for live — the still writer and the recorder are
+     * exercisable without a device. */
+    if (dyt_session_process_raw(fs->sess, fs->raw, (int)fs->n_samples,
+                                fs->width, fs->total) != 0) {
+        fprintf(stderr, "frame_source: the fixture payload was not installed\n");
+        return DYT_FS_ERROR;
+    }
+
     /* plane_y > 0 and < total is exactly "the top half is a visible picture",
      * the same test session_capture.c applies to a live payload. */
     if (fs->plane_y > 0 && fs->plane_y < fs->total) {
