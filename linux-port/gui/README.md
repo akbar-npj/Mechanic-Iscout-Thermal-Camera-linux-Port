@@ -20,10 +20,10 @@ binary and the packages stay **`dytqt`**, which is why `Exec=`, `Icon=`,
 
 The shell follows the vendor's Windows app (`ThermalAnalysisSystem.exe`; RE Docs
 07, and the manual rendered at `/tmp/pdfx/w-08.png`): a **dark theme**, a **left
-icon rail**, a centre column with the canvas and its status bar, and (in a later
-step) a **right tabbed control panel**. The theme is one stylesheet
-(`kDarkQss`), applied in `run_gui` only — never to `--selftest`, whose geometry
-assertions are calibrated against the default look.
+icon rail**, a centre column with the canvas and its status bar, and a **right
+tabbed control panel**. The theme is one stylesheet (`kDarkQss`), applied in
+`run_gui` only — never to `--selftest`, whose geometry assertions are calibrated
+against the default look.
 
 ```
 MainWindow : QWidget
@@ -48,7 +48,9 @@ right panel grow to carry every action they expose; they are retired once they
 do. Every rail button runs the same `handle_key` the keyboard does, so the rail
 is a second route to the same actions — never a second set — and every rail
 button is `Qt::NoFocus`, because a focused button would swallow the keys before
-`keyPressEvent` sees them (assertion 53b pins it).
+`keyPressEvent` sees them (assertion 53b pins it). The rail's own items are
+described under [The rail](#the-rail) below; assertion 53g clicks each one and
+checks the effect against the session.
 
 ### The control panel
 
@@ -120,12 +122,43 @@ than a departure from it. (It was 224 px, sized for a single Troubleshoot tab;
 that overflowed as soon as the second tab landed — the two wanted 239 px of the
 222 available — and assertion 53d is what caught it.)
 
-### The rail's dialogs
+### The rail
 
-The rail's bottom group is Setting and Contact, the two items that open a dialog
-rather than act on the session. They are the first rail items to be wired; the
-rest still fall through to a no-op stub and are wired one at a time as each
-gains its meaning (step 3).
+The rail's eight items split three ways: those that act on the session, those
+that open a dialog or a popup, and the two whose engine has not landed.
+
+The **top group** acts on the picture. **Palette** opens its picker; **Mark**
+re-arms the tool the user last had — `sync_actions()` remembers the last
+*active* tool, so `n` clearing the tool does not erase it, and Mark brings it
+back rather than always choosing Spot; **Reset** calls `dyt_session_reset_view`,
+one session operation rather than four GUI setters, so a caller cannot forget one
+of the four things a reset undoes (zoom to the floor, both mirrors off, range
+back to AUTO — palette, unit and fusion are deliberately left alone, since they
+are how the picture is rendered rather than how it is framed). **Rotate** and
+**Compare** are **disabled**: rotation and the two-board comparison land in later
+steps, and a greyed button reads as "not yet" where a live button that does
+nothing reads as broken. The click handler keeps their two cases, so enabling
+them is a one-line change.
+
+The **Palette picker** is a popup under the button rather than a tab or a dialog,
+because the reference's rail item is exactly that: a picker you open, choose from
+and dismiss without the picture moving. The first ten entries carry their digit
+key and therefore *run* it, so the popup is no more capable than the keyboard for
+those; past the tenth there is no key, so those entries set the palette directly.
+That is the one place the picker reaches further than the keyboard — it is what
+makes the loaded palette set, which is larger than ten, reachable at all. The
+menu is rebuilt on each open so its mark is the session's *current* palette, and
+it is shown with `popup()` rather than `exec()`: `popup()` returns at once, so no
+nested event loop sits on the stack while the picker is open, the pump keeps
+painting, and the button can be driven in a test. The menu deletes itself when
+dismissed. Assertion 53g pins both pick routes (a digit-keyed entry and a keyless
+one), the mark, and that the button opens the picker at all.
+
+The **bottom group** is Tutorials, Contact and Setting. Tutorials opens the same
+guide the Help item does. Contact is a read-only information panel — the Windows
+app's "Contact us" has nothing to act on — in a `QTextBrowser` so an address can
+be selected, which a `QMessageBox` label would not allow. Setting opens the
+Settings dialog.
 
 **Settings** presents the four runtime radiometric parameters the `e`/`A`/`R`/`D`
 ladder walks as numeric fields. That is not a widening of what the device
@@ -155,10 +188,6 @@ wrong if the rule were missing: an override this session made supersedes the
 stored value; a *failed* write does not; and a parameter the device never
 reported falls back to the ladder. The same assertion drives the rail's Setting
 button, so the wiring is pinned too, and requires the dialog to be modeless.
-
-**Contact** is a read-only information panel — the Windows app's "Contact us" has
-nothing to act on — in a `QTextBrowser` so an address can be selected, which a
-`QMessageBox` label would not allow.
 
 The dialog has a second group, **Display**, holding the view options the retired
 menu bar carried: Unit, Fusion, Zoom, Full screen and the device panel. They live
@@ -990,6 +1019,7 @@ $ ./build/dytqt --selftest
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
+  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, tutorials yes, pending yes)
   ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))

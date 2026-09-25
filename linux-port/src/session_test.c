@@ -362,6 +362,33 @@ static void test_settings(void)
     intcheck("zoom",   snap.xform.zoom, 4);
     intcheck("flip/zoom left the frame alone", snap.width, 4);
 
+    /* The rail's Reset Image.  It has to undo *all* the framing in one call,
+     * so each piece is set to something non-default first and then checked
+     * separately — a reset that forgot one of them would still pass a check
+     * that only looked at the zoom. */
+    dyt_session_set_range_mode(s, DYT_RANGE_FIXED);
+    dyt_session_reset_view(s);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("reset: flip_h off", snap.xform.flip_h, 0);
+    intcheck("reset: flip_v off", snap.xform.flip_v, 0);
+    intcheck("reset: zoom back to 1", snap.xform.zoom, DYT_ZOOM_MIN);
+    intcheck("reset: range back to auto", snap.range_mode, DYT_RANGE_AUTO);
+    intcheck("reset: the frame is untouched", snap.width, 4);
+
+    /* A reset twice is the same as once — it is a state, not a toggle. */
+    dyt_session_reset_view(s);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("reset is idempotent", snap.xform.zoom, DYT_ZOOM_MIN);
+
+    /* The palette is how the picture is rendered, not how it is framed, so a
+     * reset must leave it — and the unit — where the user put them. */
+    dyt_session_set_palette(s, 2);
+    dyt_session_set_unit(s, DYT_UNIT_F);
+    dyt_session_reset_view(s);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("reset keeps the palette", snap.palette, 2);
+    intcheck("reset keeps the unit", snap.unit, DYT_UNIT_F);
+
     dyt_session_free(s);
 }
 

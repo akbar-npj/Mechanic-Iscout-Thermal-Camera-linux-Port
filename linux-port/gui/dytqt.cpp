@@ -2254,6 +2254,15 @@ public:
         /* The bottom group — tutorials, contact, setting. */
         for (int i = Tutorials; i < N_RailItems; i++)
             lay->addWidget(make_button((RailItem)i));
+
+        /* Rotate and Compare have no engine behind them yet — rotation and the
+         * two-board comparison land in later steps.  Disabled rather than
+         * silently inert: a greyed button reads as "not yet", where a live
+         * button that does nothing reads as broken.  The click handler keeps
+         * its two cases, so enabling them is a one-line change here. */
+        for (RailItem i : { Rotate, Compare })
+            if (btn_[i])
+                btn_[i]->setEnabled(false);
     }
 
     /* A click on `item`.  Set by MainWindow, which owns the session and the
@@ -3297,12 +3306,46 @@ public:
          * and as the menu items did. */
         panel_->on_key = [this](int k) { handle_key(k); };
 
-        /* The rail's bottom group.  Setting and Contact are the two that open a
-         * dialog rather than acting on the session, so they are wired here;
-         * the rest still fall through to the stub below and are wired in a
-         * later step, one at a time, as each gains its meaning. */
+        /* The rail's items.  Setting and Contact open a dialog; Palette opens
+         * its picker; Mark and Reset act on the session; Tutorials is the
+         * guide.  Rotate and Compare stay no-ops until the engine behind them
+         * exists (rotation and the two-board comparison), so no rail button is
+         * ever a control that does nothing *silently* — the two that wait are
+         * documented here and in the README. */
         rail_->on_action = [this](IconRail::RailItem i) {
             switch (i) {
+            case IconRail::Palette:
+                show_palette_popup();
+                break;
+            case IconRail::Mark:
+                /* Back to the tool the user last had.  The panel's Temperature
+                 * Measurement radio is the selector; this is the rail's way
+                 * back to it after 'n' cleared it, which is what the reference
+                 * Mark button does.  Spot is the default — it is the tool a
+                 * first-time user gets, and the cheapest to place. */
+                handle_key(last_tool_ == DYT_TOOL_LINE ? 'l'
+                         : last_tool_ == DYT_TOOL_BOX  ? 'b' : 'p');
+                break;
+            case IconRail::ResetImage:
+                /* One session call rather than four GUI ones: the reset reads
+                 * the state under the session's own lock, so it cannot act on
+                 * a frame that has already been superseded, and it cannot
+                 * forget one of the four things it undoes. */
+                if (sess_)
+                    dyt_session_reset_view(sess_);
+                break;
+            case IconRail::Tutorials:
+                if (on_help_)
+                    on_help_();
+                break;
+            case IconRail::Rotate:
+            case IconRail::Compare:
+                break;      /* the engine behind each lands in a later step */
+            case IconRail::ContactUs: {
+                ContactDialog d(this);
+                d.exec();
+                break;
+            }
             case IconRail::Setting: {
                 SettingsDialog *d = settings_dialog();
                 d->show();
@@ -3310,12 +3353,7 @@ public:
                 d->activateWindow();
                 break;
             }
-            case IconRail::ContactUs: {
-                ContactDialog d(this);
-                d.exec();
-                break;
-            }
-            default:
+            case IconRail::N_RailItems:
                 break;
             }
         };
@@ -3452,6 +3490,58 @@ public:
             }
         }
         return settings_cur_;
+    }
+
+    /* The rail's Palette picker.  A popup under the button rather than a tab or
+     * a dialog, because the reference's rail item is exactly that: a picker you
+     * open, choose from and dismiss without the picture moving.
+     *
+     * The first ten entries carry their digit key and therefore *run* it — the
+     * same rule the retired menu bar followed, so the popup is no more capable
+     * than the keyboard for those.  Past the tenth there is no key, so those
+     * entries set the palette directly; that is the one place the picker
+     * reaches further than the keyboard, exactly as the menu's Next/Previous
+     * items did, and it is what makes the entries past the tenth reachable.
+     *
+     * Public, like rail()/panel()/settings_dialog(), so --selftest can inspect
+     * the picker without entering the nested loop that exec() would run.  The
+     * menu is rebuilt on each call and owned by its caller, because the checked
+     * entry has to be the session's *current* palette, not the one it was when
+     * the menu was first built. */
+    QMenu *palette_menu()
+    {
+        if (!sess_)
+            return nullptr;
+
+        auto *menu = new QMenu(this);
+        auto *grp  = new QActionGroup(menu);
+        grp->setExclusive(true);
+
+        for (int i = 0; i < snap_.palette_n; i++) {
+            dyt_palette_t p{};
+            if (dyt_session_get_palette(sess_, i, &p) != 0)
+                continue;
+            QAction *a = nullptr;
+            if (i < 10) {
+                const int  key    = (i == 9) ? '0' : ('1' + i);
+                const char hint[] = { (char)key, '\0' };
+                a = key_action(QString::fromUtf8(p.name), key, hint, true);
+            } else {
+                a = plain_action(QString::fromUtf8(p.name),
+                                 [this, i]() {
+                                     if (sess_)
+                                         dyt_session_set_palette(sess_, i);
+                                 }, true);
+            }
+            a->setChecked(snap_.palette == i);
+            grp->addAction(a);
+            menu->addAction(a);
+        }
+
+        menu->addSeparator();
+        menu->addAction(key_action(QStringLiteral("Next palette"), '.', "."));
+        menu->addAction(key_action(QStringLiteral("Previous palette"), ',', ","));
+        return menu;
     }
 
     FrameView   *view()  const { return view_; }
@@ -3992,6 +4082,26 @@ private:
         return a;
     }
 
+    /* Opens palette_menu() under the rail's button.  The build/show split is
+     * the same one the Settings dialog makes: --selftest has to inspect the
+     * picker without entering a nested event loop.
+     *
+     * popup() rather than exec(): popup() returns at once, so no nested event
+     * loop sits on the stack while the picker is open — the pump keeps
+     * painting, and the button can be driven in a test.  The menu deletes
+     * itself when it is dismissed (WA_DeleteOnClose), so opening it repeatedly
+     * does not accumulate menus; it is parented to the window as a backstop,
+     * so one still open when the window dies is freed with it. */
+    void show_palette_popup()
+    {
+        QPushButton *btn = rail_ ? rail_->button(IconRail::Palette) : nullptr;
+        QMenu *menu = palette_menu();
+        if (!btn || !menu)
+            return;
+        menu->setAttribute(Qt::WA_DeleteOnClose);
+        menu->popup(btn->mapToGlobal(QPoint(0, btn->height())));
+    }
+
     QMenuBar *build_menus()
     {
         auto *bar = new QMenuBar(this);
@@ -4245,6 +4355,20 @@ private:
                          strip_ && !strip_->recording_label().isEmpty(),
                          gal_.open != 0);
 
+        /* The rail's Mark, by the same rule: a rail button is checkable, so a
+         * click that unchecked it would leave the mark disagreeing with the
+         * session until the next frame put it right.  Recording the last
+         * *active* tool is what lets Mark re-arm it rather than always
+         * choosing Spot. */
+        if (snap_.tool != DYT_TOOL_NONE)
+            last_tool_ = snap_.tool;
+        if (rail_) {
+            if (QPushButton *b = rail_->button(IconRail::Mark)) {
+                const QSignalBlocker block(b);
+                b->setChecked(snap_.tool != DYT_TOOL_NONE);
+            }
+        }
+
         /* The Super Resolution page reads the session rather than the
          * snapshot, so it is synced from here too — it is correct even for the
          * states the snapshot zeroes. */
@@ -4267,6 +4391,10 @@ private:
     SettingsDialog *settings_ = nullptr;
     /* The scratch the dialog is seeded from, indexed by dyt_order_type_t. */
     float settings_cur_[DYT_ORDER_DISTANCE + 1] = {};
+    /* The last measurement tool that was not NONE, so the rail's Mark can
+     * re-arm it instead of always choosing Spot.  Spot is the start-up value,
+     * which is also the default the reference's Mark button has. */
+    dyt_tool_t last_tool_ = DYT_TOOL_POINT;
     dyt_session_t *sess_ = nullptr;      /* borrowed */
     /* The clip playing on the canvas, if any.  Borrowed from the pump, which
      * advances it — the same pattern as sess_: the window reads and steers the
@@ -7036,6 +7164,172 @@ static int selftest(const opts &o)
 
         if (dlg)
             dlg->hide();
+    }
+
+    /* 53g. The rail's items reach what they claim to.  Each is clicked for
+     * real — QPushButton::click() raises the same clicked signal a press does,
+     * so the button's own wiring is under test and not just the handler — and
+     * each is then checked against the *session*, so a handler that lit a flag
+     * nobody reads cannot pass.  The two items with no engine behind them
+     * (Rotate, Compare) are checked to be disabled, which is the honest state
+     * for a control whose feature has not landed: greyed reads as "not yet",
+     * where a live button that does nothing reads as broken. */
+    {
+        IconRail *rail = win.rail();
+        pm.step();              /* so snap_ (which the picker marks from) is fresh */
+
+        /* --- Palette.  One entry per loaded palette, the mark on the current
+         * one, and a choice that moves the session — by *both* routes the
+         * picker offers: a digit-keyed entry (index < 10, which runs its key)
+         * and a keyless one (index >= 10, which sets the palette directly). */
+        dyt_snapshot_t p0{};
+        dyt_session_snapshot(sess, &p0, nullptr, 0);
+
+        QMenu *menu = win.palette_menu();
+        QList<QAction *> pals;
+        for (QAction *a : menu ? menu->actions() : QList<QAction *>())
+            if (a->isCheckable())
+                pals.append(a);
+
+        const bool count_ok = menu && pals.size() == p0.palette_n;
+
+        /* The mark is on the session's current palette, not on the first
+         * entry: a menu that always marked entry 0 would pass a "something is
+         * marked" test and fail this one. */
+        const bool mark_ok = p0.palette >= 0 && p0.palette < pals.size() &&
+                             pals[p0.palette]->isChecked();
+
+        int low = -1;
+        if (p0.palette_n > 1)
+            low = (p0.palette == 0) ? 1 : 0;
+        bool low_ok = true;
+        if (low >= 0 && low < pals.size()) {
+            pals[low]->trigger();
+            dyt_snapshot_t s{};
+            dyt_session_snapshot(sess, &s, nullptr, 0);
+            low_ok = s.palette == low;
+        }
+
+        int high = -1;
+        if (p0.palette_n > 10)
+            high = (p0.palette == 10) ? 11 : 10;
+        bool high_ok = true;
+        if (high >= 10 && high < pals.size()) {
+            pals[high]->trigger();
+            dyt_snapshot_t s{};
+            dyt_session_snapshot(sess, &s, nullptr, 0);
+            high_ok = s.palette == high;
+        }
+        delete menu;
+        dyt_session_set_palette(sess, p0.palette);      /* put it back */
+
+        /* The rail button opens the picker.  popup() shows a menu and returns,
+         * so this neither blocks nor needs a nested loop. */
+        QPushButton *pbtn = rail ? rail->button(IconRail::Palette) : nullptr;
+        if (pbtn)
+            pbtn->click();
+        QMenu *popped = nullptr;
+        for (QMenu *m : win.findChildren<QMenu *>())
+            if (m->isVisible())
+                popped = m;
+        const bool popup_ok = popped != nullptr;
+        if (popped)
+            popped->close();
+
+        /* --- Mark re-arms the last active tool.  'l' makes Line the last
+         * active tool, 'n' clears the tool without changing that memory, and
+         * the button must bring Line back. */
+        dyt_snapshot_t t0{};
+        dyt_session_snapshot(sess, &t0, nullptr, 0);
+        send_char('l');
+        pm.step();
+        send_char('n');
+        pm.step();
+        dyt_snapshot_t t1{};
+        dyt_session_snapshot(sess, &t1, nullptr, 0);
+        QPushButton *mbtn = rail ? rail->button(IconRail::Mark) : nullptr;
+        if (mbtn)
+            mbtn->click();
+        dyt_snapshot_t t2{};
+        dyt_session_snapshot(sess, &t2, nullptr, 0);
+        const bool mark_tool_ok = t1.tool == DYT_TOOL_NONE &&
+                                  t2.tool == DYT_TOOL_LINE;
+        dyt_session_set_tool(sess, t0.tool);            /* restore */
+
+        /* --- Reset Image puts the view back.  A known non-canonical view is
+         * built first — zoom to the floor then one step up, and the flip set
+         * *to* 1 rather than toggled, so the parity is not guesswork — because
+         * a reset that did nothing would otherwise pass on a view that was
+         * already canonical. */
+        dyt_snapshot_t v0{};
+        dyt_session_snapshot(sess, &v0, nullptr, 0);
+
+        dyt_session_zoom(sess, -1000);                  /* clamp to the floor */
+        dyt_session_zoom(sess, +1);
+        dyt_snapshot_t r0{};
+        dyt_session_snapshot(sess, &r0, nullptr, 0);
+        if (r0.xform.flip_h == 0)
+            dyt_session_toggle_flip_h(sess);
+        pm.step();
+        dyt_snapshot_t r1{};
+        dyt_session_snapshot(sess, &r1, nullptr, 0);
+
+        QPushButton *rbtn = rail ? rail->button(IconRail::ResetImage) : nullptr;
+        if (rbtn)
+            rbtn->click();
+        dyt_snapshot_t r2{};
+        dyt_session_snapshot(sess, &r2, nullptr, 0);
+        const bool reset_ok = r1.xform.zoom != DYT_ZOOM_MIN &&
+                              r1.xform.flip_h != 0 &&
+                              r2.xform.flip_h == 0 && r2.xform.flip_v == 0 &&
+                              r2.xform.zoom == DYT_ZOOM_MIN &&
+                              r2.range_mode == DYT_RANGE_AUTO;
+
+        /* Put the framing back as it was found.  Without this the reset would
+         * quietly become the state the geometry assertions after this one
+         * measure, so a change here could break them for a reason that has
+         * nothing to do with geometry. */
+        dyt_session_zoom(sess, -1000);
+        dyt_session_zoom(sess, v0.xform.zoom - DYT_ZOOM_MIN);
+        dyt_snapshot_t r3{};
+        dyt_session_snapshot(sess, &r3, nullptr, 0);
+        if ((r3.xform.flip_h != 0) != (v0.xform.flip_h != 0))
+            dyt_session_toggle_flip_h(sess);
+        if ((r3.xform.flip_v != 0) != (v0.xform.flip_v != 0))
+            dyt_session_toggle_flip_v(sess);
+        dyt_session_set_range_mode(sess, v0.range_mode);
+        pm.step();
+
+        /* --- Tutorials opens the guide, through the front end's callback, so
+         * no modal opens here. */
+        int help = 0;
+        win.on_help_ = [&]() { help++; };
+        QPushButton *tbtn = rail ? rail->button(IconRail::Tutorials) : nullptr;
+        if (tbtn)
+            tbtn->click();
+        win.on_help_ = nullptr;
+        const bool help_ok = help == 1;
+
+        /* --- The two whose engine has not landed are unavailable, not inert. */
+        QPushButton *rot = rail ? rail->button(IconRail::Rotate) : nullptr;
+        QPushButton *cmp = rail ? rail->button(IconRail::Compare) : nullptr;
+        const bool pending_ok = rot && !rot->isEnabled() &&
+                                cmp && !cmp->isEnabled();
+
+        const bool ok = count_ok && mark_ok && low_ok && high_ok &&
+                        popup_ok && mark_tool_ok && reset_ok && help_ok &&
+                        pending_ok;
+        std::printf("  %-4s the rail's items reach what they claim "
+                    "(%d palette entries %s, mark %s, pick %s/%s, popup %s, "
+                    "re-arm %s, reset %s, tutorials %s, pending %s)\n",
+                    ok ? "ok" : "FAIL", (int)pals.size(),
+                    count_ok ? "yes" : "NO", mark_ok ? "yes" : "NO",
+                    low_ok ? "yes" : "NO", high_ok ? "yes" : "NO",
+                    popup_ok ? "yes" : "NO", mark_tool_ok ? "yes" : "NO",
+                    reset_ok ? "yes" : "NO", help_ok ? "yes" : "NO",
+                    pending_ok ? "yes" : "NO");
+        if (!ok)
+            fails++;
     }
 
     /* 56. No toolbar row is overflowing.  Qt hides the buttons that do not fit

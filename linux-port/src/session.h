@@ -292,6 +292,22 @@ void dyt_session_toggle_flip_h(dyt_session_t *s);
 void dyt_session_toggle_flip_v(dyt_session_t *s);
 void dyt_session_zoom(dyt_session_t *s, int delta);
 
+/* Put the view back to its start-up framing: zoom to DYT_ZOOM_MIN, both
+ * mirrors off, and the range back to AUTO.  This is the rail's Reset Image.
+ *
+ * One operation rather than four setters called in a row, because the *reset*
+ * is the meaning: a caller that forgot one of them would leave a picture reset
+ * in every way but one, which is the failure this exists to prevent.  Reading
+ * the state under the session's own lock is the other half of that — a caller
+ * composing the four from a snapshot could act on a frame that has already been
+ * superseded.
+ *
+ * The palette, the unit, the fusion pattern and the super-resolution plane are
+ * deliberately NOT touched: they are how the picture is rendered, not how it is
+ * framed, and a user resetting the image does not expect the colours to
+ * change.  Rotation joins this list when the transform grows one. */
+void dyt_session_reset_view(dyt_session_t *s);
+
 /* ----------------------------------------------------------------- fusion */
 
 /* Which fusion pattern to render (fusion.h).  An out-of-range value is

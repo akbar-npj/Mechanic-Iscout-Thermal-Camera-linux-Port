@@ -894,6 +894,23 @@ void dyt_session_zoom(dyt_session_t *s, int delta)
     pthread_mutex_unlock(&s->m);
 }
 
+void dyt_session_reset_view(dyt_session_t *s)
+{
+    if (!s)
+        return;
+
+    pthread_mutex_lock(&s->m);
+    /* The transform's own init is the start-up framing, so the reset and the
+     * start-up state cannot drift apart.  It also clears `sr`, which is inert:
+     * the factor is a *render* property that sr_factor_locked() re-derives and
+     * writes into every snapshot, so nothing reads this field between a reset
+     * and the next frame.  The palette, the unit and the fusion pattern are not
+     * framing and are left alone. */
+    dyt_view_transform_init(&s->xform);
+    s->disp.mode = DYT_RANGE_AUTO;
+    pthread_mutex_unlock(&s->m);
+}
+
 /* ------------------------------------------------------- super-resolution */
 
 void dyt_session_set_sr_upscaler(dyt_session_t *s, dyt_sr_upscale_fn fn)
