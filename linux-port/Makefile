@@ -24,8 +24,8 @@ CFLAGS += -Isrc -Ithird_party/libuvc/include -Ithird_party/stb
 LDLIBS := -lm -lpthread
 
 # The app's version, in one place: the GUI compiles it in (the -DDYT_VERSION
-# macro below) and the package is named after it, so the About box and the
-# .deb cannot disagree.  See the packaging section at the end of this file.
+# macro below) and both packages are named after it, so the About box and the
+# packages cannot disagree.  See the packaging section at the end of this file.
 VERSION ?= 0.1.0
 
 # The build directory.  Defined here, before the feature-detection blocks, so
@@ -101,16 +101,21 @@ ifneq ($(wildcard $(MNN_ROOT)/lib/libMNN.so),)
 CFLAGS   += -DDYT_HAVE_MNN
 MNN_CFLAGS := -I$(MNN_ROOT)/include
 # Where libMNN.so is looked for at run time, relative to the binary — never an
-# absolute path into the machine that built it, because `make deb` would ship
-# that path (lintian's binary-or-shlib-defines-rpath).  Two entries cover both
-# layouts: beside a build-tree binary, and one directory up and over from an
-# installed one ($(BINDIR) -> $(LIBDIR)/dytqt, both under $(PREFIX)).  The
-# quoted form is required — the tree's own path contains a space, and unquoted
-# the shell would hand the linker two arguments.
+# absolute path into the machine that built it, because a package would ship
+# that path (lintian's binary-or-shlib-defines-rpath) and a target machine
+# could then load a library the package does not contain.  Three entries cover
+# the three layouts, each of which puts the library one directory up and over
+# from the binary ($(BINDIR) -> $(LIBDIR)/dytqt, both under $(PREFIX)):
 #
-# $$ORIGIN is make-escaped: one `$` survives to the recipe and the shell's
-# single quotes leave it for the linker.
-MNN_RPATH  := -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../lib/dytqt'
+#   $ORIGIN                 the build tree, where the Makefile symlinks the lib
+#   $ORIGIN/../lib/dytqt    $(PREFIX)/lib — `make install`'s default, and the deb
+#   $ORIGIN/../lib64/dytqt  $(PREFIX)/lib64 — Fedora's %{_libdir}, and the rpm
+#
+# The quoted form is required — the tree's own path contains a space, and
+# unquoted the shell would hand the linker three arguments.  $$ORIGIN is
+# make-escaped: one `$` survives to the recipe and the shell's single quotes
+# leave it for the linker.
+MNN_RPATH  := -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../lib/dytqt:$$ORIGIN/../lib64/dytqt'
 MNN_LIBS   := -L$(MNN_ROOT)/lib -lMNN $(MNN_RPATH)
 HAVE_MNN   := 1
 endif
@@ -317,7 +322,7 @@ endif
 FROZEN := $(addprefix tools/thermometry_diff/out/, \
             240 240_fixon 256 256_fixon 384 384_fixon 640 640_fixon)
 
-.PHONY: all check clean install uninstall deb
+.PHONY: all check clean install uninstall deb rpm
 
 # libuvc is only needed by the live-capture tools; the byte-verified
 # pipeline and its tests build with just a C compiler, so $(UVC_LIB) is
@@ -763,3 +768,57 @@ deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
 	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_FILE)
 	@echo "built $(DEB_FILE)"
 	@dpkg-deb --info $(DEB_FILE)
+
+# ---------------------------------------------------------------------------
+# Packaging: RPM
+#
+# Same principle as `deb`: the RPM installs exactly what `make install` stages,
+# so the two cannot drift.  `make rpm` stages into DESTDIR, then rpmbuild copies
+# that stage into its own %{buildroot} and packages it — the spec compiles
+# nothing (see packaging/rpm/dytqt.spec).
+#
+# _topdir and the stage are deliberately ABSOLUTE and space-free.  This tree's
+# path contains a space and rpmbuild is not uniform about quoting macro
+# expansions, so keeping every rpm-internal path free of spaces removes a class
+# of failure.  A *relative* _topdir is worse than useless: %install's preamble
+# runs `cd "%{builddir}"` first, so a relative %{buildroot} would resolve
+# against %{_topdir}/BUILD while rpm's own file lookups used the invocation
+# directory.  Hence the guard in the recipe.
+# ---------------------------------------------------------------------------
+RPM_NAME   := dytqt
+RPM_ARCH   := $(shell rpm --eval '%{_arch}'   2>/dev/null || uname -m)
+RPM_LIBDIR := $(shell rpm --eval '%{_libdir}' 2>/dev/null || echo /usr/lib64)
+RPM_TOPDIR ?= $(HOME)/.cache/dytqt/rpmbuild
+RPM_STAGE  ?= $(HOME)/.cache/dytqt/stage
+RPM_SPEC   := packaging/rpm/dytqt.spec
+# The same switch drives `make install` (which ships libMNN.so) and the spec's
+# %if %{with mnn}, so the two cannot disagree about whether the runtime ships.
+RPM_WITH   := $(if $(HAVE_MNN),--with mnn,--without mnn)
+
+rpm: $(BUILD)/dytqt $(RPM_SPEC)
+	@command -v rpmbuild >/dev/null 2>&1 || { \
+	    echo "rpm: rpmbuild is required (dnf install rpm-build)" >&2; exit 1; }
+	@case "$(RPM_TOPDIR)$(RPM_STAGE)" in \
+	    *" "*) echo "rpm: RPM_TOPDIR/RPM_STAGE must not contain a space." >&2; \
+	           echo "rpm: rpmbuild resolves a relative buildroot against _topdir/BUILD," >&2; \
+	           echo "rpm: and a spaced path is not quoted consistently, so set both to a" >&2; \
+	           echo "rpm: space-free location." >&2; exit 1 ;; \
+	esac
+	rm -rf "$(RPM_STAGE)" "$(RPM_TOPDIR)"
+	mkdir -p "$(RPM_TOPDIR)/BUILD" "$(RPM_TOPDIR)/RPMS" \
+	    "$(RPM_TOPDIR)/SOURCES" "$(RPM_TOPDIR)/SPECS" "$(RPM_TOPDIR)/SRPMS"
+# An absolute DESTDIR is safe only because it has no space — a spaced absolute
+# one would be split by the sub-make, which is why `deb` keeps its DESTDIR
+# relative.  LIBDIR is overridden to rpm's own %{_libdir} so the shipped
+# libMNN.so lands where the binary's $ORIGIN/../lib64/dytqt entry looks.
+	$(MAKE) install DESTDIR=$(RPM_STAGE) PREFIX=/usr LIBDIR=$(RPM_LIBDIR) BUILD=$(BUILD)
+	rpmbuild -bb $(RPM_SPEC) \
+	    --define "_topdir $(RPM_TOPDIR)" \
+	    --define "_stage $(RPM_STAGE)" \
+	    --define "_license $(abspath ../LICENSE)" \
+	    --define "_dytqt_version $(VERSION)" \
+	    $(RPM_WITH)
+	cp "$(RPM_TOPDIR)/RPMS/$(RPM_ARCH)/$(RPM_NAME)-$(VERSION)-"*.rpm $(BUILD)/
+	@echo "built $(BUILD)/$(RPM_NAME)-$(VERSION)-*.rpm"
+	@rpm -qp --qf 'name=%{NAME} version=%{VERSION}-%{RELEASE} arch=%{ARCH}\n' \
+	    $(BUILD)/$(RPM_NAME)-$(VERSION)-*.rpm

@@ -801,6 +801,7 @@ by read-back.
 make install                          # PREFIX=/usr/local by default
 make install DESTDIR=/tmp/stage PREFIX=/usr
 make uninstall
+make rpm                              # build/dytqt-<version>-<release>.<arch>.rpm
 make deb                              # build/dytqt_<version>_<arch>.deb
 ```
 
@@ -827,22 +828,67 @@ from any cwd. Running from the source tree still prefers the tree's own
 the binary; it ships even in a build without a runtime, where it is inert.
 
 `libMNN.so` is the one file with a layout constraint: the binary's rpath is
-`$ORIGIN:$ORIGIN/../lib/dytqt`, so the library must land exactly one directory up
-from `$(BINDIR)`. `$ORIGIN` is resolved by the loader at run time, which is what
-lets the same build work under `/usr` and `/usr/local` — and, with the first
-entry, from the build tree too, where the Makefile satisfies it with a
-`build/libMNN.so` symlink. Deliberately *not* an absolute path: a `.deb` would
-ship that path (lintian's `binary-or-shlib-defines-rpath`), and on a machine
-that happened to have it, the app would load a library the package does not
-contain. `make install` skips the library and says so when the build has no
-runtime.
+`$ORIGIN:$ORIGIN/../lib/dytqt:$ORIGIN/../lib64/dytqt`, so the library must land
+exactly one directory up from `$(BINDIR)`. The three entries are one per layout,
+because the two packagers disagree about which libdir that is:
+
+| entry | layout |
+|---|---|
+| `$ORIGIN` | the build tree, where the Makefile satisfies it with a `build/libMNN.so` symlink |
+| `$ORIGIN/../lib/dytqt` | `$(PREFIX)/lib` — `make install`'s default, and the deb |
+| `$ORIGIN/../lib64/dytqt` | `$(PREFIX)/lib64` — Fedora's `%{_libdir}`, and the rpm |
+
+`$ORIGIN` is resolved by the loader at run time, which is what lets the same
+build work under `/usr` and `/usr/local` and from the build tree. Deliberately
+*not* an absolute path: a package would ship that path (lintian's
+`binary-or-shlib-defines-rpath`), and on a machine that happened to have it, the
+app would load a library the package does not contain. `make install` skips the
+library and says so when the build has no runtime.
 
 The icon is rasterised from `packaging/dytqt.svg` at install time, at 8-bit
 RGBA (the default was 16-bit, which some icon loaders handle poorly), so
 `make install` needs ImageMagick (`magick` or `convert`).
 
-`deb` wraps that same layout with `dpkg-deb`, so the file list cannot drift
-from `install`. Three details are worth knowing:
+Both packagers wrap that same layout, so neither file list can drift from
+`install`: `rpm` stages through `make install` and hands the tree to `rpmbuild`,
+`deb` stages through `make install` and hands it to `dpkg-deb`.
+
+### RPM (native on this host)
+
+`make rpm` needs `rpm-build` (`sudo dnf install rpm-build`). It stages into
+`$(RPM_STAGE)` and builds with `rpmbuild -bb packaging/rpm/dytqt.spec`, whose
+`%install` copies that stage into `%{buildroot}` — the spec compiles nothing, so
+there is no `Source:`, no tarball and no `BuildRequires` (`rpmbuild` enforces
+those, and `%build`/`%install` only copy files). Details worth knowing:
+
+* **The dependencies are measured by rpm itself.** Its ELF generator reads the
+  binary's `NEEDED` entries and resolves them against the host's provides, so
+  there is no hand-written `Requires` to get wrong — unlike `DEB_DEPENDS`, which
+  has to name Debian's soname packages by hand.
+* **`libMNN.so` needs no special handling.** An unversioned SONAME is fine in a
+  private directory: the generator emits `Provides: libMNN.so()(64bit)` for the
+  shipped copy, which satisfies the `Requires: libMNN.so()(64bit)` it derives
+  from the binary — inside the same package. Nothing is excluded or faked.
+* **`License: GPL-3.0-only`** — `LICENSE` is the unmodified GPLv3 text, the deb
+  copyright says "version 3", and no source header grants "or later".
+* **The `%if %{with mnn}` block is the Makefile's `HAVE_MNN`.** `make rpm` passes
+  `--with mnn`/`--without mnn` from the same variable that decides whether
+  `make install` ships the library, so the two cannot disagree.
+* **`%files` is an anti-drift guard.** Fedora sets
+  `%_unpackaged_files_terminate_build`, so a file `make install` staged but the
+  spec does not list fails the build rather than being silently dropped.
+
+`_topdir` and the stage default to `~/.cache/dytqt/{rpmbuild,stage}` — absolute
+and space-free by design, because this tree's path contains a space. A
+*relative* `_topdir` is worse than useless: `%install`'s preamble `cd`s to
+`%{builddir}` first, so a relative `%{buildroot}` would resolve against
+`%{_topdir}/BUILD` while rpm's own file lookups used the invocation directory.
+The `rpm` recipe refuses a spaced value; `RPM_STAGE` and `RPM_TOPDIR` override
+the defaults.
+
+### deb (cross-format on this host)
+
+`deb` wraps the same layout with `dpkg-deb`. Three details are worth knowing:
 
 * **`Depends` is measured when it can be, and says so when it cannot.** With
   `dpkg-shlibdeps` (from `dpkg-dev`) present it is read off the binary's
@@ -854,32 +900,38 @@ from `install`. Three details are worth knowing:
   its own `NEEDED` entries (`libstdc++`, `libm`, `libgcc_s`, `libc`) are already
   covered. `dpkg-shlibdeps` cannot know that, so the measurement runs with
   `--ignore-missing-info` and omits it; the alternative, a fabricated `shlibs`
-  file, would claim a library no Debian package provides.
+  file, would claim a library no Debian package provides. This host has no
+  `dpkg-shlibdeps`, so the package built here took the `DEB_DEPENDS` fallback —
+  the flag is what the measured path *would* do, not something exercised here.
 * **The staged binary is stripped** (3.4 MB → 334 KB). `make install` keeps its
   symbols, so a local install stays debuggable.
 
-This build host is Fedora, so the `.deb` is a cross-format artifact: `dpkg-deb`
-builds and inspects it, but nothing in the tree installs it. It was inspected
-here: the file list above is what the package contains, the stripped binary
-still carries its `$ORIGIN` rpath, and running the staged `usr/bin/dytqt` with
-`XDG_DATA_DIRS` pointed at the staged `usr/share` loads the staged model and
-passes the full selftest — which is the end-to-end check that the two relative
-paths (the rpath and the data search) are right.
+This build host is Fedora, so the **rpm is the native artifact and the `.deb`
+is the cross-format one**: `dpkg-deb` builds and inspects it, but nothing here
+installs it. Both were inspected here — each package contains the file list
+above, each stripped binary still carries the three-entry `$ORIGIN` rpath, and
+running each staged `usr/bin/dytqt` with `XDG_DATA_DIRS` pointed at the matching
+staged share loads the staged model and passes the full selftest. That last one
+is the end-to-end check that the two relative paths (the rpath and the data
+search) are right.
 
 `make check` runs `packaging/check.sh`, which pins the cross-file invariants a
 syntax linter cannot see: that the entry's `Exec`, `Icon` and `StartupWMClass`
 name the binary the Makefile installs, the icon it ships, and the WM_CLASS the
 app actually sets — `("dytqt","dytqt")`, measured with `xprop`, not assumed —
 that the icon rasterises to something non-blank at 16 and 256 px, that the model
-ships where the app's own search looks, and that a binary linking `libMNN.so`
-carries the `$ORIGIN` rpath and no path into the build tree. Each of those fails
-*silently* otherwise: a typo in any of the metadata entries validates cleanly and
-still launches nothing, a model in the wrong place looks exactly like a build
-without a runtime, and a bad rpath makes the installed app not start at all.
+ships where the app's own search looks, that a binary linking `libMNN.so` carries
+an rpath covering both packaged layouts and no path into the build tree, and that
+the spec agrees with the Makefile about the library's directory, the MNN switch
+and the version. Each of those fails *silently* otherwise: a typo in any of the
+metadata entries validates cleanly and still launches nothing, a model in the
+wrong place looks exactly like a build without a runtime, a bad rpath makes the
+installed app not start at all, and a spec that disagrees with `make install`
+builds a package that cannot find its own library.
 
 The version is single-sourced: the Makefile's `VERSION` feeds `-DDYT_VERSION`
-for the GUI and names the package, so the About box and the `.deb` cannot
-disagree.
+for the GUI, names the deb, and is passed to the spec as `_dytqt_version`, so the
+About box and both packages cannot disagree.
 
 ## Where the frames come from, and on which thread
 
@@ -1072,3 +1124,17 @@ only when the session wrote a parameter — then abandons it the same way.
   Driving the window with XTEST needs `QT_QPA_PLATFORM=xcb`: under the Wayland
   platform plugin the window is a native Wayland surface that X11 cannot see, and
   the key sender reports "no window matching" for a window that is plainly there.
+* **Neither package is installed by its own package manager here.** Both are
+  built, inspected with `rpm -qp`/`dpkg-deb`, and *run from their staged trees*,
+  which is what the file lists and the selftest establish. What is not exercised
+  is an actual transaction: `rpm --root` needs root for its lock and `dpkg -i` is
+  not run, so the dependency closure is checked by resolving every `Requires`
+  against the host's rpmdb rather than by installing.
+* **The RPM is a local artifact, not a Fedora submission.** It builds with this
+  host's `rpmbuild` (6.0.2) and has not been through a Fedora review, `fedpkg` or
+  `mock`. It ships no AppStream metainfo — `rpmlint` would say
+  `no-appstream-metadata` — and no `Provides: bundled(...)` for the statically
+  linked libuvc/stb or the shipped MNN, both of which a review would require. Its
+  `Requires` are what *this* host's rpm resolved the binary's `NEEDED` entries
+  to; its OpenCV soname is `.413`, so another Fedora release could resolve to a
+  different set.

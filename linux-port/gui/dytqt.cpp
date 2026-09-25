@@ -62,9 +62,9 @@
 
 /* ---------------------------------------------------------------- layout */
 
-/* The port's version, shown in the About box and named by the package.  The
+/* The port's version, shown in the About box and named by the packages.  The
  * Makefile passes the version the package is built as (VERSION -> the
- * -DDYT_VERSION macro), so the About box and the .deb cannot disagree; the
+ * -DDYT_VERSION macro), so the About box and the packages cannot disagree; the
  * literal below is the fallback for a hand compile without the Makefile. */
 #ifndef DYT_VERSION
 #define DYT_VERSION "0.1.0"

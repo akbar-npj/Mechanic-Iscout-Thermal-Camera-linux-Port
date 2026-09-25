@@ -53,17 +53,22 @@ readelf -d mnn-install/lib/libMNN.so | grep NEEDED
 
 `make install` ships `libMNN.so` (and `models/zoom2.mnn`) with the app: the
 library goes to `$(LIBDIR)/dytqt`, the model to `$(DATADIR)/dytqt/models`, and
-the binary's rpath is `$ORIGIN:$ORIGIN/../lib/dytqt` — so the same build works
-from `/usr` and `/usr/local`, and from the build tree, without ever naming an
-absolute path that a `.deb` would then ship. In the build tree the rpath's first
-entry is satisfied by a symlink the Makefile creates at `build/libMNN.so`; a
-build without MNN creates neither the symlink nor the rpath, because the binary
-has no `libMNN.so` NEEDED entry to satisfy.
+the binary's rpath is `$ORIGIN:$ORIGIN/../lib/dytqt:$ORIGIN/../lib64/dytqt` —
+three entries for three layouts, so the same build works from the build tree,
+from a `/usr/local` or `/usr` install, and under either libdir. The last entry
+is Fedora's `%{_libdir}` (`/usr/lib64`), which is where `make rpm` puts the
+library; the middle one is `make install`'s default and where `make deb` puts
+it. Never an absolute path: a package would ship that path, and a target machine
+could then load a library the package does not contain. In the build tree the
+first entry is satisfied by a symlink the Makefile creates at
+`build/libMNN.so`; a build without MNN creates neither the symlink nor the rpath,
+because the binary has no `libMNN.so` NEEDED entry to satisfy.
 
 That pairing is checked: `packaging/check.sh` (part of `make check`) fails if a
-binary that links libMNN.so lacks the rpath, if the install would not ship the
-library, or if the rpath carries a path into the build tree. `make install`
-prints a note and skips the library when the build has no runtime.
+binary that links libMNN.so lacks either packaged entry, if the install would
+not ship the library, or if the rpath carries a path into the build tree.
+`make install` prints a note and skips the library when the build has no
+runtime.
 
 ### The one patch
 

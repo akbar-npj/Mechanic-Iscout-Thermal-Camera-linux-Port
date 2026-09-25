@@ -10,9 +10,12 @@
 #
 # The super-resolution payload is checked the same way: the model has to land
 # where the app's own search looks, and a binary that links libMNN.so has to
-# ship the library at the one path its $ORIGIN rpath resolves to.  Both are
-# silent failures — the first looks like a build without a runtime, the second
-# makes the installed app fail to start.
+# ship the library at every path its $ORIGIN rpath resolves to — one per package
+# format.  Both are silent failures — the first looks like a build without a
+# runtime, the second makes the installed app fail to start.  The RPM spec is
+# held to the same standard: it packages what `make install` stages, so the two
+# have to agree about where the library goes, whether it ships at all, and the
+# version.
 #
 # Exits non-zero on a real mismatch.  The optional tools (desktop-file-validate,
 # ImageMagick, readelf) are used when present and reported as skipped when not,
@@ -140,18 +143,25 @@ if [ -f build/dytqt ] && command -v readelf >/dev/null 2>&1; then
     runpath=$(readelf -d build/dytqt 2>/dev/null \
               | sed -n 's/.*(RUNPATH).*\[\(.*\)\].*/\1/p')
     if readelf -d build/dytqt 2>/dev/null | grep -q 'libMNN'; then
-        case "$runpath" in
-            *'$ORIGIN'*'../lib/dytqt'*)
-                ok "dytqt links libMNN.so and its rpath finds the shipped copy" ;;
-            *)
-                fail "dytqt links libMNN.so and its rpath finds the shipped copy (runpath '${runpath:-<none>}')" ;;
-        esac
+        # Each package puts the library one directory up and over from the
+        # binary — the deb under $(PREFIX)/lib, the rpm under Fedora's
+        # $(PREFIX)/lib64 — so the rpath has to carry both, or one of the two
+        # packages installs a binary that cannot find its own runtime.
+        have_lib=0
+        have_lib64=0
+        case "$runpath" in *'$ORIGIN/../lib/dytqt'*)   have_lib=1 ;; esac
+        case "$runpath" in *'$ORIGIN/../lib64/dytqt'*) have_lib64=1 ;; esac
+        if [ "$have_lib" = 1 ] && [ "$have_lib64" = 1 ]; then
+            ok "dytqt links libMNN.so and its rpath finds both packaged copies"
+        else
+            fail "dytqt links libMNN.so and its rpath finds both packaged copies (runpath '${runpath:-<none>}')"
+        fi
         if grep -q 'libMNN\.so' Makefile; then
             ok "install ships the libMNN.so the binary needs"
         else
             fail "install ships the libMNN.so the binary needs"
         fi
-        # An absolute path into the build tree would be shipped in the .deb —
+        # An absolute path into the build tree would be shipped in a package —
         # lintian's binary-or-shlib-defines-rpath, and a way for a target
         # machine to load a library the package does not contain.
         if readelf -d build/dytqt 2>/dev/null | grep -qF "$(pwd)"; then
@@ -164,6 +174,51 @@ if [ -f build/dytqt ] && command -v readelf >/dev/null 2>&1; then
     fi
 else
     skip "dytqt links the shipped libMNN.so" "build/dytqt absent or readelf missing"
+fi
+
+# --- the RPM metadata ---
+#
+# packaging/rpm/dytqt.spec packages what `make install` stages, so the two have
+# to agree about the three things that can silently diverge: where the private
+# library goes, whether it ships at all, and the version.  A mismatch does not
+# fail the build — it produces a package that installs a binary unable to find
+# its runtime, or a libMNN.so nothing loads.
+spec=packaging/rpm/dytqt.spec
+if [ -f "$spec" ]; then
+    if grep -q '^Name:[[:space:]]*dytqt' "$spec"; then
+        ok "the spec names the package dytqt"
+    else
+        fail "the spec names the package dytqt"
+    fi
+    # The binary's $ORIGIN/../lib64/dytqt entry is what finds it, so the spec
+    # must install the library under %{_libdir}/dytqt — the same relative
+    # position `make install` uses when LIBDIR is rpm's %{_libdir}.
+    if grep -q '%{_libdir}/dytqt/libMNN\.so' "$spec"; then
+        ok "the spec ships libMNN.so where the binary looks for it"
+    else
+        fail "the spec ships libMNN.so where the binary looks for it"
+    fi
+    # `make rpm` passes --with/--without mnn from the same HAVE_MNN that decides
+    # whether `make install` ships the library, so the two cannot disagree.
+    if grep -q '%if %{with mnn}' "$spec" \
+       && grep -q 'RPM_WITH.*HAVE_MNN' Makefile; then
+        ok "the spec's MNN switch is the Makefile's HAVE_MNN"
+    else
+        fail "the spec's MNN switch is the Makefile's HAVE_MNN"
+    fi
+    if grep -q 'Version:[[:space:]]*%{_dytqt_version}' "$spec" \
+       && grep -q '_dytqt_version.*\$(VERSION)' Makefile; then
+        ok "the spec's version comes from the Makefile's VERSION"
+    else
+        fail "the spec's version comes from the Makefile's VERSION"
+    fi
+    if grep -q 'rpmbuild' Makefile && grep -q 'packaging/rpm/dytqt\.spec' Makefile; then
+        ok "the Makefile builds the spec"
+    else
+        fail "the Makefile builds the spec"
+    fi
+else
+    skip "the RPM spec ships" "packaging/rpm/dytqt.spec absent"
 fi
 
 if [ "$fails" -ne 0 ]; then
