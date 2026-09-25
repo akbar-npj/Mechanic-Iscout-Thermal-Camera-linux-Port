@@ -116,6 +116,56 @@ nearest-neighbour, matching `map()`'s integer division and the OpenCV viewer's
 shared pointer mapping does not agree with. `QImage::flipped()` is used rather
 than the deprecated `mirrored()`.
 
+### Measurement and alarm
+
+The window places measurements with the mouse and picks the tool with the
+keyboard, both driving `src/view_model.c` rather than re-deciding anything:
+
+| key | effect |
+|---|---|
+| `p` / `l` / `b` | point / line / box |
+| `n` | no tool, and forget the placed points |
+| `a` | arm the alarm, or disarm it if already armed |
+| `i` | toggle the isotherm |
+
+One gesture covers all three tools: a press places **both** points, a move while
+the button is held moves point 1, and a release ends the drag — so a click leaves
+both points on one pixel, which is exactly a point probe, and a drag draws a line
+or a box. That rule is `dyt_vm_tool_mouse()`'s, not the window's, and
+`view_model_test` pins it. The tool is read from the view's own last snapshot, so
+it is the session's tool and there is no second copy to drift.
+
+**The overlay and the pointer share one mapping.** A click maps output→source
+with `dyt_view_transform_map()`; the overlay projects source→output with
+`dyt_view_transform_project()`. Both are handed the same
+`(xform, src_w, src_h, dst_w, dst_h)`, where `dst` is the *transformed* image size
+(`img_.size()`), and the widget offset `(kPad, kPad)` is added only at draw time.
+Hand-scaling by `zoom` anywhere would put a marker and its click on different
+pixels. `FrameView` owns that mapping — and the pointer state with it — because
+the hover crosshair needs the pointer position and the temperature plane at paint
+time; splitting them across a callback would duplicate the one piece of state
+that must not drift.
+
+The canvas draws the frame's hottest and coldest pixels (`H` red, `L` blue, from
+`stats`), the temperature under the pointer with a crosshair, and the placed tool
+— a ring for a point, a line with endpoint dots, a box with its `min/max/avg/med`
+label. The alarm, when it trips, gets a right-aligned badge on the first status
+line, the one place with room: the second line can be arbitrarily long and the
+image area is where the measurement labels go.
+
+Three strings the viewer used to spell for itself now come from the view model, so
+the two front-ends cannot disagree: `dyt_vm_hover_label()` (carrying the `t == t`
+guard `dyt_vm_temp()` deliberately omits), `dyt_vm_roi_label()` (a NaN statistic
+reads `--`, never a plausible-looking `0 C`), and `dyt_vm_alarm_band()` — the
+middle 40 % of the current range with 10 % hysteresis, which is what `a` arms.
+
+Two behaviours are inherited from the viewer rather than corrected. `i` on its own
+dims the whole image, because with no alarm armed the isotherm band is `[0,0]` and
+every pixel is outside it. And the armed band is fixed at the moment `a` is
+pressed, so a camera whose auto-range later settles elsewhere will show an alarm
+that no longer matches the scene — the honest consequence of a derived band, and
+the reason explicit thresholds are a later task.
+
 ## The toolkit decision — Qt6 Widgets
 
 Qt6 was chosen as the toolkit, and within Qt6, **Widgets** rather than Quick/QML.
@@ -234,6 +284,10 @@ switches to the raw-AD frame (256×192) by sending `setTinyCOutputADValue` and
 reading the flat plane; it is the path the vendor's AD-mode tools use, and is
 only there because the port's super-resolution model was recovered against it.
 
+Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
+alarm and `i` shows the isotherm, and with `--live` the window reconnects on its
+own while `R` retries immediately — see "Measurement and alarm".
+
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
 at a window. It is wired into `make check`, so the GUI is part of the CI gate
@@ -266,6 +320,11 @@ $ ./build/dytqt --selftest
   ok   a frozen stream is NO SIGNAL, and cannot mask the other states (NO SIGNAL)
   ok   the fps meter reports 0.0 on a frozen counter (25.0 -> 0.0)
   ok   the retry backoff doubles to a cap, then gives up (0.5, 1.0, ..., 30.0, stop)
+  ok   the tool keys reach the session (line/point/box/clear all route)
+  ok   the mouse places and drags through the widget (20,15 -> 45,35)
+  ok   the alarm key arms the derived band, then disarms (31.7..32.1)
+  ok   the isotherm key toggles the overlay
+  ok   the strip reports the measurement ("box (10,10)-(60,50) n=2091")
 === ALL PASS ===
 ```
 
@@ -295,6 +354,17 @@ drives `StallWatch` through a freeze, a recovery and a warm-up; 20 checks that a
 stall cannot mask `NO DEVICE` or `WARMING UP`; 21 pins that the `seq`-driven meter
 reads 0.0 on a frozen counter; 22 pins the backoff schedule. None of the four
 needs a camera, and none would be reachable any other way.
+
+Assertions 23–27 drive the measurement UI through the **real widgets**, with
+synthesized `QMouseEvent`s and `QKeyEvent`s delivered by `QApplication::sendEvent`
+— the tool keys, a press/drag/release placing a box, the alarm arming the derived
+band and disarming, the isotherm toggling, and the strip reporting the
+measurement. The expected source pixel comes from `dyt_view_transform_map()`
+itself, so they pin the *routing* (that a widget coordinate reaches
+`dyt_vm_tool_mouse()` with the right `dst` size) rather than the transform, which
+assertion 16 already covers. The overlay's *painting* is deliberately not
+asserted: a pixel check on a drawn rectangle is brittle, so it was verified by eye
+from a fixture render instead.
 
 ## Where the frames come from, and on which thread
 
@@ -414,15 +484,26 @@ then abandons it the same way.
   its device handle and the leaked session with it, because there is no way to
   cancel it without a timeout in vendored libuvc. Adding one there was the
   alternative weighed and not taken.
-* **Interaction.** `src/view_model.c` already provides the pointer→tool mapping
-  (`dyt_vm_tool_mouse`) and the parameter arm/confirm machine
-  (`dyt_vm_param_key`), and both are pinned by `view_model_test`. The window does
-  not yet route Qt mouse and key events into them, so the tool and settings UI is
-  unexercised — tasks #88 and #89. That is also why assertion 16 drives the
-  transform directly: no key sets the flip yet.
-* **High-DPI and scaling.** The window paints at 1:1 device pixels. Qt's
-  automatic scaling is untested here.
+* **The parameter ladder and the device panel.** `src/view_model.c` also provides
+  the runtime-parameter arm/confirm machine (`dyt_vm_param_key`) and the device
+  panel's rows (`dyt_vm_info`), and `view_model_test` pins both. The window does
+  not route keys into them yet, so that UI is unexercised — task #89. `n` will
+  then have to reach the parameter handler first and be swallowed while something
+  is armed, exactly as the reference viewer orders it. The measurement UI itself
+  is wired (see "Measurement and alarm").
+* **No view keys.** Palette, unit, range, flip, zoom and fusion are reachable from
+  the command line (`--zoom`) but not from the window, so the mirror is still
+  unexercised interactively — which is why assertion 16 drives the transform
+  directly.
+* **High-DPI and scaling.** The window paints at 1:1 device pixels, and the
+  pointer math assumes it: at a device pixel ratio above 1 Qt scales the drawn
+  image, so a widget coordinate would no longer be an image pixel and a click
+  would land off-target. Qt's automatic scaling is untested here.
 * **Only a smoke test on a real compositor.** The window was shown and painted
   twelve frames on Wayland to prove the platform plugin loads, a window maps and
   the resized layout settles; that is not a sustained run, and it is not part of
-  `make check`.
+  `make check`. The measurement UI was additionally driven live against the camera
+  (a key press armed the alarm and the isotherm, and mouse motion reached the
+  pointer handler), but synthetic pointer drags proved unreliable on this
+  compositor — the window manager slides the window, so a drag's absolute
+  coordinates go stale — and the overlay was verified by a fixture render instead.

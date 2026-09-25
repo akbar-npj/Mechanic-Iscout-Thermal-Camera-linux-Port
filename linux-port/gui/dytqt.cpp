@@ -17,6 +17,7 @@
  */
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,7 @@
 #include <QEventLoop>
 #include <QImage>
 #include <QKeyEvent>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QSize>
@@ -406,23 +408,91 @@ static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
     return out;
 }
 
+/* ------------------------------------------------------- measurement keys
+ *
+ * The measurement bindings, in one place so the window and --selftest cannot
+ * diverge — both reach them through FrameView::measure_key().  Returns 1 when
+ * the key was consumed.
+ *
+ * These are the reference viewer's bindings: one key per tool, "n" also
+ * forgetting the placed points, "a" arming the derived band or disarming, "i"
+ * toggling the isotherm.  The view keys (palette, unit, range, flip, zoom,
+ * fusion) and the runtime-parameter ladder are deliberately not here; they are
+ * later tasks.  The letters are free of the device keys: the window keeps "R"
+ * for retry (Qt reports both 'r' and 'R' as Qt::Key_R, but no measurement key
+ * uses it). */
+static int apply_measure_key(dyt_session_t *sess, int key)
+{
+    dyt_snapshot_t s;
+
+    if (!sess)
+        return 0;
+
+    /* Only the alarm and isotherm keys need the current state — the range for
+     * the band, and whether it is already armed. */
+    if (key == 'a' || key == 'i') {
+        if (dyt_session_snapshot(sess, &s, nullptr, 0) != 0)
+            return 1;                 /* consumed; there is no frame yet */
+    }
+
+    switch (key) {
+    case 'p': dyt_session_set_tool(sess, DYT_TOOL_POINT); return 1;
+    case 'l': dyt_session_set_tool(sess, DYT_TOOL_LINE);  return 1;
+    case 'b': dyt_session_set_tool(sess, DYT_TOOL_BOX);   return 1;
+    case 'n':
+        /* One key per tool, and "n" also forgets the placed points so the
+         * next tool starts clean. */
+        dyt_session_set_tool(sess, DYT_TOOL_NONE);
+        dyt_session_clear_points(sess);
+        return 1;
+    case 'a':
+        if (!s.alarm_on) {
+            float lo, hi, hyst;
+            if (dyt_vm_alarm_band(&s, &lo, &hi, &hyst) == 0)
+                dyt_session_set_alarm(sess, lo, hi, hyst);
+        } else {
+            dyt_session_alarm_disable(sess);
+        }
+        return 1;
+    case 'i':
+        dyt_session_set_isotherm(sess, !s.iso_on);
+        return 1;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------- the canvas */
 
-/* Paints the engine's frame.  The only class here that knows about pixels:
- * everything above it deals in the session and the view model. */
+/* Paints the engine's frame, and owns the pointer interaction.
+ *
+ * It is the only class here that knows about pixels — everything above it
+ * deals in the session and the view model — and that is exactly why the mouse
+ * handling lives here too: a click has to be mapped back through the same
+ * transform the overlay is drawn with, and the hover crosshair needs both the
+ * pointer position and the temperature plane at paint time.  Splitting that
+ * across a callback would duplicate the one piece of state that must not
+ * drift. */
 class FrameView : public QWidget {
 public:
     explicit FrameView(QWidget *parent = nullptr) : QWidget(parent)
     {
         setAutoFillBackground(true);
+        /* So a move with no button held still updates the hover readout. */
+        setMouseTracking(true);
     }
 
+    /* The session the pointer events act on.  Borrowed, never freed here. */
+    void set_session(dyt_session_t *s) { sess_ = s; }
+
     void set_frame(const dyt_snapshot_t &snap, const QImage &img,
-                   const dyt_palette_t &pal)
+                   const dyt_palette_t &pal, const float *temps)
     {
-        snap_ = snap;
-        img_  = img;
-        pal_  = pal;
+        snap_  = snap;
+        img_   = img;
+        pal_   = pal;
+        temps_ = temps;   /* borrowed from the pump's scratch, refreshed here
+                           * in the same step() that fills it, so no paint can
+                           * see a stale plane */
         /* No resize() here: the widget is laid out by MainWindow, which sizes
          * it from sizeHint().  Resizing a layout-managed widget is a no-op on
          * the next layout pass, and doing it made it look as though the canvas
@@ -439,6 +509,19 @@ public:
      * last real frame instead of flickering back to the placeholder. */
     void set_placeholder(const QString &s) { placeholder_ = s; update(); }
 
+    /* Apply a measurement key.  Returns 1 if the key was ours, so the window
+     * can fall through to whatever else it binds.  The snapshot is refreshed
+     * so the overlay switches at once rather than at the next tick; only the
+     * scalars are re-read, so this is cheap. */
+    int measure_key(int k)
+    {
+        if (!apply_measure_key(sess_, k))
+            return 0;
+        if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0)
+            update();
+        return 1;
+    }
+
     bool  has_frame() const { return !img_.isNull(); }
     QSize imageSize() const { return img_.size(); }
 
@@ -450,6 +533,32 @@ public:
     }
 
 protected:
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        if (e->button() != Qt::LeftButton) {
+            e->ignore();
+            return;
+        }
+        pointer(DYT_VM_MOUSE_DOWN, e->position());
+        e->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent *e) override
+    {
+        pointer(DYT_VM_MOUSE_MOVE, e->position());
+        e->accept();
+    }
+
+    void mouseReleaseEvent(QMouseEvent *e) override
+    {
+        if (e->button() != Qt::LeftButton) {
+            e->ignore();
+            return;
+        }
+        pointer(DYT_VM_MOUSE_UP, e->position());
+        e->accept();
+    }
+
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
@@ -493,13 +602,148 @@ protected:
             p.setPen(i == 1 ? QColor(210, 210, 210) : QColor(255, 255, 255));
             p.drawText(lx, yy, QString::fromUtf8(lbl));
         }
+
+        /* ---- the measurement overlays --------------------------------
+         *
+         * Everything below is projected with the view model's inverse of the
+         * mapping the pointer handler uses, and with the same (src, dst) pair,
+         * so a click and the marker it places cannot disagree.  `dst` is the
+         * *transformed* image size; the widget offset (kPad, kPad) is added
+         * only here, at draw time. */
+        const int sw = snap_.width, sh = snap_.height;
+        const int dw = img_.width(), dh = img_.height();
+        if (sw <= 0 || sh <= 0)
+            return;
+
+        /* Source pixel -> widget position, clamping into the frame first so a
+         * box dragged partly off the image still draws, clipped at the edge,
+         * rather than vanishing because one corner projects outside. */
+        auto proj = [&](int sx, int sy, QPoint &out) {
+            int ox = 0, oy = 0;
+            sx = std::max(0, std::min(sw - 1, sx));
+            sy = std::max(0, std::min(sh - 1, sy));
+            if (dyt_view_transform_project(&snap_.xform, sw, sh, dw, dh,
+                                           sx, sy, &ox, &oy) != 0)
+                return false;
+            out = QPoint(x0 + ox, y0 + oy);
+            return true;
+        };
+
+        /* The frame's own extremes, marked as the reference viewer does:
+         * H red for the hottest pixel, L blue for the coldest. */
+        {
+            auto mark = [&](int sx, int sy, float c, const QColor &col,
+                            const char *tag) {
+                QPoint q;
+                if (sx < 0 || sy < 0 || !proj(sx, sy, q))
+                    return;
+                p.setBrush(Qt::NoBrush);
+                p.setPen(QPen(QColor(0, 0, 0), 2));
+                p.drawEllipse(q, 5, 5);
+                p.setPen(col);
+                p.drawEllipse(q, 5, 5);
+                char t[32], lbl[64];
+                dyt_vm_temp(&snap_, c, t, sizeof t);
+                std::snprintf(lbl, sizeof lbl, "%s %s", tag, t);
+                p.drawText(q + QPoint(8, -6), QString::fromUtf8(lbl));
+            };
+            mark(snap_.stats.hot_x, snap_.stats.hot_y, snap_.stats.hi,
+                 QColor(255, 60, 60), "H");
+            mark(snap_.stats.cold_x, snap_.stats.cold_y, snap_.stats.lo,
+                 QColor(90, 160, 255), "L");
+        }
+
+        /* The hover readout: the temperature under the pointer, with a small
+         * crosshair so the pixel it names is unambiguous. */
+        if (temps_ && ptr_.x >= 0 && ptr_.y >= 0 && ptr_.x < dw && ptr_.y < dh) {
+            int ix = 0, iy = 0;
+            if (dyt_view_transform_map(&snap_.xform, sw, sh, dw, dh,
+                                       ptr_.x, ptr_.y, &ix, &iy) == 0 &&
+                ix >= 0 && ix < sw && iy >= 0 && iy < sh) {
+                const float t = temps_[(size_t)iy * (size_t)sw + (size_t)ix];
+                char lbl[64];
+                dyt_vm_hover_label(&snap_, t, ix, iy, lbl, sizeof lbl);
+                p.setPen(QColor(255, 255, 255));
+                p.drawText(QPoint(x0 + ptr_.x + 10, y0 + ptr_.y - 8),
+                           QString::fromUtf8(lbl));
+                p.setPen(QColor(0, 0, 0));
+                p.drawLine(x0 + ptr_.x - 6, y0 + ptr_.y,
+                           x0 + ptr_.x + 6, y0 + ptr_.y);
+                p.drawLine(x0 + ptr_.x, y0 + ptr_.y - 6,
+                           x0 + ptr_.x, y0 + ptr_.y + 6);
+            }
+        }
+
+        /* The placed tool. */
+        if (snap_.tool != DYT_TOOL_NONE) {
+            const QColor mark(255, 255, 0);
+            QPoint a, b;
+            if (snap_.tool == DYT_TOOL_POINT && snap_.point_ok &&
+                proj(snap_.p0.x, snap_.p0.y, a)) {
+                p.setBrush(Qt::NoBrush);
+                p.setPen(QPen(QColor(0, 0, 0), 2));
+                p.drawEllipse(a, 7, 7);
+                p.setPen(mark);
+                p.drawEllipse(a, 7, 7);
+                char t[32], lbl[64];
+                dyt_vm_temp(&snap_, snap_.point_c, t, sizeof t);
+                std::snprintf(lbl, sizeof lbl, "P %s", t);
+                p.drawText(a + QPoint(10, -8), QString::fromUtf8(lbl));
+            } else if (snap_.tool == DYT_TOOL_LINE &&
+                       proj(snap_.p0.x, snap_.p0.y, a) &&
+                       proj(snap_.p1.x, snap_.p1.y, b)) {
+                p.setPen(QPen(QColor(0, 0, 0), 3));
+                p.drawLine(a, b);
+                p.setPen(mark);
+                p.drawLine(a, b);
+                p.setBrush(mark);
+                p.drawEllipse(a, 4, 4);
+                p.drawEllipse(b, 4, 4);
+            } else if (snap_.tool == DYT_TOOL_BOX &&
+                       proj(snap_.p0.x, snap_.p0.y, a) &&
+                       proj(snap_.p1.x, snap_.p1.y, b)) {
+                const QRect r(QPoint(std::min(a.x(), b.x()),
+                                     std::min(a.y(), b.y())),
+                              QPoint(std::max(a.x(), b.x()),
+                                     std::max(a.y(), b.y())));
+                p.setBrush(Qt::NoBrush);
+                p.setPen(QPen(QColor(0, 0, 0), 3));
+                p.drawRect(r);
+                p.setPen(mark);
+                p.drawRect(r);
+                if (snap_.roi_ok) {
+                    char lbl[128];
+                    dyt_vm_roi_label(&snap_, lbl, sizeof lbl);
+                    p.drawText(QPoint(r.left() + 4, r.top() - 6),
+                               QString::fromUtf8(lbl));
+                }
+            }
+        }
     }
 
 private:
-    dyt_snapshot_t snap_{};
-    QImage         img_;
-    dyt_palette_t  pal_{};
-    QString        placeholder_ = QStringLiteral("waiting for a frame");
+    /* The one widget -> image mapping, so a click and the marker it places
+     * cannot disagree.  floor(), not a cast: (int)(-0.5) is 0, which would
+     * place a point one pixel outside the image. */
+    void pointer(dyt_vm_mouse_ev_t ev, const QPointF &pos)
+    {
+        if (!sess_ || img_.isNull())
+            return;
+        const int lx = (int)std::floor(pos.x() - kPad);
+        const int ly = (int)std::floor(pos.y() - kPad);
+        dyt_vm_tool_mouse(sess_, &ptr_, ev, snap_.tool, &snap_.xform,
+                          snap_.width, snap_.height,
+                          img_.width(), img_.height(), lx, ly);
+        update();
+    }
+
+    dyt_snapshot_t      snap_{};
+    QImage              img_;
+    dyt_palette_t       pal_{};
+    QString             placeholder_ = QStringLiteral("waiting for a frame");
+    dyt_session_t      *sess_        = nullptr;   /* borrowed */
+    dyt_vm_pointer_t    ptr_         = DYT_VM_POINTER_INIT;
+    const float        *temps_       = nullptr;   /* borrowed from the pump */
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -529,6 +773,17 @@ public:
 
     const QString &line(int i) const { return line_[i]; }
 
+    /* The alarm, when armed and tripped.  Kept here rather than on the canvas
+     * because the first line is the one place with room to spare: the second
+     * line can be arbitrarily long, and the image area is where the
+     * measurement labels go. */
+    void set_alarm(bool on, dyt_alarm_state_t st)
+    {
+        alarm_on_ = on;
+        alarm_    = st;
+        update();
+    }
+
     QSize sizeHint() const override
     {
         int w = 0;
@@ -551,10 +806,27 @@ protected:
             p.setPen(pen[i]);
             p.drawText(kStripPad, kStripPad + i * kLineH + ascent, line_[i]);
         }
+
+        /* The alarm is the one thing worth shouting about. */
+        if (alarm_on_ && alarm_ != DYT_ALARM_NONE) {
+            const QString a =
+                QStringLiteral("ALARM ") +
+                QString::fromUtf8(dyt_alarm_name(alarm_));
+            const int   bw = 12 + fontMetrics().horizontalAdvance(a);
+            const QRect r(width() - bw - kStripPad, kStripPad,
+                          bw, kLineH + 4);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 0, 180));
+            p.drawRect(r);
+            p.setPen(QColor(255, 255, 255));
+            p.drawText(r, Qt::AlignCenter, a);
+        }
     }
 
 private:
     QString line_[3];
+    bool    alarm_on_ = false;
+    dyt_alarm_state_t alarm_ = DYT_ALARM_NONE;
 };
 
 /* --------------------------------------------------------------- the window */
@@ -626,6 +898,7 @@ public:
         dyt_vm_readout_line(&snap, msg, b, sizeof b);
         strip_->set_lines(QString::fromUtf8(a), QString::fromUtf8(b),
                           state_line(st, snap, fps));
+        strip_->set_alarm(snap.alarm_on != 0, snap.alarm);
         fit_to_view();
     }
 
@@ -647,10 +920,21 @@ protected:
 
     void keyPressEvent(QKeyEvent *e) override
     {
+        /* Retry first: "R" is the device key and must keep working whatever
+         * else is bound. */
         if (e->key() == Qt::Key_R && on_retry_) {
             on_retry_();
             return;
         }
+        /* Qt reports a letter as its uppercase code, so lowercase it before
+         * the measurement bindings — which are all lowercase — are consulted.
+         * The return value decides, rather than a list of letters here, so
+         * --selftest and the window cannot disagree about what is bound. */
+        int k = e->key();
+        if (k >= Qt::Key_A && k <= Qt::Key_Z)
+            k += 'a' - 'A';
+        if (view_ && view_->measure_key(k))
+            return;
         QWidget::keyPressEvent(e);
     }
 
@@ -769,11 +1053,29 @@ struct pump {
             return true;                  /* deliberately not a painted frame */
         }
 
+        /* The isotherm dims the pixels outside the alarm band.  It is applied
+         * to the *source-resolution* buffer and before the transform, exactly
+         * as the reference viewer does, so the dimming follows the data rather
+         * than the zoom.  A private copy, because the engine's buffer is not
+         * ours to scribble on; and a std::vector rather than QImage::bits(),
+         * because Qt may pad bytesPerLine while dyt_vm_apply_isotherm assumes
+         * tightly packed w*3 rows.  The buffer is RGB, not BGR, but the pass
+         * halves every channel, so the order does not matter. */
+        std::vector<uint8_t> iso_buf;
+        const uint8_t       *pix = rgb;
+        if (snap.iso_on && scr.temps && scr.cap >= w * h) {
+            iso_buf.assign(rgb, rgb + (size_t)w * (size_t)h * 3);
+            dyt_vm_apply_isotherm(iso_buf.data(), w, h, scr.temps, scr.cap,
+                                  snap.iso_lo, snap.iso_hi);
+            pix = iso_buf.data();
+        }
+
         /* The engine's buffer is tightly packed RGB, so QImage wraps it with
          * no conversion.  transformed() owns what it returns, because the
          * source buffer dies on the next next(). */
-        const QImage wrapped(rgb, w, h, w * 3, QImage::Format_RGB888);
-        win->view()->set_frame(snap, transformed(wrapped, snap.xform), pal);
+        const QImage wrapped(pix, w, h, w * 3, QImage::Format_RGB888);
+        win->view()->set_frame(snap, transformed(wrapped, snap.xform), pal,
+                               scr.temps);
         win->set_frame_status(snap, ds, fps.fps(), mode);
 
         frames++;                        /* painted frames, for --frames/--png */
@@ -832,6 +1134,7 @@ static int selftest(const opts &o)
     }
 
     MainWindow win;
+    win.view()->set_session(sess);
     pump       pm;
     pm.fs   = fs;
     pm.sess = sess;
@@ -1258,6 +1561,165 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* The measurement UI.  These drive the real widgets — synthesized Qt
+     * events into the window and the canvas — so what is pinned is the
+     * routing, not the arithmetic underneath it.  A fixture run populates
+     * everything they need (a frame, its stats, and a settable tool). */
+    auto send_key = [&](Qt::Key k) {
+        QKeyEvent e(QEvent::KeyPress, k, Qt::NoModifier);
+        QApplication::sendEvent(&win, &e);
+    };
+
+    /* 23. The tool keys reach the session.  This is also what arms the mouse
+     * test below: the pointer handler reads the tool from the view's own
+     * snapshot, so a tool must be selected through the key path before a drag
+     * places anything — which is exactly the real order of use. */
+    {
+        dyt_snapshot_t s{};
+
+        send_key(Qt::Key_L);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool line = s.tool == DYT_TOOL_LINE;
+
+        send_key(Qt::Key_P);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool point = s.tool == DYT_TOOL_POINT;
+
+        send_key(Qt::Key_B);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool box = s.tool == DYT_TOOL_BOX;
+
+        /* "n" clears as well as deselecting, so the next tool starts clean. */
+        send_key(Qt::Key_N);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool none = s.tool == DYT_TOOL_NONE &&
+                          s.p0.x < 0 && s.p1.x < 0;
+
+        const bool ok = line && point && box && none;
+        std::printf("  %-4s the tool keys reach the session (line/point/box/"
+                    "clear %s)\n", ok ? "ok" : "FAIL",
+                    ok ? "all route" : "MISSED");
+        if (!ok)
+            fails++;
+    }
+
+    /* 24. The mouse reaches the session through the real widget: a press
+     * places both points, a drag moves point 1, a release ends it.  The
+     * expected source pixel comes from the view model's own map(), so this
+     * pins the wiring — that the widget's coordinates reach tool_mouse at all,
+     * with the right dst size — rather than the transform (assertion 16). */
+    auto send_mouse = [&](QEvent::Type t, Qt::MouseButton b,
+                          Qt::MouseButtons bs, int lx, int ly) {
+        QMouseEvent e(t, QPointF(kPad + lx, kPad + ly),
+                      QPointF(kPad + lx, kPad + ly), b, bs, Qt::NoModifier);
+        QApplication::sendEvent(win.view(), &e);
+    };
+    {
+        send_key(Qt::Key_B);            /* the view's snapshot must carry it */
+
+        const QSize is  = win.view()->imageSize();
+        const int   lx0 = 40, ly0 = 30;
+        const int   lx1 = 90, ly1 = 70;
+
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   lx0, ly0);
+        dyt_snapshot_t s1{};
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        int ex0 = -1, ey0 = -1;
+        const bool m0 = dyt_view_transform_map(&s1.xform, s1.width, s1.height,
+                                               is.width(), is.height(),
+                                               lx0, ly0, &ex0, &ey0) == 0;
+
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, lx1, ly1);
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+        int ex1 = -1, ey1 = -1;
+        const bool m1 = dyt_view_transform_map(&s2.xform, s2.width, s2.height,
+                                               is.width(), is.height(),
+                                               lx1, ly1, &ex1, &ey1) == 0;
+
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   lx1, ly1);
+
+        const bool ok = m0 && m1 &&
+                        s1.p0.x == ex0 && s1.p0.y == ey0 &&
+                        s1.p1.x == ex0 && s1.p1.y == ey0 &&
+                        s2.p0.x == ex0 && s2.p0.y == ey0 &&
+                        s2.p1.x == ex1 && s2.p1.y == ey1;
+        std::printf("  %-4s the mouse places and drags through the widget "
+                    "(%d,%d -> %d,%d)\n", ok ? "ok" : "FAIL",
+                    s1.p0.x, s1.p0.y, s2.p1.x, s2.p1.y);
+        if (!ok)
+            fails++;
+    }
+
+    /* 25. The alarm key arms the band the view model derives from the current
+     * range, and a second press disarms. */
+    {
+        dyt_snapshot_t s{};
+
+        send_key(Qt::Key_A);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool armed = s.alarm_on != 0 && s.alarm_lo < s.alarm_hi;
+
+        float lo = 0.f, hi = 0.f, hyst = 0.f;
+        dyt_vm_alarm_band(&s, &lo, &hi, &hyst);
+        const bool matches = std::fabs(s.alarm_lo - lo) < 1e-4f &&
+                             std::fabs(s.alarm_hi - hi) < 1e-4f;
+        const float armed_lo = s.alarm_lo, armed_hi = s.alarm_hi;
+
+        send_key(Qt::Key_A);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool disarmed = s.alarm_on == 0;
+
+        const bool ok = armed && matches && disarmed;
+        std::printf("  %-4s the alarm key arms the derived band, then disarms "
+                    "(%.1f..%.1f)\n", ok ? "ok" : "FAIL",
+                    (double)armed_lo, (double)armed_hi);
+        if (!ok)
+            fails++;
+    }
+
+    /* 26. The isotherm key toggles the overlay. */
+    {
+        dyt_snapshot_t s{};
+
+        send_key(Qt::Key_I);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool on = s.iso_on != 0;
+
+        send_key(Qt::Key_I);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool off = s.iso_on == 0;
+
+        const bool ok = on && off;
+        std::printf("  %-4s the isotherm key toggles the overlay\n",
+                    ok ? "ok" : "FAIL");
+        if (!ok)
+            fails++;
+    }
+
+    /* 27. The strip the window shows carries the measurement, so the overlay
+     * and the text cannot disagree.  A box is placed, then one tick runs so
+     * the strip is rebuilt from a fresh snapshot the way the timer does it. */
+    {
+        send_key(Qt::Key_B);
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   20, 20);
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, 120, 100);
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   120, 100);
+
+        pm.step();                      /* the fixture replays forever */
+        const QString l2 = win.strip()->line(1);
+        const bool ok = l2.startsWith(QStringLiteral("box (")) &&
+                        l2.contains(QStringLiteral("n="));
+        std::printf("  %-4s the strip reports the measurement (\"%s\")\n",
+                    ok ? "ok" : "FAIL", l2.toUtf8().constData());
+        if (!ok)
+            fails++;
+    }
+
     dyt_frame_source_close(fs);
     dyt_session_free(sess);
 
@@ -1418,6 +1880,7 @@ static int run_gui(const opts &o, QApplication &app)
         return 1;
 
     MainWindow win;
+    win.view()->set_session(sess);
     pump       pm;
     pm.sess = sess;
     pm.win  = &win;
