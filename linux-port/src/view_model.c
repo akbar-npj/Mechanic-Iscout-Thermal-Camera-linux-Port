@@ -195,6 +195,55 @@ int dyt_vm_readout_line(const dyt_snapshot_t *snap, const char *msg,
     return (int)off;
 }
 
+/* One ROI statistic, or "--" when the region had no finite samples
+ * (measure.h) — never a plausible-looking 0 C. */
+static void stat_str(const dyt_snapshot_t *snap, float c, char *out, size_t n)
+{
+    if (c == c)
+        dyt_vm_temp(snap, c, out, n);
+    else
+        snprintf(out, n, "--");
+}
+
+int dyt_vm_hover_label(const dyt_snapshot_t *snap, float celsius,
+                       int x, int y, char *out, size_t n)
+{
+    char   t[32];
+    size_t off = 0;
+
+    if (!snap || !out || n == 0)
+        return -1;
+
+    out[0] = '\0';
+
+    if (celsius == celsius)
+        dyt_vm_temp(snap, celsius, t, sizeof t);
+    else
+        snprintf(t, sizeof t, "---");
+
+    appf(out, n, &off, "%s  (%d,%d)", t, x, y);
+    return (int)off;
+}
+
+int dyt_vm_roi_label(const dyt_snapshot_t *snap, char *out, size_t n)
+{
+    char   a[32], b[32], c[32], d[32];
+    size_t off = 0;
+
+    if (!snap || !out || n == 0)
+        return -1;
+
+    out[0] = '\0';
+
+    stat_str(snap, snap->roi.min,    a, sizeof a);
+    stat_str(snap, snap->roi.max,    b, sizeof b);
+    stat_str(snap, snap->roi.mean,   c, sizeof c);
+    stat_str(snap, snap->roi.median, d, sizeof d);
+
+    appf(out, n, &off, "min %s  max %s  avg %s  med %s", a, b, c, d);
+    return (int)off;
+}
+
 /* ------------------------------------------------------------- colour bar */
 
 int dyt_vm_bar_index(int row, int rows)
@@ -470,6 +519,24 @@ int dyt_vm_tool_mouse(dyt_session_t *s, dyt_vm_pointer_t *p,
             return 1;
         }
     }
+    return 0;
+}
+
+int dyt_vm_alarm_band(const dyt_snapshot_t *snap,
+                      float *lo, float *hi, float *hyst)
+{
+    float span;
+
+    if (!snap || !lo || !hi || !hyst)
+        return -1;
+
+    span = snap->hi - snap->lo;
+    if (!(span > 0.0f))          /* flat or inverted: fall back to one degree */
+        span = 1.0f;
+
+    *lo   = snap->lo + 0.30f * span;
+    *hi   = snap->hi - 0.30f * span;
+    *hyst = 0.10f * span;
     return 0;
 }
 

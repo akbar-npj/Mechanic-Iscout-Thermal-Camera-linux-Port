@@ -90,6 +90,24 @@ int dyt_vm_status_line(const dyt_snapshot_t *snap, dyt_mode_t mode,
 int dyt_vm_readout_line(const dyt_snapshot_t *snap, const char *msg,
                         char *out, size_t n);
 
+/* The hover readout: the temperature under the pointer with the source pixel
+ * it came from, e.g. "31.2 C  (12,7)".  A NaN reads "---  (12,7)".
+ *
+ * This is where the `t == t` guard lives.  dyt_vm_temp() deliberately does not
+ * apply one — a NaN formats as whatever the host spells NaN — and every
+ * front-end that shows a temperature under the pointer needs the same guard,
+ * so it belongs here rather than in each of them. */
+int dyt_vm_hover_label(const dyt_snapshot_t *snap, float celsius,
+                       int x, int y, char *out, size_t n);
+
+/* The box tool's statistics, e.g.
+ * "min 30.0 C  max 40.0 C  avg 35.0 C  med 36.0 C".  A statistic that is NaN
+ * — a region with no finite samples (measure.h) — reads "--", so an empty box
+ * cannot be mistaken for a reading of 0 C.  Returns the number of characters
+ * that would have been written, so a caller can detect truncation, or -1 on a
+ * bad argument. */
+int dyt_vm_roi_label(const dyt_snapshot_t *snap, char *out, size_t n);
+
 /* ------------------------------------------------------------- colour bar */
 
 /* The palette index for a row of a bar `rows` tall.  Row 0 is the top, which
@@ -212,6 +230,22 @@ int dyt_vm_tool_mouse(dyt_session_t *s, dyt_vm_pointer_t *p,
                       const dyt_view_transform_t *xform,
                       int src_w, int src_h, int dst_w, int dst_h,
                       int x, int y);
+
+/* The alarm band a front-end arms when the user asks for one: the middle 40 %
+ * of the frame's current display range, with a 10 % hysteresis.  The band's
+ * edges sit inside the range, so the hottest and coldest parts of the scene
+ * trip it.
+ *
+ * A policy rather than a reading, which is why it lives here and not in each
+ * front-end: it is one spelling of "arm an alarm across what is on screen",
+ * and the reference viewer and the Qt app must not disagree about it.  A flat
+ * frame (hi == lo) falls back to a span of 1.0, which makes the returned `hi`
+ * *below* the returned `lo` — the reference viewer's behaviour, kept rather
+ * than quietly corrected.
+ *
+ * Returns 0 on success, -1 on a bad argument. */
+int dyt_vm_alarm_band(const dyt_snapshot_t *snap,
+                      float *lo, float *hi, float *hyst);
 
 /* --------------------------------------------------------------- overlays */
 

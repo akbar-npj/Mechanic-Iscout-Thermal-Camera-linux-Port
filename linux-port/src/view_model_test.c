@@ -202,6 +202,53 @@ static void test_readout_line(void)
              "box (0,0)-(9,9) n=100  |  alarm high 30.0..40.0  |  iso 42 px");
 }
 
+static void test_hover_label(void)
+{
+    dyt_snapshot_t s;
+    char           b[64];
+
+    base_snapshot(&s);
+
+    dyt_vm_hover_label(&s, 31.2f, 12, 7, b, sizeof b);
+    strcheck("hover: a reading and the pixel it came from", b, "31.2 C  (12,7)");
+
+    /* A NaN is the pipeline's "not measured" marker (measure.h), and
+     * dyt_vm_temp() would happily format it, so the guard is the point. */
+    dyt_vm_hover_label(&s, NAN, 12, 7, b, sizeof b);
+    strcheck("hover: a NaN reads as dashes", b, "---  (12,7)");
+
+    intcheck("hover: bad snapshot",
+             dyt_vm_hover_label(NULL, 1.f, 0, 0, b, sizeof b), -1);
+    intcheck("hover: no room", dyt_vm_hover_label(&s, 1.f, 0, 0, b, 0), -1);
+}
+
+static void test_roi_label(void)
+{
+    dyt_snapshot_t s;
+    char           b[128];
+
+    base_snapshot(&s);
+
+    s.roi.min = 30.0f; s.roi.max = 40.0f;
+    s.roi.mean = 35.0f; s.roi.median = 36.0f;
+    s.roi.n = 100;
+    dyt_vm_roi_label(&s, b, sizeof b);
+    strcheck("roi label: the four statistics", b,
+             "min 30.0 C  max 40.0 C  avg 35.0 C  med 36.0 C");
+
+    /* A region with no finite samples reports NaN statistics (measure.h), so
+     * none of them may be formatted as a plausible-looking 0 C. */
+    s.roi.min = s.roi.max = s.roi.mean = s.roi.median = NAN;
+    s.roi.n = 0;
+    dyt_vm_roi_label(&s, b, sizeof b);
+    strcheck("roi label: an empty region reads as dashes", b,
+             "min --  max --  avg --  med --");
+
+    intcheck("roi label: bad snapshot",
+             dyt_vm_roi_label(NULL, b, sizeof b), -1);
+    intcheck("roi label: no room", dyt_vm_roi_label(&s, b, 0), -1);
+}
+
 /* -------------------------------------------------------------- colour bar */
 
 static void test_bar(void)
@@ -556,6 +603,45 @@ static void test_tool_mouse(void)
     dyt_session_free(s);
 }
 
+static void test_alarm_band(void)
+{
+    dyt_snapshot_t s;
+    float          lo = 0.f, hi = 0.f, h = 0.f;
+
+    base_snapshot(&s);                 /* lo 30, hi 40 */
+
+    intcheck("alarm band: derived", dyt_vm_alarm_band(&s, &lo, &hi, &h), 0);
+    if (fabsf(lo - 33.0f) < 1e-4f && fabsf(hi - 37.0f) < 1e-4f &&
+        fabsf(h - 1.0f) < 1e-4f)
+        ok("alarm band: the middle 40 %, with 10 % hysteresis");
+    else {
+        char d[96];
+        snprintf(d, sizeof d, "got %.3f..%.3f h %.3f",
+                 (double)lo, (double)hi, (double)h);
+        fail("alarm band: the middle 40 %, with 10 % hysteresis", d);
+    }
+
+    /* A flat frame falls back to a one-degree span, which puts the returned
+     * `hi` *below* the returned `lo`.  That is the reference viewer's
+     * behaviour, pinned here so it is kept rather than quietly corrected. */
+    s.lo = s.hi = 30.0f;
+    dyt_vm_alarm_band(&s, &lo, &hi, &h);
+    if (fabsf(lo - 30.3f) < 1e-4f && fabsf(hi - 29.7f) < 1e-4f &&
+        fabsf(h - 0.1f) < 1e-4f)
+        ok("alarm band: a flat frame falls back to one degree (inverted)");
+    else {
+        char d[96];
+        snprintf(d, sizeof d, "got %.3f..%.3f h %.3f",
+                 (double)lo, (double)hi, (double)h);
+        fail("alarm band: a flat frame falls back to one degree (inverted)", d);
+    }
+
+    intcheck("alarm band: bad snapshot",
+             dyt_vm_alarm_band(NULL, &lo, &hi, &h), -1);
+    intcheck("alarm band: bad output",
+             dyt_vm_alarm_band(&s, NULL, &hi, &h), -1);
+}
+
 static void test_utilities(void)
 {
     char b[4096];
@@ -597,12 +683,15 @@ int main(void)
     test_temp();
     test_status_line();
     test_readout_line();
+    test_hover_label();
+    test_roi_label();
     test_bar();
     test_info();
     test_param();
     test_isotherm();
     test_grab();
     test_tool_mouse();
+    test_alarm_band();
     test_utilities();
     printf("=== %s ===\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
