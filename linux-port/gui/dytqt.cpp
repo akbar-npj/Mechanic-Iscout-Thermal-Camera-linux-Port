@@ -70,6 +70,7 @@
 #include "view_model.h"
 
 #ifdef DYT_HAVE_OPENCV
+#include "player.h"      /* the shared mp4 reader, the writer's mirror */
 #include "recorder.h"    /* the shared mp4 writer, when OpenCV is present */
 #endif
 
@@ -893,6 +894,133 @@ struct CaptureCtl {
     ~CaptureCtl() { stop(); }
 };
 
+/* --------------------------------------------------------- clip playback
+ *
+ * The clip being played, the mirror of CaptureCtl: where that one owns the
+ * writer and is fed by the pump, this one owns the reader and feeds the canvas.
+ * One clip at a time, and the state the badge and the keys read.
+ *
+ * Frames are pulled at the pump's per-tick hook rather than from the frame
+ * path, so a clip keeps playing on the WAIT and no-frame ticks — which is
+ * exactly when a live stream has nothing to show and a recorded one does.  It
+ * also means browsing works with no camera attached, which is the whole point
+ * of having saved the clip.
+ *
+ * It holds no Qt: advance() decodes into a plain RGB buffer and says whether
+ * the frame is new, and the pump is what wraps it in a QImage.  That keeps the
+ * reader's contract identical to the one tools/player.h documents and testable
+ * without a window.
+ */
+static std::string base_name(const std::string &path)
+{
+    const size_t slash = path.find_last_of('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+struct PlaybackCtl {
+    std::string name;             /* the file's base name, for the labels */
+    bool        active = false;   /* a clip is open */
+    bool        paused = false;
+    long long   pos    = 0;       /* the last frame delivered, 0-based */
+    long long   count  = 0;       /* the clip's frame count, 0 when unknown */
+    std::vector<uint8_t> buf;     /* the frame just decoded, tightly-packed RGB */
+    int         w = 0, h = 0;
+
+#ifdef DYT_HAVE_OPENCV
+    dyt_player_t *reader = nullptr;
+#endif
+
+    /* Line 3 while a clip is up.  Constant for the clip's life, so the line
+     * does not churn; the moving position is the badge's job. */
+    std::string view_label() const { return "viewing " + name; }
+
+    /* The strip's badge — "playing <name> 12/50", or "paused" — and empty when
+     * nothing is playing.  Its own badge rather than part of a line, for the
+     * same reason the recording one is: it must stay visible while the
+     * transient notices come and go. */
+    std::string label() const
+    {
+        char b[300];
+
+        if (!active)
+            return std::string();
+        if (count > 0)
+            snprintf(b, sizeof b, "%s %s  %lld/%lld",
+                     paused ? "paused" : "playing", name.c_str(), pos + 1,
+                     count);
+        else
+            snprintf(b, sizeof b, "%s %s  frame %lld",
+                     paused ? "paused" : "playing", name.c_str(), pos + 1);
+        return b;
+    }
+
+    /* Open a clip to play.  Returns false and fills `why` when it cannot —
+     * a still, a missing file, or a build with no OpenCV. */
+    bool open(const std::string &path, std::string &why)
+    {
+        stop();                             /* one clip at a time */
+
+#ifdef DYT_HAVE_OPENCV
+        reader = dyt_player_open(path.c_str());
+        if (!reader) {
+            why = "cannot play " + base_name(path) + ": not a readable clip";
+            return false;
+        }
+        if (dyt_player_size(reader, &w, &h) != 0 || w <= 0 || h <= 0) {
+            dyt_player_close(reader);
+            reader = nullptr;
+            why = "cannot play " + base_name(path) + ": no frame size";
+            return false;
+        }
+        buf.assign((size_t)w * (size_t)h * 3, 0);
+        count = dyt_player_count(reader);
+        name  = base_name(path);
+        pos   = 0;
+        paused = false;
+        active = true;
+        return true;
+#else
+        (void)path;
+        why = "cannot play " + base_name(path) + ": built without OpenCV";
+        return false;
+#endif
+    }
+
+    /* Decode the next frame into `buf`.  Returns true when `buf` holds a fresh
+     * frame, false when nothing new is shown (paused, or the clip failed and
+     * was stopped).  A failure leaves its reason in `why`. */
+    bool advance(std::string &why)
+    {
+        if (!active || paused)
+            return false;
+
+#ifdef DYT_HAVE_OPENCV
+        if (dyt_player_next(reader, buf.data(), (int)buf.size(), &pos) != 0) {
+            stop();
+            why = "playback stopped: the clip could not be decoded";
+            return false;
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void stop()
+    {
+        active = false;
+        paused = false;
+        pos    = 0;
+#ifdef DYT_HAVE_OPENCV
+        if (reader)
+            dyt_player_close(reader);
+        reader = nullptr;
+#endif
+    }
+
+    ~PlaybackCtl() { stop(); }
+};
+
 /* Write a still: the container and the PNG.  Returns true on success; on
  * failure `msg` says why. */
 static bool save_still(dyt_session_t *sess, const std::string &dir,
@@ -1001,8 +1129,18 @@ public:
 
     /* A saved still being viewed.  The pump keeps painting the live frame
      * underneath — live keeps streaming, the fixture keeps ticking — so
-     * clearing this restores the stream with nothing to unwind. */
-    void set_override(const QImage &img) { override_ = img; update(); }
+     * clearing this restores the stream with nothing to unwind.
+     *
+     * updateGeometry(), not just update(): sizeHint() is sized from the
+     * override when one is set, so the layout has to re-ask for it — otherwise
+     * fit_to_view() would resize the window against a stale hint and a clip
+     * bigger than the live view would be cropped. */
+    void set_override(const QImage &img)
+    {
+        override_ = img;
+        updateGeometry();
+        update();
+    }
 
     /* Apply a measurement key.  Returns 1 if the key was ours, so the window
      * can fall through to whatever else it binds.  The snapshot is refreshed
@@ -1190,8 +1328,14 @@ public:
 
     QSize sizeHint() const override
     {
-        const int w = img_.isNull() ? 256 : img_.width();
-        const int h = img_.isNull() ? 192 : img_.height();
+        /* The override is what is actually drawn when one is set — a saved
+         * still or a playing clip — so the canvas sizes to it, not to the live
+         * frame underneath.  Without this a clip played with no camera
+         * attached would be laid out against the placeholder's 256x192 and
+         * scaled against the wrong natural size. */
+        const QImage &shown = override_.isNull() ? img_ : override_;
+        const int w = shown.isNull() ? 256 : shown.width();
+        const int h = shown.isNull() ? 192 : shown.height();
         return QSize(kPad + w + kBarGap + kBarW + kLabelW + kPad, h + 2 * kPad);
     }
 
@@ -1272,7 +1416,10 @@ protected:
         QPainter p(this);
         p.fillRect(rect(), QColor(16, 16, 16));
 
-        if (img_.isNull()) {
+        /* The placeholder is the only thing left when there is neither a live
+         * frame nor an override, and it is drawn in *widget* space — centred
+         * in the window — which is why it comes before the transform below. */
+        if (img_.isNull() && override_.isNull()) {
             p.setPen(QColor(200, 200, 200));
             p.drawText(rect(), Qt::AlignCenter, placeholder_);
             /* The parameter keys do not need a frame: once bring-up finishes
@@ -1300,17 +1447,22 @@ protected:
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
 
         const int x0 = kPad, y0 = kPad;
-        p.drawImage(QPoint(x0, y0), img_);
 
-        /* A saved still takes the canvas.  It is drawn at the source's own
-         * size, which is what the still source renders, so no scaling is
-         * needed; the confirm overlay stays because the parameter keys are
-         * still live over a still. */
+        /* A saved still or a playing clip takes the canvas.  It is drawn at
+         * the source's own size, so no scaling is needed, and the confirm
+         * overlay stays because the parameter keys are still live over it.
+         *
+         * This is checked before the live frame is drawn, so the override
+         * covers it completely — and, with the check above, so it appears even
+         * with no camera attached, which is exactly when a saved clip is the
+         * only thing there is to look at. */
         if (!override_.isNull()) {
             p.drawImage(QPoint(x0, y0), override_);
             draw_confirm(p);
             return;
         }
+
+        p.drawImage(QPoint(x0, y0), img_);
 
         /* The colour bar.  The tick rule — which palette entry belongs to
          * which row — is the view model's, so the Qt bar and the OpenCV one
@@ -1642,6 +1794,18 @@ public:
 
     const QString &recording_label() const { return rec_; }
 
+    /* The playback indicator — "playing clip.mp4  12/50" or "paused" — or
+     * empty when no clip is up.  A badge of its own, like the recording one,
+     * and on the middle line so the two cannot collide: the alarm owns line 1
+     * and the recording badge owns line 3. */
+    void set_playback(const QString &s)
+    {
+        play_ = s;
+        update();
+    }
+
+    const QString &playback_label() const { return play_; }
+
     QSize sizeHint() const override
     {
         int w = 0;
@@ -1660,24 +1824,55 @@ protected:
                                        QColor(0xbe, 0xd2, 0xff),
                                        QColor(0x9a, 0xa4, 0xb4) };
         const int ascent = fontMetrics().ascent();
+
+        /* A badge shares its line with the text, so the text is elided to stop
+         * before it — otherwise a long status or readout line simply vanishes
+         * under the badge.  One inset per line: the alarm is on line 1,
+         * playback on line 2, recording on line 3.  The badges themselves are
+         * drawn below, after the text. */
+        const QString alarm_txt =
+            (alarm_on_ && alarm_ != DYT_ALARM_NONE)
+                ? QStringLiteral("ALARM ") +
+                      QString::fromUtf8(dyt_alarm_name(alarm_))
+                : QString();
+        const int inset[3] = {
+            alarm_txt.isEmpty() ? 0 : 12 + fontMetrics().horizontalAdvance(alarm_txt),
+            play_.isEmpty()     ? 0 : 12 + fontMetrics().horizontalAdvance(play_),
+            rec_.isEmpty()      ? 0 : 12 + fontMetrics().horizontalAdvance(rec_),
+        };
+
         for (int i = 0; i < 3; i++) {
             p.setPen(pen[i]);
-            p.drawText(kStripPad, kStripPad + i * kLineH + ascent, line_[i]);
+            const int avail = width() - 2 * kStripPad - inset[i];
+            p.drawText(kStripPad, kStripPad + i * kLineH + ascent,
+                       fontMetrics().elidedText(line_[i], Qt::ElideRight,
+                                                std::max(0, avail)));
         }
 
         /* The alarm is the one thing worth shouting about. */
-        if (alarm_on_ && alarm_ != DYT_ALARM_NONE) {
-            const QString a =
-                QStringLiteral("ALARM ") +
-                QString::fromUtf8(dyt_alarm_name(alarm_));
-            const int   bw = 12 + fontMetrics().horizontalAdvance(a);
+        if (!alarm_txt.isEmpty()) {
+            const int   bw = 12 + fontMetrics().horizontalAdvance(alarm_txt);
             const QRect r(width() - bw - kStripPad, kStripPad,
                           bw, kLineH + 4);
             p.setPen(Qt::NoPen);
             p.setBrush(QColor(0, 0, 180));
             p.drawRect(r);
             p.setPen(QColor(255, 255, 255));
-            p.drawText(r, Qt::AlignCenter, a);
+            p.drawText(r, Qt::AlignCenter, alarm_txt);
+        }
+
+        /* Playback, on the middle line so it cannot collide with the alarm
+         * above it or the recording badge below.  Amber rather than the
+         * recording red: a clip playing is not something being written. */
+        if (!play_.isEmpty()) {
+            const int   bw = 12 + fontMetrics().horizontalAdvance(play_);
+            const QRect r(width() - bw - kStripPad,
+                          kStripPad + kLineH, bw, kLineH + 4);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0x9a, 0x66, 0x00));
+            p.drawRect(r);
+            p.setPen(QColor(255, 255, 255));
+            p.drawText(r, Qt::AlignCenter, play_);
         }
 
         /* Recording, on the last line so the two badges cannot collide. */
@@ -1696,6 +1891,7 @@ protected:
 private:
     QString line_[3];
     QString rec_;
+    QString play_;
     bool    alarm_on_ = false;
     dyt_alarm_state_t alarm_ = DYT_ALARM_NONE;
 };
@@ -1964,8 +2160,10 @@ public:
 
     /* The gallery.  `on_gallery_open_` is handed the highlighted entry (NULL
      * when there is none) and `on_gallery_export_` likewise; both are the front
-     * end's, because one needs the pipeline and the other the disk. */
-    std::function<void(const dyt_vm_item_t *)> on_gallery_open_;
+     * end's, because one needs the pipeline and the other the disk.  Open
+     * returns false when the entry could not be opened, which keeps the list up
+     * rather than hiding it over nothing. */
+    std::function<bool(const dyt_vm_item_t *)> on_gallery_open_;
     std::function<void(const dyt_vm_item_t *)> on_gallery_export_;
     /* Called when the list is opened, so the front end can rescan and pick up
      * anything saved since it was last looked at. */
@@ -1989,6 +2187,11 @@ public:
 
     /* The browsing state, owned here and read by the canvas at paint time. */
     dyt_vm_gallery_t *gallery() { return &gal_; }
+
+    /* Borrow the clip reader from the pump.  The window reads its state (is a
+     * clip up? paused?) and steers it (pause, stop), but the pump owns it and
+     * is what advances it — the same borrow as sess_. */
+    void set_playback(PlaybackCtl *p) { play_ = p; }
 
     /* The on-screen controls, public so --selftest can trigger one and check it
      * lands where the key would.  Every one of them is also the member
@@ -2024,6 +2227,12 @@ public:
     {
         viewing_label_.clear();
         view_->set_override(QImage());
+        /* Back to the live view's size.  set_viewing() re-fits the window to
+         * what it is showing, so dismissing a still or a clip has to undo
+         * that — a 64x48 clip played over a 512x384 stream would otherwise
+         * leave the window sized for the clip.  Guarded inside fit_to_view(),
+         * so the common case of nothing having changed resizes nothing. */
+        fit_to_view();
     }
 
     bool viewing() const { return !viewing_label_.isEmpty(); }
@@ -2047,16 +2256,34 @@ public:
             gal_panel_->reload();
     }
 
+    /* Stop any playing clip and return the canvas to the live view.  One place,
+     * so the badge and the override cannot be cleared without stopping the
+     * reader (or the other way round). */
+    void stop_playback()
+    {
+        if (play_)
+            play_->stop();
+        if (strip_)
+            strip_->set_playback(QString());
+        clear_viewing();
+    }
+
     /* Open the highlighted entry, then get out of the way: the panel hides so
      * the still or the playing clip fills the canvas, and 'g' brings the list
      * back.  Doing it here rather than in the front end keeps the keyboard and
-     * the mouse on one path. */
+     * the mouse on one path.
+     *
+     * A failure leaves the list up.  Hiding it over a clip that could not be
+     * decoded would leave the user looking at the live view with no idea why —
+     * the notice on the strip is the answer, and it needs the list to stay put
+     * so another entry can be tried. */
     void open_gallery_sel()
     {
         const dyt_vm_item_t *it = dyt_vm_gallery_sel(&gal_);
         if (!it || !on_gallery_open_)
             return;                 /* nothing highlighted: leave the list up */
-        on_gallery_open_(it);
+        if (!on_gallery_open_(it))
+            return;
         gal_.open = 0;
         if (gal_panel_)
             gal_panel_->hide();
@@ -2068,7 +2295,9 @@ public:
     }
 
     /* Show or hide the list, keeping the panel and the state in step.  Closing
-     * returns to the live view, which is the contract 'g' and Esc share. */
+     * returns to the live view, which is the contract 'g' and Esc share — and
+     * that includes stopping a clip, since a clip plays with the panel hidden
+     * and closing is how a user says "back to the camera". */
     void set_gallery_open(bool open)
     {
         gal_.open = open ? 1 : 0;
@@ -2080,7 +2309,7 @@ public:
             gal_panel_->raise();
         } else {
             gal_panel_->hide();
-            clear_viewing();
+            stop_playback();
         }
         view_->update();
     }
@@ -2282,6 +2511,24 @@ public:
             /* Anything else is swallowed rather than acted on: the list has
              * the keyboard while it is up. */
             return 1;
+        }
+
+        /* A playing clip, with the list closed — opening an entry hides the
+         * panel, so this is the state a clip actually plays in.  Space pauses
+         * and resumes, Esc stops it and returns to the live view.  It is
+         * deliberately not a key that swallows everything else: 'g' must still
+         * reopen the list, and 'q' must still quit. */
+        if (play_ && play_->active) {
+            if (raw == ' ') {
+                play_->paused = !play_->paused;
+                if (strip_)
+                    strip_->set_playback(QString::fromStdString(play_->label()));
+                return 1;
+            }
+            if (raw == 27) {                    /* Esc stops, back to live */
+                stop_playback();
+                return 1;
+            }
         }
 
         /* Capture: 's' saves a still, 'v' toggles a clip.  Both are free of
@@ -2643,6 +2890,10 @@ private:
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
     dyt_session_t *sess_ = nullptr;      /* borrowed */
+    /* The clip playing on the canvas, if any.  Borrowed from the pump, which
+     * advances it — the same pattern as sess_: the window reads and steers the
+     * state, the pump owns its lifetime. */
+    PlaybackCtl *play_ = nullptr;
     /* The last painted frame, so an action lambda can read the current state
      * (which super-resolution plane to switch off, say) without a second
      * snapshot call. */
@@ -2702,6 +2953,12 @@ struct pump {
      * run_gui because step() is what feeds it a frame. */
     CaptureCtl capture;
 
+    /* The clip being played, the mirror of `capture`.  Also here because
+     * step() is what advances it — and at the per-tick hook, not the frame
+     * path, so a clip keeps playing on the WAIT and no-frame ticks.  The
+     * window borrows it (MainWindow::play_) to pause and stop it. */
+    PlaybackCtl playback;
+
     /* Post a transient notice.  A method so the callers cannot set one without
      * the other and leave a message that never expires. */
     void notice(const std::string &s, int ttl = 150)
@@ -2737,6 +2994,26 @@ struct pump {
         /* Keep the recording badge current even on a tick that paints nothing:
          * the clock has to advance whether or not a frame arrived. */
         win->strip()->set_recording(QString::fromStdString(capture.label()));
+        win->strip()->set_playback(QString::fromStdString(playback.label()));
+
+        /* A playing clip advances here, at the frame-independent hook, so it
+         * keeps moving on the WAIT and no-frame ticks — which is exactly when
+         * a live stream has nothing to show and a recorded clip does.  It is
+         * also before the no-source return below, so browsing works with no
+         * camera attached.  The frame goes through the same set_viewing()
+         * override a saved still uses, so the live frame keeps painting
+         * underneath and Esc has nothing to swap back. */
+        if (playback.active) {
+            std::string why;
+            if (playback.advance(why)) {
+                const QImage frame(playback.buf.data(), playback.w, playback.h,
+                                   playback.w * 3, QImage::Format_RGB888);
+                win->set_viewing(frame.copy(),
+                                 QString::fromStdString(playback.view_label()));
+            }
+            if (!why.empty())
+                notice(why);
+        }
 
         if (!fs) {
             /* Bring-up failed, so there is no source to pull from — but the
@@ -2888,6 +3165,7 @@ static const key_line_t kKeyLines[] = {
     { "the device",  "  d r           device panel / retry\n" },
     { "capture",     "  s v           save a still / record a clip\n" },
     { "capture",     "  g o x         gallery: browse / open / export\n" },
+    { "capture",     "  space         pause / resume a playing clip\n" },
     { "the picture", "  1-0 , .       palette        u  unit\n" },
     { "the picture", "  t             range auto/fixed\n" },
     { "the picture", "  h H           flip horizontally / vertically\n" },
@@ -2950,6 +3228,7 @@ static int selftest(const opts &o)
     pm.sess = sess;
     pm.win  = &win;
     pm.mode = DYT_MODE_1000;
+    win.set_playback(&pm.playback);    /* borrowed, exactly as run_gui wires it */
     if (dyt_session_get_palette(sess, o.palette - 1, &pm.pal) != 0) {
         dyt_frame_source_close(fs);
         dyt_session_free(sess);
@@ -4173,7 +4452,7 @@ static int selftest(const opts &o)
             refreshes++;
             dyt_vm_gallery_load(win.gallery(), d2.c_str());
         };
-        win.on_gallery_open_   = [&](const dyt_vm_item_t *it) {
+        win.on_gallery_open_   = [&](const dyt_vm_item_t *it) -> bool {
             opens++;
             opened = it;
             /* Stand in for the real render, so the test can pin that closing
@@ -4181,6 +4460,7 @@ static int selftest(const opts &o)
             QImage probe(4, 4, QImage::Format_RGB888);
             probe.fill(Qt::black);
             win.set_viewing(probe, QStringLiteral("viewing test"));
+            return true;
         };
         win.on_gallery_export_ = [&](const dyt_vm_item_t *) { exports++; };
 
@@ -4271,7 +4551,7 @@ static int selftest(const opts &o)
         win.on_gallery_refresh_ = [&]() {
             dyt_vm_gallery_load(win.gallery(), dw.c_str());
         };
-        win.on_gallery_open_ = [&](const dyt_vm_item_t *) {};
+        win.on_gallery_open_ = [&](const dyt_vm_item_t *) { return true; };
         win.set_folder(QString::fromStdString(dw));
 
         /* Closed first, so the "with the panel" grab has a baseline. */
@@ -4356,7 +4636,7 @@ static int selftest(const opts &o)
         win.on_gallery_refresh_ = [&]() {
             dyt_vm_gallery_load(win.gallery(), dm.c_str());
         };
-        win.on_gallery_open_ = [&](const dyt_vm_item_t *) { opens++; };
+        win.on_gallery_open_ = [&](const dyt_vm_item_t *) { opens++; return true; };
 
         send_char('g');
         QApplication::processEvents();
@@ -4411,6 +4691,150 @@ static int selftest(const opts &o)
         }
         if (dirm)
             rmdir(dirm);
+    }
+
+    /* 59. A clip plays.  The reader itself is tools/player.{h,cpp} and its own
+     * test; what this pins is the window's half — that opening a clip starts
+     * playback, that the pump advances it and pushes the frame through the
+     * canvas override, that space pauses without losing the position, and that
+     * Esc stops it and returns to the live view.
+     *
+     * The clip is written from a solid magenta frame rather than from this
+     * session's render, so "the clip reached the screen" is decidable: no
+     * thermal palette produces magenta, so counting magenta pixels in a canvas
+     * grab cannot be confused with the live picture.  A diff against the live
+     * frame would prove nothing, because a clip recorded from this session *is*
+     * the live frame. */
+    {
+        char  tmplp[] = "/tmp/dytqt-play-XXXXXX";
+        char *dirp    = mkdtemp(tmplp);
+        const std::string dp = dirp ? dirp : ".";
+
+#ifdef DYT_HAVE_OPENCV
+        const int cw = 256, ch = 192;
+        std::vector<uint8_t> mag((size_t)cw * ch * 3);
+        for (size_t i = 0; i + 2 < mag.size(); i += 3) {
+            mag[i + 0] = 255;
+            mag[i + 1] = 0;
+            mag[i + 2] = 255;
+        }
+
+        std::string clip;
+        {
+            CaptureCtl  c;
+            std::string why;
+            c.dir = dp;
+            if (c.start(25.0, why)) {
+                clip = c.path;
+                for (int i = 0; i < 8; i++) {
+                    std::string f;
+                    if (!c.feed(mag.data(), cw, ch, f))
+                        break;
+                }
+            }
+            c.stop();
+        }
+
+        auto magenta = [](const QImage &im) {
+            int n = 0;
+            for (int y = 0; y < im.height(); y++)
+                for (int x = 0; x < im.width(); x++) {
+                    const QRgb p = im.pixel(x, y);
+                    if (qRed(p) > 220 && qGreen(p) < 60 && qBlue(p) > 220)
+                        n++;
+                }
+            return n;
+        };
+
+        QApplication::processEvents();
+        const int off_before = magenta(win.view()->grab().toImage());
+
+        std::string why;
+        const bool  opened  = pm.playback.open(clip, why);
+        const long long nf  = pm.playback.count;
+        const bool  named   = opened && nf == 8 &&
+                              pm.playback.label().find("playing") != std::string::npos;
+
+        /* The pump advances it — a few ticks is enough to see the position
+         * move and the canvas take the frame. */
+        for (int i = 0; i < 3; i++)
+            pm.step();
+        QApplication::processEvents();
+
+        const bool advanced = pm.playback.pos > 0;
+        /* The canvas sizes to the clip, not to the live frame under it. */
+        const bool sized = win.view()->sizeHint().height() == ch + 2 * kPad;
+        const bool shown = win.viewing();
+        const bool badge = !win.strip()->playback_label().isEmpty();
+        const int  on    = magenta(win.view()->grab().toImage());
+
+        /* Space pauses without losing the position. */
+        const long long held = pm.playback.pos;
+        send_char(' ');
+        for (int i = 0; i < 3; i++)
+            pm.step();
+        const bool paused = pm.playback.paused && pm.playback.pos == held &&
+                            pm.playback.label().find("paused") != std::string::npos;
+
+        /* Space resumes, and Esc stops it and returns to the live view. */
+        send_char(' ');
+        const bool resumed = !pm.playback.paused;
+        send_esc();
+        QApplication::processEvents();
+        const int  off_after = magenta(win.view()->grab().toImage());
+        const bool stopped   = !pm.playback.active && !win.viewing() &&
+                               win.strip()->playback_label().isEmpty();
+
+        /* And the reader refuses what is not a clip. */
+        {
+            FILE *f = fopen((dp + "/not-a-clip.dyt.jpg").c_str(), "wb");
+            if (f) { fputs("not a video", f); fclose(f); }
+        }
+        std::string why2;
+        const bool refused = !pm.playback.open(dp + "/not-a-clip.dyt.jpg", why2);
+
+        const bool ok = opened && named && advanced && sized && shown && badge &&
+                        on > 1000 && off_before < on / 10 && paused && resumed &&
+                        stopped && off_after < on / 10 && refused;
+        std::printf("  %-4s a clip plays, pauses and stops (open %s, %lld "
+                    "frames, moved %s, sized %s, magenta %d vs %d/%d, badge %s, "
+                    "paused %s, resumed %s, stopped %s, refused a still %s)\n",
+                    ok ? "ok" : "FAIL", opened ? "yes" : "NO", nf,
+                    advanced ? "yes" : "NO", sized ? "yes" : "NO", on,
+                    off_before, off_after, badge ? "yes" : "NO",
+                    paused ? "yes" : "NO", resumed ? "yes" : "NO",
+                    stopped ? "yes" : "NO", refused ? "yes" : "NO");
+        if (!ok) {
+            fails++;
+            if (!why.empty())
+                std::printf("       %s\n", why.c_str());
+        }
+#else
+        /* Without OpenCV there is no reader at all, so the refusal has to be
+         * the defined one — not a crash and not a silent no-op. */
+        std::string why;
+        const bool refused = !pm.playback.open(dp + "/x.mp4", why) &&
+                             why.find("OpenCV") != std::string::npos;
+        std::printf("  %-4s clip playback is refused without OpenCV "
+                    "(refused %s, says why %s)\n",
+                    refused ? "ok" : "FAIL", refused ? "yes" : "NO",
+                    why.find("OpenCV") != std::string::npos ? "yes" : "NO");
+        if (!refused)
+            fails++;
+#endif
+
+        {
+            DIR *dpp = opendir(dp.c_str());
+            for (struct dirent *e; dpp && (e = readdir(dpp)) != nullptr;) {
+                if (e->d_name[0] == '.')
+                    continue;
+                unlink((dp + "/" + e->d_name).c_str());
+            }
+            if (dpp)
+                closedir(dpp);
+        }
+        if (dirp)
+            rmdir(dirp);
     }
 
     /* 43. The view keys reach the session through the window: palette, the
@@ -5362,6 +5786,7 @@ static int run_gui(const opts &o_in, QApplication &app)
     pm.sess = sess;
     pm.win  = &win;
     pm.live = o.live;
+    win.set_playback(&pm.playback);    /* the window steers the pump's reader */
     if (dyt_session_get_palette(sess, o.palette - 1, &pm.pal) != 0) {
         dyt_session_free(sess);
         return 1;
@@ -5672,24 +6097,38 @@ static int run_gui(const opts &o_in, QApplication &app)
         return ok;
     };
 
-    win.on_gallery_open_ = [&](const dyt_vm_item_t *it) {
+    win.on_gallery_open_ = [&](const dyt_vm_item_t *it) -> bool {
         if (!it) {
             pm.notice("gallery: nothing selected");
-            return;
+            return false;
         }
+
+        /* Whatever was on the canvas goes, so a still opened over a playing
+         * clip is not overwritten by the next playback tick — and a clip
+         * opened over a still is not drawn under it.  The badge goes with it,
+         * so it cannot briefly claim a clip is playing after it stopped. */
+        pm.playback.stop();
+        win.strip()->set_playback(QString());
+
         if (it->kind != DYT_VM_ITEM_STILL) {
-            /* The port has no mp4 decoder wired in; saying so is better than
-             * pretending the clip opened. */
-            pm.notice("clip playback is not implemented; 'x' exports a still",
-                      200);
-            return;
+            /* A clip.  Opening it starts the reader; the pump advances it at
+             * its per-tick hook, and MainWindow has already hidden the list
+             * (a success return) so the clip fills the canvas.  The badge on
+             * the strip carries the position, and space pauses it. */
+            std::string why;
+            if (!pm.playback.open(it->path, why)) {
+                pm.notice(why, 200);
+                return false;           /* keep the list up */
+            }
+            pm.notice(std::string("playing ") + it->name, 150);
+            return true;
         }
 
         std::vector<uint8_t> rgb;
         int                  w = 0, h = 0;
         if (!render_still(it, rgb, w, h)) {
             pm.notice(std::string("cannot open ") + it->name, 200);
-            return;
+            return false;
         }
 
         dyt_vm_still_info_t info;
@@ -5701,6 +6140,7 @@ static int run_gui(const opts &o_in, QApplication &app)
         const QImage img(rgb.data(), w, h, w * 3, QImage::Format_RGB888);
         win.set_viewing(img.copy(), label);
         pm.notice(std::string("opened ") + it->name, 120);
+        return true;
     };
 
     win.on_gallery_export_ = [&](const dyt_vm_item_t *it) {
