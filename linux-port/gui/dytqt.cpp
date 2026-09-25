@@ -750,13 +750,16 @@ static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
  * diverge — both reach them through FrameView::measure_key().  Returns 1 when
  * the key was consumed.
  *
- * These are the reference viewer's bindings: one key per tool, "n" also
- * forgetting the placed points, "a" arming the derived band or disarming, "i"
- * toggling the isotherm.  The view keys (palette, unit, range, flip, zoom,
- * fusion) are deliberately not here; they are later tasks.  The
- * runtime-parameter ladder is a sibling (FrameView::param_key), because its
- * keys are case-sensitive and this function's are not.  The letters are free
- * of the device keys: retry is lowercase "r" and the panel toggle is "d". */
+ * These are the reference viewer's bindings: one key per tool ("o" is the
+ * polygon), "n" also forgetting the placed points, "a" arming the derived band
+ * or disarming, "i" toggling the isotherm.  The polygon adds two gestures of
+ * its own — Enter closes the outline and Backspace undoes a vertex — which are
+ * answered only while the polygon tool is up, so neither steals a key from
+ * anywhere else.  The view keys (palette, unit, range, flip, zoom, fusion) are
+ * deliberately not here; they are later tasks.  The runtime-parameter ladder is
+ * a sibling (FrameView::param_key), because its keys are case-sensitive and
+ * this function's are not.  The letters are free of the device keys: retry is
+ * lowercase "r" and the panel toggle is "d". */
 static int apply_measure_key(dyt_session_t *sess, int key)
 {
     dyt_snapshot_t s;
@@ -772,9 +775,10 @@ static int apply_measure_key(dyt_session_t *sess, int key)
     }
 
     switch (key) {
-    case 'p': dyt_session_set_tool(sess, DYT_TOOL_POINT); return 1;
-    case 'l': dyt_session_set_tool(sess, DYT_TOOL_LINE);  return 1;
-    case 'b': dyt_session_set_tool(sess, DYT_TOOL_BOX);   return 1;
+    case 'p': dyt_session_set_tool(sess, DYT_TOOL_POINT);   return 1;
+    case 'l': dyt_session_set_tool(sess, DYT_TOOL_LINE);    return 1;
+    case 'b': dyt_session_set_tool(sess, DYT_TOOL_BOX);     return 1;
+    case 'o': dyt_session_set_tool(sess, DYT_TOOL_POLYGON); return 1;
     case 'n':
         /* One key per tool, and "n" also forgets the placed points so the
          * next tool starts clean. */
@@ -794,6 +798,27 @@ static int apply_measure_key(dyt_session_t *sess, int key)
         dyt_session_set_isotherm(sess, !s.iso_on);
         return 1;
     }
+
+    /* The polygon's own gestures.  Enter finishes the outline so the next
+     * click starts a new one; Backspace takes the last vertex back, which is
+     * the only way to correct a misclick without losing the whole shape.
+     *
+     * Both are ours only while the polygon tool is up.  Enter belongs to the
+     * gallery otherwise, and Backspace must fall through to Qt rather than be
+     * swallowed, so this answers 0 for every other tool. */
+    if (key == 13 || key == Qt::Key_Return || key == Qt::Key_Enter ||
+        key == 8 || key == Qt::Key_Backspace) {
+        if (dyt_session_snapshot(sess, &s, nullptr, 0) != 0)
+            return 0;                  /* no frame: not a key we own */
+        if (s.tool != DYT_TOOL_POLYGON)
+            return 0;
+        if (key == 8 || key == Qt::Key_Backspace)
+            dyt_session_polygon_undo(sess);
+        else
+            dyt_session_set_polygon_closed(sess, 1);
+        return 1;
+    }
+
     return 0;
 }
 
@@ -1234,9 +1259,18 @@ public:
     {
         if (!apply_measure_key(sess_, k))
             return 0;
+        resnap();
+        return 1;
+    }
+
+    /* Re-read the scalars — and the polygon outline — so an overlay change
+     * shows at once rather than at the next tick.  The measurements are
+     * recomputed with it, so this is for one-off gestures (a key, a
+     * right-click), not for a drag. */
+    void resnap()
+    {
         if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0)
             update();
-        return 1;
     }
 
     /* Apply a view key — palette, unit, range, flip, zoom, fusion,
@@ -1515,6 +1549,20 @@ public:
 protected:
     void mousePressEvent(QMouseEvent *e) override
     {
+        /* The polygon's finish gesture.  Only the polygon has one, so every
+         * other tool keeps the right button free — and an unhandled
+         * right-click is passed on, which is what lets a future context menu
+         * exist without this having to change. */
+        if (e->button() == Qt::RightButton) {
+            if (snap_.tool == DYT_TOOL_POLYGON) {
+                dyt_session_set_polygon_closed(sess_, 1);
+                resnap();
+                e->accept();
+                return;
+            }
+            e->ignore();
+            return;
+        }
         if (e->button() != Qt::LeftButton) {
             e->ignore();
             return;
@@ -1754,6 +1802,48 @@ protected:
                     p.drawText(QPoint(r.left() + 4, r.top() - 6),
                                QString::fromUtf8(lbl));
                 }
+            } else if (snap_.tool == DYT_TOOL_POLYGON && snap_.poly_n > 0) {
+                /* The outline through the placed vertices.  While it is still
+                 * open a rubber band runs from the last vertex to the pointer,
+                 * so the user can see where the next click will land; a closed
+                 * outline has no next click and is drawn shut instead. */
+                QPolygon poly;
+                for (int i = 0; i < snap_.poly_n; i++) {
+                    QPoint q;
+                    if (proj(snap_.poly[i].x, snap_.poly[i].y, q))
+                        poly << q;
+                }
+                if (!snap_.poly_closed && ptr_.x >= 0)
+                    poly << QPoint(x0 + ptr_.x, y0 + ptr_.y);
+
+                const bool shut = snap_.poly_closed && poly.size() >= 3;
+
+                if (poly.size() >= 2) {
+                    p.setBrush(Qt::NoBrush);
+                    /* A dark stroke under the bright one, as the other tools
+                     * draw, so the shape reads on any picture. */
+                    for (int pass = 0; pass < 2; pass++) {
+                        p.setPen(pass == 0 ? QPen(QColor(0, 0, 0), 3) : mark);
+                        if (shut)
+                            p.drawPolygon(poly);
+                        else
+                            p.drawPolyline(poly);
+                    }
+                }
+
+                /* The vertices, the first one larger: it is where the shape
+                 * started, and Backspace undoes from the other end.  Only the
+                 * placed ones — the rubber band's end is not a vertex. */
+                p.setBrush(mark);
+                p.setPen(mark);
+                for (int i = 0; i < snap_.poly_n && i < poly.size(); i++)
+                    p.drawEllipse(poly[i], i == 0 ? 4 : 3, i == 0 ? 4 : 3);
+
+                if (snap_.roi_ok && !poly.isEmpty()) {
+                    char lbl[128];
+                    dyt_vm_roi_label(&snap_, lbl, sizeof lbl);
+                    p.drawText(poly[0] + QPoint(8, -8), QString::fromUtf8(lbl));
+                }
             }
         }
 
@@ -1851,9 +1941,17 @@ private:
         const QPointF org = display_origin();
         const int lx = (int)std::floor((pos.x() - org.x()) / s - kPad);
         const int ly = (int)std::floor((pos.y() - org.y()) / s - kPad);
-        dyt_vm_tool_mouse(sess_, &ptr_, ev, snap_.tool, &snap_.xform,
-                          snap_.width, snap_.height,
-                          img_.width(), img_.height(), lx, ly);
+        const int placed =
+            dyt_vm_tool_mouse(sess_, &ptr_, ev, snap_.tool, &snap_.xform,
+                              snap_.width, snap_.height,
+                              img_.width(), img_.height(), lx, ly);
+        /* The polygon is placed a click at a time and its outline lives in the
+         * snapshot, so a new vertex has to be read back before it can be drawn
+         * — and the fill with it.  The drag tools only move point 1, which the
+         * next tick picks up anyway, and a polygon *move* places nothing, so
+         * this costs one snapshot per click rather than one per mouse event. */
+        if (placed && snap_.tool == DYT_TOOL_POLYGON && sess_)
+            dyt_session_snapshot(sess_, &snap_, nullptr, 0);
         update();
     }
 
@@ -2480,7 +2578,7 @@ private:
 class ControlPanel : public QWidget {
 public:
     enum Id {
-        Spot = 0, Line, Rect, ToolNone,
+        Spot = 0, Line, Rect, Poly, ToolNone,
         Tracking, Alarm, Highlight,
         FlipH, FlipV, FixedRange,
         Still, Record, Gallery,
@@ -2573,6 +2671,7 @@ public:
         set(btn_[Spot],      snap.tool == DYT_TOOL_POINT);
         set(btn_[Line],      snap.tool == DYT_TOOL_LINE);
         set(btn_[Rect],      snap.tool == DYT_TOOL_BOX);
+        set(btn_[Poly],      snap.tool == DYT_TOOL_POLYGON);
         set(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE);
         set(btn_[Tracking],  hot_shown);
         set(btn_[Alarm],     snap.alarm_on != 0);
@@ -2695,7 +2794,7 @@ private:
         QGroupBox *meas = group(QStringLiteral("Temperature Measurement"));
         auto *mgrp = new QButtonGroup(this);
         mgrp->setExclusive(true);
-        for (Id i : { Spot, Line, Rect, ToolNone })
+        for (Id i : { Spot, Line, Rect, Poly, ToolNone })
             mgrp->addButton(row(meas, i, tool_label(i), tool_key(i), true));
         lay->addWidget(meas);
 
@@ -2793,6 +2892,7 @@ private:
         case Spot:     return QStringLiteral("Spot");
         case Line:     return QStringLiteral("Line");
         case Rect:     return QStringLiteral("Rectangle");
+        case Poly:     return QStringLiteral("Polygon");
         case ToolNone: return QStringLiteral("None");
         default:       return QString();
         }
@@ -2803,6 +2903,7 @@ private:
         case Spot:     return 'p';
         case Line:     return 'l';
         case Rect:     return 'b';
+        case Poly:     return 'o';
         case ToolNone: return 'n';
         default:       return 0;
         }
@@ -2833,6 +2934,17 @@ private:
         case Rect:
             p.drawRect(cx - 6, cy - 5, 12, 10);
             break;
+        case Poly: {
+            /* a pentagon, with the first vertex marked like the canvas does */
+            QPolygon poly;
+            poly << QPoint(cx,     cy - 7) << QPoint(cx + 6, cy - 2)
+                 << QPoint(cx + 4, cy + 6) << QPoint(cx - 4, cy + 6)
+                 << QPoint(cx - 6, cy - 2);
+            p.drawPolygon(poly);
+            p.setBrush(cyan);
+            p.drawEllipse(QPointF(cx, cy - 7), 2, 2);
+            break;
+        }
         case ToolNone:
             p.drawEllipse(QPointF(cx, cy), 6, 6);
             p.drawLine(cx - 5, cy + 5, cx + 5, cy - 5);
@@ -4488,13 +4600,15 @@ struct key_line_t {
 };
 
 static const key_line_t kKeyLines[] = {
-    { "measurement", "  p l b n       point / line / box / clear\n" },
+    { "measurement", "  p l b o n     point / line / box / polygon / clear\n" },
+    { "measurement", "  enter bksp    polygon: finish the outline / undo a vertex\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
     { "measurement", "  m             hottest/coldest markers on/off\n" },
     { "the device",  "  e A R D y     emissivity / ambient / reflected / distance, send\n" },
     { "the device",  "  d r           device panel / retry\n" },
     { "capture",     "  s v           save a still / record a clip\n" },
-    { "capture",     "  g o x         gallery: browse / open / export\n" },
+    { "capture",     "  g             gallery: browse\n" },
+    { "capture",     "  o enter x     (in the gallery) open / open / export\n" },
     { "capture",     "  space         pause / resume a playing clip\n" },
     { "the picture", "  1-0 , .       palette        u  unit\n" },
     { "the picture", "  t             range auto/fixed\n" },
@@ -5084,6 +5198,85 @@ static int selftest(const opts &o)
         std::printf("  %-4s the mouse places and drags through the widget "
                     "(%d,%d -> %d,%d)\n", ok ? "ok" : "FAIL",
                     s1.p0.x, s1.p0.y, s2.p1.x, s2.p1.y);
+        if (!ok)
+            fails++;
+    }
+
+    /* 24b. The polygon is placed a click at a time through the same widget,
+     * and its gestures are the window's: a click adds a vertex, Enter finishes
+     * the outline, Backspace takes a vertex back, and the right button
+     * finishes it too.
+     *
+     * The outline has to reach the overlay as well as the session, so the last
+     * check counts the mark colour on the canvas rather than sampling it — the
+     * same counting-not-sampling rule assertion 34 uses.  The difference is
+     * what is counted, not the absolute total: the colour bar is drawn from a
+     * palette that contains pure yellow, so an absolute count would be reading
+     * the palette as much as the outline. */
+    {
+        const int px[3] = { 20, 60, 20 };
+        const int py[3] = { 20, 20, 60 };
+        dyt_snapshot_t s{};
+
+        send_key(Qt::Key_O);            /* the polygon tool, by its key */
+
+        for (int i = 0; i < 3; i++)
+            send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
+                       Qt::LeftButton, px[i], py[i]);
+
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool tool     = s.tool == DYT_TOOL_POLYGON;
+        const bool placed   = s.poly_n == 3;
+        const bool measured = s.roi_ok && s.roi.n > 0;
+        const bool open     = s.poly_closed == 0;
+
+        /* Enter finishes the outline: it takes no more vertices, but it keeps
+         * measuring the ones it has. */
+        send_key(Qt::Key_Return);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool closed = s.poly_closed == 1 && s.poly_n == 3 && s.roi_ok;
+
+        /* Backspace takes the last vertex back and reopens the outline, so it
+         * can be added to again — the only way to correct a misclick without
+         * losing the whole shape. */
+        send_key(Qt::Key_Backspace);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool undone = s.poly_n == 2 && s.poly_closed == 0;
+
+        /* The right button finishes it too — but not a two-vertex outline,
+         * which is not a region yet. */
+        send_mouse(QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton,
+                   px[0], py[0]);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool refused = s.poly_closed == 0 && s.poly_n == 2;
+
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   px[2], py[2]);
+        send_mouse(QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton,
+                   px[0], py[0]);
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool shut = s.poly_closed == 1 && s.poly_n == 3;
+
+        /* And the outline is on the canvas, not only in the session. */
+        auto count_mark = [](const QImage &im) {
+            int n = 0;
+            for (int y = 0; y < im.height(); y++)
+                for (int x = 0; x < im.width(); x++)
+                    if (im.pixelColor(x, y) == QColor(255, 255, 0))
+                        n++;
+            return n;
+        };
+        const int painted = count_mark(win.view()->render_canvas());
+        send_key(Qt::Key_N);            /* clear: the outline goes with it */
+        const int cleared = count_mark(win.view()->render_canvas());
+
+        const bool ok = tool && placed && measured && open && closed &&
+                        undone && refused && shut &&
+                        painted > cleared + 60;
+        std::printf("  %-4s the polygon is placed a click at a time, and its "
+                    "outline is painted (3 clicks, closed, undone, "
+                    "right-button %s, %d mark px then %d)\n",
+                    ok ? "ok" : "FAIL", shut ? "yes" : "NO", painted, cleared);
         if (!ok)
             fails++;
     }
@@ -6452,8 +6645,9 @@ static int selftest(const opts &o)
 
     /* 50b. A control-panel button does what its key does.  The panel is the
      * Windows shell's route to the same actions the keyboard reaches and must
-     * not become a second implementation.  The Line button must move the
-     * session exactly as 'l' does, and None must clear exactly as 'n' does.
+     * not become a second implementation.  The Line and Polygon buttons must
+     * move the session exactly as 'l' and 'o' do, and None must clear exactly
+     * as 'n' does.
      * (The menu bar this assertion was paired with is gone; the panel is now
      * the only on-screen route for these, so the check stands on its own.) */
     {
@@ -6469,6 +6663,13 @@ static int selftest(const opts &o)
         dyt_session_snapshot(sess, &s, nullptr, 0);
         const bool moved = s.tool == DYT_TOOL_LINE;
 
+        QPushButton *poly = win.panel()
+            ? win.panel()->button(ControlPanel::Poly) : nullptr;
+        if (poly)
+            poly->click();
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const bool poly_on = s.tool == DYT_TOOL_POLYGON;
+
         QPushButton *none = win.panel()
             ? win.panel()->button(ControlPanel::ToolNone) : nullptr;
         if (none)
@@ -6476,10 +6677,12 @@ static int selftest(const opts &o)
         dyt_session_snapshot(sess, &s, nullptr, 0);
         const bool cleared = s.tool == DYT_TOOL_NONE;
 
-        const bool ok = start && line && moved && none && cleared;
+        const bool ok = start && line && moved && poly && poly_on &&
+                        none && cleared;
         std::printf("  %-4s a panel button reaches the session like its key "
-                    "(line %s, clear %s)\n", ok ? "ok" : "FAIL",
-                    moved ? "yes" : "NO", cleared ? "yes" : "NO");
+                    "(line %s, polygon %s, clear %s)\n", ok ? "ok" : "FAIL",
+                    moved ? "yes" : "NO", poly_on ? "yes" : "NO",
+                    cleared ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -7628,12 +7831,14 @@ static std::string help_text()
 
     s += "getting started\n";
     s += "  * Drag on the picture to place the selected tool (point, line or box)\n";
-    s += "    and read a temperature.  The reading appears in the strip below the\n";
-    s += "    picture, beside the frame's hottest and coldest pixels (marked H and\n";
-    s += "    L on the picture).\n";
-    s += "  * Everything the keys do is also on the menu bar and the toolbar, so a\n";
-    s += "    key you have forgotten can be found there.  The two cannot disagree:\n";
-    s += "    a menu item runs exactly what its key runs.\n";
+    s += "    and read a temperature.  The polygon is placed a click at a time\n";
+    s += "    instead: each click adds a vertex, Enter or the right button\n";
+    s += "    finishes the outline, and Backspace takes a vertex back.  The\n";
+    s += "    reading appears in the strip below the picture, beside the frame's\n";
+    s += "    hottest and coldest pixels (marked H and L on the picture).\n";
+    s += "  * Everything the keys do is also on the control panel down the right,\n";
+    s += "    so a key you have forgotten can be found there.  The two cannot\n";
+    s += "    disagree: a control runs exactly what its key runs.\n";
     s += "  * 's' saves a still and 'v' records a clip, into the capture directory\n";
     s += "    (the current directory by default); 'g' browses what has been saved.\n";
     s += "  * F11 is full screen.  The picture scales up to fill the screen, keeping\n";

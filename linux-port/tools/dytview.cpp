@@ -787,7 +787,8 @@ static void usage(const char *prog)
         "      s save a DYT still (picture + raw payload) · w save a PNG of the\n"
         "      whole window\n"
         "      p point · l line · b box · o polygon (click per vertex,\n"
-        "      right-click or Enter to close) · n clear (click/drag to place)\n"
+        "      right-click or Enter to close, Backspace to undo a vertex)\n"
+        "      n clear (click/drag to place)\n"
         "      a alarm on/off · i isotherm (alarm band) overlay\n"
         "      f cycle fusion · [ ] align visible X · ; ' align visible Y\n"
         "      d device-info panel (serial + stored parameters)\n"
@@ -1096,11 +1097,14 @@ int main(int argc, char **argv)
                 dyt_session_clear_points(v.sess);
         } else if ((key == 13 || key == 10) && v.tool == DYT_TOOL_POLYGON) {
             /* Enter closes the outline, so the next click starts a new one
-             * instead of extending the shape just finished.  Kept out of the
-             * tool chain above because it is a polygon gesture, not a tool
-             * key — and "e" is already emissivity. */
+             * instead of extending the shape just finished.  A polygon
+             * gesture rather than a tool key, which is why it is not in the
+             * chain above. */
             dyt_session_set_polygon_closed(v.sess, 1);
-        } else if (key == 'z' && v.tool == DYT_TOOL_POLYGON) {
+        } else if (key == 8 && v.tool == DYT_TOOL_POLYGON) {
+            /* Backspace takes the last vertex back.  Not "z": that is the
+             * super-resolution key, and a polygon tool that shadowed it would
+             * be the only way to lose the binding. */
             dyt_session_polygon_undo(v.sess);
         } else if (key == 'a') {
             /* Arm the alarm across the middle of whatever range is on

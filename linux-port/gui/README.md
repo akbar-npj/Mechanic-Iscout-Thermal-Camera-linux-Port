@@ -54,19 +54,32 @@ against the session.
 
 `ControlPanel` is the Windows counterpart's right column: a `QTabWidget` whose
 **Troubleshoot** tab holds four checkable `QGroupBox`es — Temperature
-Measurement (Spot / Line / Rectangle / None), High Temperature (Tracking /
-Alarm / Highlight), Image Enhancement (the two flips and Fixed range) and
-Capture (Still / Record / Gallery). Only groups the engine backs are present:
-the reference's Polygon, Chart and 3D rows are absent rather than
+Measurement (Spot / Line / Rectangle / Polygon / None), High Temperature
+(Tracking / Alarm / Highlight), Image Enhancement (the two flips and Fixed
+range) and Capture (Still / Record / Gallery). Only groups the engine backs are
+present: the reference's Chart and 3D rows are absent rather than
 present-and-dead, so nothing on screen is a control that does nothing.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
-cannot drift — assertion 50b triggers the Line button and requires the session
-to move exactly as `l` does. The checkmarks come from the snapshot in
-`sync()`, never from the button's own toggle, for the same reason
+cannot drift — assertion 50b triggers the Line and Polygon buttons and requires
+the session to move exactly as `l` and `o` do. The checkmarks come from the
+snapshot in `sync()`, never from the button's own toggle, for the same reason
 `sync_actions()` does it: a key the session refused must not leave a button lit.
 No control takes focus, for the reason above.
+
+**Polygon** is placed a click at a time rather than by dragging, which is the one
+place the tools differ: each click adds a vertex, Enter or the right button
+finishes the outline, and Backspace takes a vertex back. The region is measured
+from the third vertex on, so there is no "commit" step, and the outline is drawn
+with a rubber band from the last vertex to the pointer while it is still open.
+The fill is `dyt_measure_polygon()` — an even-odd scanline, so a concave polygon
+fills correctly and the winding direction does not matter — and it is the box
+tool's convention extended, not a second one: the outline `(x0,y0) (x1+1,y0)
+(x1+1,y1+1) (x0,y1+1)` covers exactly the pixels the box `(x0,y0)-(x1,y1)` does
+(`measure_test` pins the two against each other). Assertion 24b drives the whole
+gesture through the widget and counts the mark colour on the canvas, so the
+outline is required to be *painted* and not merely stored.
 
 **Tracking** is a new binding: `m` hides and shows the frame's hottest/coldest
 markers (`FrameView::toggle_hot()`), which the reference viewer always draws.
@@ -515,8 +528,10 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 
 | key | effect |
 |---|---|
-| `p` / `l` / `b` | point / line / box |
-| `n` | no tool, and forget the placed points |
+| `p` / `l` / `b` / `o` | point / line / box / polygon |
+| `n` | no tool, and forget the placed points and the polygon outline |
+| Enter / right button | finish the polygon outline |
+| Backspace | take back the last polygon vertex |
 | `a` | arm the alarm, or disarm it if already armed |
 | `i` | toggle the isotherm |
 | `m` | show or hide the hottest/coldest markers |
@@ -1000,17 +1015,17 @@ and not a thing that is only ever run by hand.
 ```
 $ ./build/dytqt --selftest
   ok   painted the requested 25 frame(s) (got 25)
-  ok   the frame path fits the 40 ms budget at 25 fps (worst step 1.1 ms)
+  ok   the frame path fits the 40 ms budget at 25 fps (worst step 0.9 ms)
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (1172x533, 64 distinct colours)
-  ok   the canvas is not clipped (660x400, wants 660x400)
+  ok   the canvas painted (1172x560, 64 distinct colours)
+  ok   the canvas is not clipped (660x504, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
-        line 2: tool: none (p point, l line, b box, n clear)
-        line 3: range auto   |   FIXTURE  1045.5 fps
-  ok   line 3 names the source ("range auto   |   FIXTURE  1045.5 fps")
+        line 2: tool: none (p point, l line, b box, o polygon, n clear)
+        line 3: range auto   |   FIXTURE  875.2 fps
+  ok   line 3 names the source ("range auto   |   FIXTURE  875.2 fps")
   ok   the range mode reaches the snapshot (auto -> fixed -> auto)
   ok   the engine names the range modes ("auto", "fixed")
   ok   the fps meter is exact (25.0 fps)
@@ -1026,6 +1041,7 @@ $ ./build/dytqt --selftest
   ok   the retry backoff doubles to a cap, then gives up (0.5, 1.0, ..., 30.0, stop)
   ok   the tool keys reach the session (line/point/box/clear all route)
   ok   the mouse places and drags through the widget (20,15 -> 45,35)
+  ok   the polygon is placed a click at a time, and its outline is painted (3 clicks, closed, undone, right-button yes, 276 mark px then 0)
   ok   the alarm key arms the derived band, then disarms (31.7..32.1)
   ok   the isotherm key toggles the overlay
   ok   the strip reports the measurement ("box (10,10)-(60,50) n=2091")
@@ -1035,7 +1051,7 @@ $ ./build/dytqt --selftest
   ok   y sends the armed value and a refusal keeps it armed (send yes, keep yes)
   ok   the device panel rows and the override `*` (rows yes, override yes, failed-write yes)
   ok   the device panel is painted over the image (fill yes, toggle yes, covers yes)
-  ok   the confirmation is painted only while armed (idle 0, armed 7048, cancelled 0)
+  ok   the confirmation is painted only while armed (idle 0, armed 7378, cancelled 0)
   ok   q quits and is never swallowed (idle yes, armed yes)
   ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
   ok   a still writes the container and the PNG (wrote yes, 1 + 1, sized yes)
@@ -1045,24 +1061,24 @@ $ ./build/dytqt --selftest
   ok   a clip is refused where there is no disk (refused yes, says why yes)
   ok   the capture keys route (still 1, record 1)
   ok   the gallery keys browse, open and export (open yes, move yes, swallow yes, opened 1, hid yes, exported 1, closed yes, back to live yes)
-  ok   the gallery is a real widget: up on 'g', painted and still up in fullscreen, names the folder (shown yes, folder yes, fullscreen yes, painted 9800 px, back yes, hidden yes)
+  ok   the gallery is a real widget: up on 'g', painted and still up in fullscreen, names the folder (shown yes, folder yes, fullscreen yes, painted 4760 px, back yes, hidden yes)
   ok   the gallery takes the mouse (rows 2, click selects yes, double-click opens yes)
   ok   a clip plays, pauses and stops (open yes, 8 frames, moved yes, sized yes, magenta 49152 vs 0/0, badge yes, paused yes, resumed yes, stopped yes, refused a still yes)
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x533 yes)
-  ok   a panel button reaches the session like its key (line yes, clear yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x560 yes)
+  ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the control panel cannot take the keyboard (16 control(s), 0 that would)
+  ok   the control panel cannot take the keyboard (17 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, tutorials yes, pending yes)
-  ok   the control panel asks for its content's height (panel 533 of 533, page 620 of 507, shrinks yes, keeps yes, scrolls yes)
+  ok   the control panel asks for its content's height (panel 560 of 560, page 620 of 534, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
 === ALL PASS ===
@@ -1082,7 +1098,7 @@ pass vacuously:
   relation it checks would hold for an untransformed frame too, and would prove
   nothing.
 
-The `1045.5 fps` on line 3 is not a bug — `--selftest` paces nothing, so it runs
+The `875.2 fps` on line 3 is not a bug — `--selftest` paces nothing, so it runs
 the 25 frames as fast as it can (the figure is whatever the machine manages, so
 it differs run to run). Assertion 9 checks the *label* there and assertion 12
 pins the arithmetic instead.
@@ -1108,8 +1124,18 @@ measurement. The expected source pixel comes from `dyt_view_transform_map()`
 itself, so they pin the *routing* (that a widget coordinate reaches
 `dyt_vm_tool_mouse()` with the right `dst` size) rather than the transform, which
 assertion 16 already covers. The measurement overlay's *painting* is deliberately
-not asserted: a pixel check on a drawn rectangle is brittle, so it was verified by
-eye from a fixture render instead.
+not asserted for the box and the line: a pixel check on a drawn rectangle is
+brittle, so it was verified by eye from a fixture render instead.
+
+**24b** is the polygon, and it is the one that does assert a measurement
+overlay's painting — by *counting* the mark colour with the outline placed and
+again after `n`, so what is compared is the difference the outline makes rather
+than an edge pixel that a one-pixel shift would move. The colour bar is drawn
+from a palette that contains pure yellow, which is why the difference is counted
+rather than the total. It also drives the whole gesture through the widget:
+three clicks, Enter to finish the outline, Backspace to take a vertex back, and
+the right button to finish it — including that the right button does *nothing*
+to a two-vertex outline, which is not yet a region.
 
 Assertions 28–35 cover the runtime-parameter ladder and the device panel, and they
 are the reason the arming state lives in `FrameView` rather than in the front end:
