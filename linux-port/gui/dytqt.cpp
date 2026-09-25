@@ -2555,12 +2555,226 @@ private:
     QPushButton *btn_[N_RailItems] = {};
 };
 
+/* ------------------------------------------------------- the analysis chart
+ *
+ * The Analysis group's plot.  The reference's group has two rows over one
+ * chart, and their labels are the reading: **Line** is the line itself — the
+ * temperature along the placed line, from dyt_measure_line, a slice through
+ * space — and **Chart analysis** is the analysis *of* that curve: the same
+ * samples with the statistics drawn on them (the mean and median rules, and
+ * the peak picked out with its value).  Neither is a second data source, which
+ * is why one widget carries both.
+ *
+ * Hand-painted rather than Qt Charts: that is a separate module for one plot,
+ * and the drawing is a polyline and a few labels.
+ *
+ * The samples arrive from the window rather than being read here, so this
+ * widget holds no session and no lock.  It is fed once per painted frame, and
+ * the statistics are computed there rather than in paintEvent — a sort inside a
+ * paint is a sort per repaint, and repaints do not happen at the frame rate.
+ */
+static const int kPlotH     = 76;   /* the curve and one row of labels */
+static const int kPlotAxisW = 44;   /* the value labels' gutter */
+static const int kPlotW     = 300;  /* a preference; the panel sets the width */
+
+class ProfilePlot : public QWidget {
+public:
+    enum Mode { Line = 0, Analysis };
+
+    explicit ProfilePlot(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setFixedHeight(kPlotH);
+        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        setFocusPolicy(Qt::NoFocus);   /* see ControlPanel's comment */
+        setToolTip(QStringLiteral(
+            "x: pixels along the line · y: temperature"));
+    }
+
+    /* Install a profile: `n` samples in Celsius, NaN where the sample was off
+     * the image (measure.h), which is drawn as a gap rather than a zero.
+     *
+     * n <= 0, or a profile with no finite sample, clears back to the
+     * placeholder — a curve of nothing is not a curve, and drawing a flat line
+     * at 0 C would be inventing a reading.  `unit` is only for the labels; the
+     * samples stay Celsius, as everywhere else. */
+    void set_profile(const float *v, int n, dyt_unit_t unit);
+
+    void set_mode(Mode m) { mode_ = m; update(); }
+    Mode mode() const { return mode_; }
+
+    /* The index of the highest finite sample, or -1 when there is none: the
+     * peak the chart marks, exposed for --selftest. */
+    int peak_bin() const { return peak_; }
+
+    QSize sizeHint() const override { return QSize(kPlotW, kPlotH); }
+
+protected:
+    void paintEvent(QPaintEvent *) override;
+
+private:
+    QVector<float> v_;
+    int            peak_   = -1;
+    float          lo_     = 0.f, hi_ = 0.f;
+    float          mean_   = 0.f, median_ = 0.f;
+    dyt_unit_t     unit_   = DYT_UNIT_C;
+    Mode           mode_   = Line;
+};
+
+void ProfilePlot::set_profile(const float *v, int n, dyt_unit_t unit)
+{
+    v_.clear();
+    peak_ = -1;
+    mean_ = median_ = 0.f;
+    unit_ = unit;
+
+    if (v && n > 0) {
+        QVector<float> sorted;
+        double         sum  = 0.0;
+        float          mn   = 0.f, mx = 0.f;
+        int            seen = 0;
+
+        sorted.reserve(n);
+        for (int i = 0; i < n; i++) {
+            if (!std::isfinite(v[i]))
+                continue;               /* off the image: a gap, not a zero */
+            /* Strict > keeps the *first* maximum, the same tie-break
+             * dyt_frame_stats() uses — so the peak this marks is the pixel the
+             * H marker does, not a second opinion about it. */
+            if (seen == 0 || v[i] < mn) mn = v[i];
+            if (seen == 0 || v[i] > mx) { mx = v[i]; peak_ = i; }
+            sum += v[i];
+            sorted.append(v[i]);
+            seen++;
+        }
+
+        if (seen > 0) {
+            /* Every sample is kept, NaN included, so a gap stays where it is
+             * on the x-axis instead of the line closing up around it. */
+            v_.resize(n);
+            for (int i = 0; i < n; i++)
+                v_[i] = v[i];
+
+            mean_ = (float)(sum / (double)seen);
+            std::sort(sorted.begin(), sorted.end());
+            median_ = (seen & 1)
+                          ? sorted[seen / 2]
+                          : 0.5f * (sorted[seen / 2 - 1] + sorted[seen / 2]);
+
+            /* A flat profile would divide by zero, and a nearly-flat one would
+             * fill the plot with rounding noise; give it half a degree either
+             * side so the line sits across the middle. */
+            if (mx - mn < 0.05f) { mn -= 0.5f; mx += 0.5f; }
+            lo_ = mn;
+            hi_ = mx;
+        }
+    }
+    update();
+}
+
+void ProfilePlot::paintEvent(QPaintEvent *)
+{
+    QPainter p(this);
+    const QRect r = rect().adjusted(0, 0, -1, -1);
+
+    p.fillRect(rect(), QColor(QStringLiteral("#0d161d")));
+    p.setPen(QColor(QStringLiteral("#2a3a45")));
+    p.drawRect(r);
+
+    if (v_.isEmpty()) {
+        p.setPen(QColor(120, 132, 142));
+        p.drawText(rect(), Qt::AlignCenter,
+                   QStringLiteral("place a line to see its profile"));
+        return;
+    }
+
+    /* The plot area: a gutter on the left for the value labels and a row at
+     * the bottom for the sample positions. */
+    const QRect plot(r.left() + kPlotAxisW, r.top() + 4,
+                     r.width() - kPlotAxisW - 6, r.height() - 20);
+
+    const double span = (double)(hi_ - lo_) > 0 ? (double)(hi_ - lo_) : 1.0;
+    const int    n    = (int)v_.size();
+
+    auto xmap = [&](int i) {
+        return plot.left() + (n <= 1
+                   ? 0
+                   : (int)std::lround((double)i * (plot.width() - 1)
+                                      / (double)(n - 1)));
+    };
+    auto ymap = [&](float c) {
+        return plot.bottom() - (int)std::lround(
+            ((double)c - (double)lo_) / span * (plot.height() - 1));
+    };
+
+    /* Three rules: the axis's top, middle and bottom.  The curve's own range
+     * *is* the axis, so the top and bottom rules are its min and max. */
+    p.setPen(QColor(QStringLiteral("#233039")));
+    p.drawLine(plot.left(), plot.top(), plot.right(), plot.top());
+    p.drawLine(plot.left(), plot.center().y(), plot.right(), plot.center().y());
+    p.drawLine(plot.left(), plot.bottom(), plot.right(), plot.bottom());
+
+    /* The curve.  A NaN sample breaks the path rather than being interpolated
+     * across, so a line that leaves the image shows as a gap. */
+    QPainterPath path;
+    bool         open = false;
+    for (int i = 0; i < n; i++) {
+        if (!std::isfinite(v_[i])) { open = false; continue; }
+        const QPointF q(xmap(i), ymap(v_[i]));
+        if (open) path.lineTo(q);
+        else    { path.moveTo(q); open = true; }
+    }
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(QPen(QColor(QStringLiteral("#00b4d8")), 1.4));
+    p.setBrush(Qt::NoBrush);
+    p.drawPath(path);
+    p.setRenderHint(QPainter::Antialiasing, false);
+
+    char b[32];
+
+    if (mode_ == Analysis) {
+        /* The statistics as rules across the curve — the mean solid and the
+         * median dotted, so a skewed profile shows as the gap between them —
+         * and the peak marked where it is. */
+        p.setPen(QPen(QColor(QStringLiteral("#e0a020")), 1, Qt::DashLine));
+        p.drawLine(plot.left(), ymap(mean_), plot.right(), ymap(mean_));
+        p.setPen(QPen(QColor(QStringLiteral("#7ac0a0")), 1, Qt::DotLine));
+        p.drawLine(plot.left(), ymap(median_), plot.right(), ymap(median_));
+
+        if (peak_ >= 0) {
+            const QPoint q(xmap(peak_), ymap(v_[peak_]));
+            p.setPen(QPen(QColor(0, 0, 0), 3));
+            p.drawEllipse(q, 4, 4);
+            p.setPen(QColor(QStringLiteral("#ffd166")));
+            p.drawEllipse(q, 4, 4);
+            dyt_temp_format(unit_, v_[peak_], b, sizeof b);
+            p.drawText(q + QPoint(7, -5), QString::fromUtf8(b));
+        }
+    }
+
+    /* The axis labels: the range in the gutter, the sample positions along the
+     * bottom.  Left-aligned in the gutter so a long value cannot push the plot
+     * around. */
+    p.setPen(QColor(140, 152, 162));
+    const int gw = kPlotAxisW - 8;
+    dyt_temp_format(unit_, hi_, b, sizeof b);
+    p.drawText(QRect(r.left() + 3, plot.top() - 7, gw, 14),
+               Qt::AlignLeft | Qt::AlignVCenter, QString::fromUtf8(b));
+    dyt_temp_format(unit_, lo_, b, sizeof b);
+    p.drawText(QRect(r.left() + 3, plot.bottom() - 7, gw, 14),
+               Qt::AlignLeft | Qt::AlignVCenter, QString::fromUtf8(b));
+
+    const QRect foot(plot.left(), plot.bottom() + 3, plot.width(), 14);
+    p.drawText(foot, Qt::AlignLeft | Qt::AlignVCenter,
+               QStringLiteral("0"));
+    p.drawText(foot, Qt::AlignRight | Qt::AlignVCenter,
+               QString::number(n - 1));
+}
+
 /* ---------------------------------------------------------- the control panel
  *
  * The Windows counterpart's right panel (manual p.5, /tmp/pdfx/w-08.png): a
  * narrow tabbed column of grouped controls.  Only the groups the engine backs
- * are present — the reference's Polygon/Chart/3D rows are absent rather than
- * present-and-dead, so nothing on screen is a control that does nothing.
+ * are present, so nothing on screen is a control that does nothing.
  *
  * Every row runs the same handle_key the keyboard does (through on_key), so a
  * button is a second route to the same action, never a second implementation.
@@ -2579,6 +2793,7 @@ class ControlPanel : public QWidget {
 public:
     enum Id {
         Spot = 0, Line, Rect, Poly, ToolNone,
+        AnalysisLine, AnalysisChart,
         Tracking, Alarm, Highlight,
         FlipH, FlipV, FixedRange,
         Still, Record, Gallery,
@@ -2673,6 +2888,11 @@ public:
         set(btn_[Rect],      snap.tool == DYT_TOOL_BOX);
         set(btn_[Poly],      snap.tool == DYT_TOOL_POLYGON);
         set(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE);
+        /* The Analysis pair tracks the chart's mode, not the tool: "Chart
+         * analysis" leaves the line tool selected, so a tool-derived checkmark
+         * would light the wrong row. */
+        set(btn_[AnalysisLine],  plot_ && plot_->mode() == ProfilePlot::Line);
+        set(btn_[AnalysisChart], plot_ && plot_->mode() == ProfilePlot::Analysis);
         set(btn_[Tracking],  hot_shown);
         set(btn_[Alarm],     snap.alarm_on != 0);
         set(btn_[Highlight], snap.iso_on != 0);
@@ -2726,6 +2946,29 @@ public:
 
     /* The page's live status line, for the selftest to read back. */
     QLabel *sr_status() const { return sr_status_; }
+
+    /* ---- the Analysis chart ---------------------------------------------
+     * The mode is a *panel* flag rather than a session one: the chart is a way
+     * of looking at the measurement, not a measurement, and the two rows that
+     * select it are the only things that read it.  The window sets it from the
+     * same keys the rows send, so a click and a key cannot disagree. */
+    ProfilePlot *plot() const { return plot_; }
+
+    void set_chart_mode(ProfilePlot::Mode m)
+    {
+        if (plot_)
+            plot_->set_mode(m);
+    }
+
+    /* Feed the chart: the profile (n samples, NaN for an off-image point, or
+     * NULL for none) and the unit its labels are drawn in.  Called once per
+     * painted frame with the profile the window just read from the session, so
+     * the widget itself holds no session and takes no lock. */
+    void sync_analysis(const dyt_snapshot_t &snap, const float *line, int n)
+    {
+        if (plot_)
+            plot_->set_profile(line, n, snap.unit);
+    }
 
     /* The key that turns super-resolution off from the mode the session is
      * holding.  Each of 'z' and 'Z' toggles *its own* plane, so neither alone
@@ -2797,6 +3040,24 @@ private:
         for (Id i : { Spot, Line, Rect, Poly, ToolNone })
             mgrp->addButton(row(meas, i, tool_label(i), tool_key(i), true));
         lay->addWidget(meas);
+
+        /* Analysis — one chart, two presentations of it, in the reference's
+         * order and with its labels.  The reference's manual never describes
+         * the panel, so the labels are read literally: "Line" is the line,
+         * "Chart analysis" is the analysis *of* it.  Both select the line tool
+         * as well, because a line chart with no line has nothing to show, and
+         * 'l' is the tool key — so the row and the key do exactly the same
+         * thing, which is the rule every other row follows. */
+        QGroupBox *ana = group(QStringLiteral("Analysis"));
+        auto *agrp = new QButtonGroup(this);
+        agrp->setExclusive(true);
+        agrp->addButton(row(ana, AnalysisLine, QStringLiteral("Line"),
+                            'l', true));
+        agrp->addButton(row(ana, AnalysisChart, QStringLiteral("Chart analysis"),
+                            'c', true));
+        plot_ = new ProfilePlot(ana);
+        qobject_cast<QVBoxLayout *>(ana->layout())->addWidget(plot_);
+        lay->addWidget(ana);
 
         QGroupBox *hot = group(QStringLiteral("High Temperature"));
         row(hot, Tracking,  QStringLiteral("High TEMP. Tracking"), 'm', true);
@@ -2949,6 +3210,22 @@ private:
             p.drawEllipse(QPointF(cx, cy), 6, 6);
             p.drawLine(cx - 5, cy + 5, cx + 5, cy - 5);
             break;
+        case AnalysisLine: {
+            /* a chart frame with a profile in it */
+            p.drawRect(cx - 7, cy - 6, 14, 12);
+            p.drawLine(cx - 7, cy + 2, cx - 3, cy - 2);
+            p.drawLine(cx - 3, cy - 2, cx + 1, cy + 2);
+            p.drawLine(cx + 1, cy + 2, cx + 6, cy - 4);
+            break;
+        }
+        case AnalysisChart: {
+            /* the same frame, with the statistics drawn across it */
+            p.drawRect(cx - 7, cy - 6, 14, 12);
+            p.drawLine(cx - 7, cy - 2, cx + 6, cy - 2);
+            p.setPen(QPen(cyan, 1.3, Qt::DashLine));
+            p.drawLine(cx - 7, cy + 2, cx + 6, cy + 2);
+            break;
+        }
         case Tracking:
             p.drawEllipse(QPointF(cx, cy), 4, 4);
             p.drawLine(cx - 7, cy, cx - 2, cy);
@@ -3044,6 +3321,7 @@ private:
 
     QTabWidget  *tabs_ = nullptr;
     QPushButton *btn_[N_Ids] = {};
+    ProfilePlot *plot_ = nullptr;        /* the Analysis group's chart */
     QLabel      *sr_status_ = nullptr;   /* the Super Resolution tab's readout */
     /* The mode the last sync reported, so the Off row knows which key means
      * "off" from where the session is.  Kept as the last *synced* mode rather
@@ -4155,6 +4433,25 @@ public:
         int k = raw;
         if (k >= 'A' && k <= 'Z')
             k += 'a' - 'A';
+
+        /* The Analysis group's chart, above the tool keys because 'l' is one
+         * of them: the row and the key must move the chart the same way, and
+         * the rows route exactly these two keys.  'l' falls through to the
+         * tool dispatch below, which is what selects the line; 'c' is consumed
+         * here, and picks the line tool up on its way through the same
+         * dispatch — a chart with no line has nothing to show, and a row that
+         * only lights up is the dead control the on-screen-controls rule
+         * exists to prevent. */
+        if (panel_ && (k == 'l' || k == 'c')) {
+            panel_->set_chart_mode(k == 'c' ? ProfilePlot::Analysis
+                                            : ProfilePlot::Line);
+            if (k == 'c') {
+                if (view_)
+                    view_->measure_key('l');
+                return 1;
+            }
+        }
+
         if (view_ && view_->measure_key(k))
             return 1;
 
@@ -4282,6 +4579,17 @@ private:
             panel_->sync(snap_, view_ && view_->hot_shown(),
                          strip_ && !strip_->recording_label().isEmpty(),
                          gal_.open != 0);
+
+        /* The Analysis chart.  The profile is read here rather than in the
+         * panel, so the widget stays free of the session and its lock — and
+         * because this is the only place that has the session at all.  A
+         * profile the session refuses (no frame, no line tool) is passed as
+         * none, which puts the chart back to its placeholder. */
+        if (panel_) {
+            float prof[DYT_PROFILE_MAX];
+            int   n = sess_ ? dyt_session_profile(sess_, prof, DYT_PROFILE_MAX) : 0;
+            panel_->sync_analysis(snap_, n > 0 ? prof : nullptr, n > 0 ? n : 0);
+        }
 
         /* The rail's Mark, by the same rule: a rail button is checkable, so a
          * click that unchecked it would leave the mark disagreeing with the
@@ -4602,6 +4910,7 @@ struct key_line_t {
 static const key_line_t kKeyLines[] = {
     { "measurement", "  p l b o n     point / line / box / polygon / clear\n" },
     { "measurement", "  enter bksp    polygon: finish the outline / undo a vertex\n" },
+    { "measurement", "  c             Analysis: annotate the line's chart\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
     { "measurement", "  m             hottest/coldest markers on/off\n" },
     { "the device",  "  e A R D y     emissivity / ambient / reflected / distance, send\n" },
@@ -5277,6 +5586,91 @@ static int selftest(const opts &o)
                     "outline is painted (3 clicks, closed, undone, "
                     "right-button %s, %d mark px then %d)\n",
                     ok ? "ok" : "FAIL", shut ? "yes" : "NO", painted, cleared);
+        if (!ok)
+            fails++;
+    }
+
+    /* 24c. The Analysis chart plots the line's profile, and the peak it marks
+     * is the frame's own hot pixel.  The line is drawn along the row that pixel
+     * is in and right across the image, so sample i is source x = i — which
+     * makes the peak bin the hot pixel's own column, a number taken from the
+     * snapshot rather than from the chart.
+     *
+     * "Chart analysis" has to change what is *drawn*, not only what is checked,
+     * so the two modes are compared by the pixels of the peak marker — which
+     * only the annotated one has, and which no palette produces. */
+    {
+        pm.step();
+        QApplication::processEvents();
+
+        dyt_snapshot_t s{};
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+        const QSize is = win.view()->imageSize();
+        const int   hy = s.stats.hot_y;
+
+        /* The canvas coordinates of the row's two ends, so the line lands on
+         * the source pixels the assertion reasons in whatever the transform. */
+        int ax = 0, ay = 0, bx = 0, by = 0;
+        const bool ends =
+            dyt_view_transform_project(&s.xform, s.width, s.height,
+                                       is.width(), is.height(),
+                                       0, hy, &ax, &ay) == 0 &&
+            dyt_view_transform_project(&s.xform, s.width, s.height,
+                                       is.width(), is.height(),
+                                       s.width - 1, hy, &bx, &by) == 0;
+
+        send_key(Qt::Key_L);                    /* the line tool */
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   ax, ay);
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, bx, by);
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   bx, by);
+
+        pm.step();                              /* the chart is fed on paint */
+        QApplication::processEvents();
+
+        ProfilePlot *plot = win.panel() ? win.panel()->plot() : nullptr;
+        const bool peak = plot && plot->peak_bin() == s.stats.hot_x;
+
+        auto count_marker = [](const QImage &im) {
+            int n = 0;
+            for (int y = 0; y < im.height(); y++)
+                for (int x = 0; x < im.width(); x++)
+                    if (im.pixelColor(x, y) == QColor(255, 209, 102))
+                        n++;
+            return n;
+        };
+
+        const int bare = plot ? count_marker(plot->grab().toImage()) : -1;
+
+        send_key(Qt::Key_C);                    /* the annotated chart */
+        const bool analysis = win.panel() && win.panel()->plot() &&
+                              win.panel()->plot()->mode() == ProfilePlot::Analysis;
+        const int annotated = plot ? count_marker(plot->grab().toImage()) : -1;
+
+        send_key(Qt::Key_L);                    /* and back to the curve */
+        const bool back = win.panel() && win.panel()->plot() &&
+                          win.panel()->plot()->mode() == ProfilePlot::Line;
+
+        /* "Chart analysis" picks the line tool up with the chart.  Cleared
+         * first, so the check is not satisfied by the tool the assertion
+         * placed the line with. */
+        send_key(Qt::Key_N);                    /* drop the tool */
+        send_key(Qt::Key_C);                    /* and ask for the chart */
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+        const bool picks = s2.tool == DYT_TOOL_LINE;
+
+        send_key(Qt::Key_L);                    /* leave it as it was found */
+
+        const bool ok = ends && peak && analysis && back && picks &&
+                        bare == 0 && annotated > 0;
+        std::printf("  %-4s the Analysis chart plots the line's profile and "
+                    "marks its peak (peak bin %d of hot x %d, chart %s, "
+                    "picks line %s, marker %d px then %d)\n", ok ? "ok" : "FAIL",
+                    plot ? plot->peak_bin() : -1, s.stats.hot_x,
+                    analysis ? "analysis" : "NO", picks ? "yes" : "NO",
+                    bare, annotated);
         if (!ok)
             fails++;
     }

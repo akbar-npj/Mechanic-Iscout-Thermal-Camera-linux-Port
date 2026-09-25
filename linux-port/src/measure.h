@@ -77,6 +77,13 @@ int dyt_measure_line(const float *temps, int w, int h,
                      int x0, int y0, int x1, int y1,
                      float *out, int cap);
 
+/* A front-end buffer big enough for any profile this camera can produce.  The
+ * longest line is a full diagonal of the widest supported frame (640 px) and
+ * the count is max(|dx|,|dy|) + 1 (see above), so a caller that sizes a stack
+ * array from this never sees the -2 above.  1024 leaves room for a sensor wider
+ * than any we support rather than for one we do. */
+#define DYT_PROFILE_MAX 1024
+
 /* ------------------------------------------------------------- polygon ROI */
 
 /* The most vertices a polygon measurement accepts.  A bound rather than an

@@ -35,8 +35,8 @@ MainWindow : QWidget
     │   │   └── GalleryPanel          the saved-items list, an overlay child widget
     │   └── StatusStrip (stretch 0)   three left-aligned lines
     └── ControlPanel (stretch 0)  right panel: QTabWidget
-        ├── "Troubleshoot"        Temperature Measurement / High Temperature /
-        │                         Image Enhancement / Capture
+        ├── "Troubleshoot"        Temperature Measurement / Analysis /
+        │                         High Temperature / Image Enhancement / Capture
         └── "Super Resolution"    Off / Visible plane (2x) / Thermal plane (2x)
 ```
 
@@ -53,12 +53,14 @@ against the session.
 ### The control panel
 
 `ControlPanel` is the Windows counterpart's right column: a `QTabWidget` whose
-**Troubleshoot** tab holds four checkable `QGroupBox`es — Temperature
-Measurement (Spot / Line / Rectangle / Polygon / None), High Temperature
-(Tracking / Alarm / Highlight), Image Enhancement (the two flips and Fixed
-range) and Capture (Still / Record / Gallery). Only groups the engine backs are
-present: the reference's Chart and 3D rows are absent rather than
-present-and-dead, so nothing on screen is a control that does nothing.
+**Troubleshoot** tab holds five checkable `QGroupBox`es — Temperature
+Measurement (Spot / Line / Rectangle / Polygon / None), Analysis (Line / Chart
+analysis), High Temperature (Tracking / Alarm / Highlight), Image Enhancement
+(the two flips and Fixed range) and Capture (Still / Record / Gallery). The
+first four are the reference's own groups, in its own order; Capture is this
+port's addition. Only groups the engine backs are present — the 3D Analysis,
+Comparison and Circuit Design tabs wait for their features (Track B) — so
+nothing on screen is a control that does nothing.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -80,6 +82,35 @@ tool's convention extended, not a second one: the outline `(x0,y0) (x1+1,y0)
 (`measure_test` pins the two against each other). Assertion 24b drives the whole
 gesture through the widget and counts the mark colour on the canvas, so the
 outline is required to be *painted* and not merely stored.
+
+**Analysis** is the reference's second group, and its two rows are one chart
+with two presentations rather than two data sources. The manual never describes
+the panel — searching it for "chart" finds only generic circuit-board prose — so
+the labels are read literally: **Line** draws the temperature along the placed
+line (a slice through space, from `dyt_measure_line`), and **Chart analysis**
+draws the *analysis* of that same curve, with the mean and median rules across
+it and the peak picked out with its value. Both rows put the line tool up — a
+line chart with no line has nothing to show, and a row that only lights up is
+the dead control the on-screen-controls rule exists to prevent — so the Line row
+is just `l` and the Chart analysis row is `c`, which sets the chart mode and
+then routes `l` through the same tool dispatch. Assertion 24c clears the tool
+before pressing `c` so that is pinned rather than satisfied by the line the
+assertion itself placed.
+
+The plot is a hand-painted `ProfilePlot` (`QPainter`, not Qt Charts — that is a
+separate module for one polyline and a few labels). It is *fed* rather than
+reading: `MainWindow::sync_actions()` hands it `dyt_session_profile()` once per
+painted frame, so the widget holds no session and no lock, and the statistics are
+computed on the way in rather than inside `paintEvent` — a sort in a paint is a
+sort per repaint. NaN samples are kept in place and break the path instead of
+being interpolated across, so a line that leaves the image shows as a gap rather
+than a straight segment through nothing. The peak's tie-break is strict `>` —
+the same rule `dyt_frame_stats()` and the `H` marker use — so the bin the chart
+marks is the pixel the readout names, not a second opinion about it. Assertion
+24c pins that: it draws the line along the frame's own hot row so sample *i* is
+source x *i*, requires `peak_bin()` to equal the snapshot's `hot_x`, and counts
+the marker colour before and after switching to "Chart analysis" to prove the
+mode changes what is *painted* and not merely which button is lit.
 
 **Tracking** is a new binding: `m` hides and shows the frame's hottest/coldest
 markers (`FrameView::toggle_hot()`), which the reference viewer always draws.
@@ -532,6 +563,7 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 | `n` | no tool, and forget the placed points and the polygon outline |
 | Enter / right button | finish the polygon outline |
 | Backspace | take back the last polygon vertex |
+| `c` | chart analysis: annotate the line's profile (picks up the line tool) |
 | `a` | arm the alarm, or disarm it if already armed |
 | `i` | toggle the isotherm |
 | `m` | show or hide the hottest/coldest markers |
@@ -1019,8 +1051,8 @@ $ ./build/dytqt --selftest
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (1172x560, 64 distinct colours)
-  ok   the canvas is not clipped (660x504, wants 660x400)
+  ok   the canvas painted (1172x731, 64 distinct colours)
+  ok   the canvas is not clipped (660x675, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
         line 2: tool: none (p point, l line, b box, o polygon, n clear)
@@ -1042,6 +1074,7 @@ $ ./build/dytqt --selftest
   ok   the tool keys reach the session (line/point/box/clear all route)
   ok   the mouse places and drags through the widget (20,15 -> 45,35)
   ok   the polygon is placed a click at a time, and its outline is painted (3 clicks, closed, undone, right-button yes, 276 mark px then 0)
+  ok   the Analysis chart plots the line's profile and marks its peak (peak bin 1 of hot x 1, chart analysis, picks line yes, marker 0 px then 20)
   ok   the alarm key arms the derived band, then disarms (31.7..32.1)
   ok   the isotherm key toggles the overlay
   ok   the strip reports the measurement ("box (10,10)-(60,50) n=2091")
@@ -1067,18 +1100,18 @@ $ ./build/dytqt --selftest
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x560 yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x731 yes)
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the control panel cannot take the keyboard (17 control(s), 0 that would)
+  ok   the control panel cannot take the keyboard (19 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, tutorials yes, pending yes)
-  ok   the control panel asks for its content's height (panel 560 of 560, page 620 of 534, shrinks yes, keeps yes, scrolls yes)
+  ok   the control panel asks for its content's height (panel 731 of 731, page 705 of 705, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
 === ALL PASS ===
@@ -1098,10 +1131,11 @@ pass vacuously:
   relation it checks would hold for an untransformed frame too, and would prove
   nothing.
 
-The `875.2 fps` on line 3 is not a bug — `--selftest` paces nothing, so it runs
-the 25 frames as fast as it can (the figure is whatever the machine manages, so
-it differs run to run). Assertion 9 checks the *label* there and assertion 12
-pins the arithmetic instead.
+The `fps` figure on line 3 is not a bug: `--selftest` paces nothing, so it runs
+the 25 frames as fast as it can, and the number is whatever the machine manages
+on the run. It differs every time, and so does `worst step` — those two are the
+only lines in the transcript above that a re-run will not reproduce. Assertion 9
+checks the *label* there and assertion 12 pins the arithmetic instead.
 
 Assertions 17 and 18 cover the live path without a camera: 17 checks that
 `--live` is refused when it contradicts the fixture-only flags, and 18 checks
@@ -1136,6 +1170,16 @@ rather than the total. It also drives the whole gesture through the widget:
 three clicks, Enter to finish the outline, Backspace to take a vertex back, and
 the right button to finish it — including that the right button does *nothing*
 to a two-vertex outline, which is not yet a region.
+
+**24c** is the chart, and it pins two different things. The *data*: the line is
+drawn along the row the frame's own hot pixel is in and right across the image,
+so sample *i* is source x *i* and the peak bin the chart marks has to equal the
+snapshot's `hot_x` — a number taken from the frame, not from the chart. The
+*painting*: "Chart analysis" has to change what is drawn, not only which button
+is lit, so the two modes are compared by counting the peak marker's colour,
+which the annotated mode draws and no palette produces. It also clears the tool
+and presses `c` on its own, because the row claims to put the line tool up and
+that claim is worth nothing if the assertion had already placed one.
 
 Assertions 28–35 cover the runtime-parameter ladder and the device panel, and they
 are the reason the arming state lives in `FrameView` rather than in the front end:
