@@ -973,6 +973,45 @@ int dyt_vm_gallery_label(const dyt_vm_gallery_t *g, char *out, size_t n)
                     it->name, sz);
 }
 
+/* ------------------------------------------------------------- view keys */
+
+int dyt_vm_view_key(dyt_session_t *s, int key)
+{
+    if (!s)
+        return 0;
+
+    /* Palette: the ten digits pick one directly, and the two brackets either
+     * side of the keyboard's full stop step through all of them. */
+    if (key >= '1' && key <= '9') {
+        dyt_session_set_palette(s, key - '1');
+        return 1;
+    }
+    if (key == '0') {
+        dyt_session_set_palette(s, 9);
+        return 1;
+    }
+
+    switch (key) {
+    case '.': dyt_session_cycle_palette(s, +1);          return 1;
+    case ',': dyt_session_cycle_palette(s, -1);          return 1;
+    case 'u': dyt_session_cycle_unit(s);                 return 1;
+    case 't': dyt_session_toggle_range(s);               return 1;
+    case 'h': dyt_session_toggle_flip_h(s);              return 1;
+    case 'H': dyt_session_toggle_flip_v(s);              return 1;
+    case '+':
+    case '=': dyt_session_zoom(s, +1);                   return 1;
+    case '-':
+    case '_': dyt_session_zoom(s, -1);                   return 1;
+    case 'f': dyt_session_cycle_fusion(s, +1);           return 1;
+    case '[': dyt_session_adjust_fusion_align(s, -1, 0); return 1;
+    case ']': dyt_session_adjust_fusion_align(s, +1, 0); return 1;
+    case ';': dyt_session_adjust_fusion_align(s, 0, -1); return 1;
+    case '\'': dyt_session_adjust_fusion_align(s, 0, +1); return 1;
+    default: break;
+    }
+    return 0;
+}
+
 /* -------------------------------------------------------------- utilities */
 
 int dyt_vm_exe_dir(char *out, size_t n)

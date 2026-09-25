@@ -775,6 +775,19 @@ public:
         return 1;
     }
 
+    /* Apply a view key — palette, unit, range, flip, zoom, fusion.  The
+     * bindings are the view model's, so the two front ends cannot disagree
+     * about which letter does what; the frame itself is re-rendered by the
+     * pump on its next tick.  Returns 1 if the key was one of these. */
+    int view_key(int k)
+    {
+        if (!dyt_vm_view_key(sess_, k))
+            return 0;
+        if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0)
+            update();
+        return 1;
+    }
+
     /* Apply a runtime-parameter key.  `raw` is the *unfolded* character, so
      * the reference's case-sensitive bindings survive: 'e' emissivity, 'A'
      * ambient, 'R' reflected, 'D' distance, and 'y' to send.  The ladder and
@@ -1655,6 +1668,13 @@ protected:
             on_record_();
             return;
         }
+
+        /* How the picture is shown: palette, unit, range, flip, zoom, fusion.
+         * Routed with the unfolded character, because two of the bindings are
+         * Shift forms ('H' flips vertically where 'h' flips horizontally) and
+         * the fold below would erase the difference. */
+        if (view_ && view_->view_key(raw))
+            return;
 
         /* Everything else is the measurement bindings, which are lowercase —
          * so fold the unfolded character back down before consulting them.
@@ -3094,6 +3114,39 @@ static int selftest(const opts &o)
         }
         if (dir2)
             rmdir(dir2);
+    }
+
+    /* 43. The view keys reach the session through the window: palette, the
+     * two flips (which the case split must keep apart) and the zoom. */
+    {
+        dyt_snapshot_t s1{};
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+
+        send_char('3');
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool pal = s1.palette == 2;
+
+        const int h0 = s1.xform.flip_h, v0 = s1.xform.flip_v;
+        send_char('h');
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool fh = s1.xform.flip_h != h0 && s1.xform.flip_v == v0;
+
+        send_char('H');
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool fv = s1.xform.flip_v != v0;
+
+        const int z0 = s1.xform.zoom;
+        send_char('+');
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool zoom = s1.xform.zoom == z0 + 1;
+
+        const bool ok = pal && fh && fv && zoom;
+        std::printf("  %-4s the view keys reach the session "
+                    "(palette %s, flip h %s, flip v %s, zoom %s)\n",
+                    ok ? "ok" : "FAIL", pal ? "yes" : "NO", fh ? "yes" : "NO",
+                    fv ? "yes" : "NO", zoom ? "yes" : "NO");
+        if (!ok)
+            fails++;
     }
 
     /* Leave the view model's state as the rest of the run found it. */

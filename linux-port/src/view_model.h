@@ -410,7 +410,6 @@ int dyt_vm_gallery_load(dyt_vm_gallery_t *g, const char *dir);
 /* Move the highlight by `delta`, wrapping at both ends.  Does nothing when the
  * list is empty. */
 void dyt_vm_gallery_move(dyt_vm_gallery_t *g, int delta);
-
 /* The highlighted entry, or NULL when there is none. */
 const dyt_vm_item_t *dyt_vm_gallery_sel(const dyt_vm_gallery_t *g);
 
@@ -418,6 +417,20 @@ const dyt_vm_item_t *dyt_vm_gallery_sel(const dyt_vm_gallery_t *g);
  * clips".  Returns the number of characters that would have been written, or
  * -1 on a bad argument. */
 int dyt_vm_gallery_label(const dyt_vm_gallery_t *g, char *out, size_t n);
+
+/* ------------------------------------------------------------- view keys
+ *
+ * The bindings that change how the picture is shown rather than what is
+ * measured: palette, unit, range, flip, zoom and fusion.  They are here, and
+ * not in the window, for the same reason the tool keys are — the reference
+ * viewer binds the same letters, and two lists of them would drift.
+ *
+ * A key is matched on the *unfolded* character, so a caller that wants the
+ * Shift forms (`H`, `+`) must pass the real case.  Returns 1 when the key was
+ * one of these, 0 otherwise, so the caller can fall through to its own
+ * bindings.
+ */
+int dyt_vm_view_key(dyt_session_t *s, int key);
 
 /* -------------------------------------------------------------- utilities */
 

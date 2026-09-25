@@ -1008,6 +1008,141 @@ static void test_gallery(void)
     rmdir(dir);
 }
 
+/* The view keys: palette, unit, range, flip, zoom, fusion.  Each is checked
+ * against the session state it is supposed to move, so a wrong letter — or a
+ * letter bound to the wrong setter — fails here rather than in a window. */
+static void test_view_keys(void)
+{
+    dyt_session_t  *s = dyt_session_create();
+    dyt_snapshot_t  snap;
+    float           img[16 * 16];
+
+    printf("\n-- view keys --\n");
+
+    if (!s) {
+        fail("view: session", "out of memory");
+        return;
+    }
+    feed(s, img, 16, 16);
+
+#define SNAP() dyt_session_snapshot(s, &snap, NULL, 0)
+
+    /* Palette: digits pick one directly.  How many are loaded depends on the
+     * palette directory, so '0' is checked against the count rather than
+     * against a hard-coded 9. */
+    intcheck("view: '3' is a view key", dyt_vm_view_key(s, '3'), 1);
+    SNAP();
+    intcheck("view: and picks palette 2", snap.palette, 2);
+
+    const int npal = snap.palette_n;
+    if (npal < 3) {
+        fail("view: the test session has palettes", "too few");
+        dyt_session_free(s);
+        return;
+    }
+
+    dyt_vm_view_key(s, '0');
+    SNAP();
+    intcheck("view: '0' picks the tenth, or the last there is",
+             snap.palette, npal - 1 < 9 ? npal - 1 : 9);
+
+    /* Cycling wraps at both ends of however many are loaded. */
+    {
+        const int p0 = snap.palette;
+        dyt_vm_view_key(s, '.');
+        SNAP();
+        intcheck("view: '.' cycles forward, wrapping",
+                 snap.palette, (p0 + 1) % npal);
+        dyt_vm_view_key(s, ',');
+        SNAP();
+        intcheck("view: ',' cycles back", snap.palette, p0);
+    }
+
+    /* Unit cycles through the three the engine knows. */
+    {
+        dyt_unit_t before;
+        SNAP();
+        before = snap.unit;
+        dyt_vm_view_key(s, 'u');
+        SNAP();
+        if (snap.unit != before)
+            ok("view: 'u' cycles the unit");
+        else
+            fail("view: 'u' cycles the unit", "unchanged");
+    }
+
+    /* Range: auto <-> fixed. */
+    {
+        dyt_range_mode_t before;
+        SNAP();
+        before = snap.range_mode;
+        dyt_vm_view_key(s, 't');
+        SNAP();
+        if (snap.range_mode != before)
+            ok("view: 't' toggles the range mode");
+        else
+            fail("view: 't' toggles the range mode", "unchanged");
+    }
+
+    /* The two flips are separate bindings, and the case is what tells them
+     * apart — an unconditional fold would make them the same key. */
+    {
+        const int h0 = snap.xform.flip_h, v0 = snap.xform.flip_v;
+        dyt_vm_view_key(s, 'h');
+        SNAP();
+        const bool h_flipped = snap.xform.flip_h != h0 &&
+                               snap.xform.flip_v == v0;
+        dyt_vm_view_key(s, 'H');
+        SNAP();
+        const bool v_flipped = snap.xform.flip_v != v0 &&
+                               snap.xform.flip_h != h0;
+        if (h_flipped && v_flipped)
+            ok("view: 'h' and 'H' flip different axes");
+        else
+            fail("view: 'h' and 'H' flip different axes", "same axis");
+    }
+
+    /* Zoom, both spellings of each direction. */
+    {
+        const int z0 = snap.xform.zoom;
+        dyt_vm_view_key(s, '+');
+        SNAP();
+        const int z1 = snap.xform.zoom;
+        dyt_vm_view_key(s, '-');
+        SNAP();
+        if (z1 == z0 + 1 && snap.xform.zoom == z0)
+            ok("view: '+' and '-' step the zoom");
+        else
+            fail("view: '+' and '-' step the zoom", "wrong step");
+    }
+
+    /* Fusion: 'f' cycles the pattern, the four brackets nudge the alignment. */
+    {
+        const dyt_fusion_t f0 = snap.fusion;
+        dyt_vm_view_key(s, 'f');
+        SNAP();
+        const bool cycled = snap.fusion != f0;
+        const int dx0 = snap.fusion_dx;
+        dyt_vm_view_key(s, ']');
+        SNAP();
+        const bool dx_moved = snap.fusion_dx == dx0 + 1;
+        if (cycled && dx_moved)
+            ok("view: 'f' cycles fusion and ']' nudges its alignment");
+        else
+            fail("view: 'f' cycles fusion and ']' nudges its alignment",
+                 "no move");
+    }
+
+    /* A key that is not a view key is reported, so the caller falls through. */
+    intcheck("view: 'z' is not a view key", dyt_vm_view_key(s, 'z'), 0);
+    intcheck("view: 'p' is not a view key", dyt_vm_view_key(s, 'p'), 0);
+    intcheck("view: a NULL session is refused", dyt_vm_view_key(NULL, '3'), 0);
+
+#undef SNAP
+
+    dyt_session_free(s);
+}
+
 int main(void)
 {
     printf("=== view_model_test ===\n");
@@ -1026,6 +1161,7 @@ int main(void)
     test_utilities();
     test_capture();
     test_gallery();
+    test_view_keys();
     printf("=== %s ===\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
 }
