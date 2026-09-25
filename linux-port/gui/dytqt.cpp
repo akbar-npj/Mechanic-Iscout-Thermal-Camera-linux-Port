@@ -37,8 +37,12 @@
 #include <QColor>
 #include <QDialog>
 #include <QEventLoop>
+#include <QFileDialog>
+#include <QHBoxLayout>
 #include <QImage>
 #include <QKeyEvent>
+#include <QLabel>
+#include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -265,7 +269,9 @@ static void usage(const char *prog)
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
         "  --png PATH       write the canvas here and exit\n"
-        "  --capture-dir D  where 's' (still) and 'v' (clip) write (default .)\n"
+        "  --capture-dir D  where 's' (still) and 'v' (clip) write, and the\n"
+        "                   folder the gallery lists (default: the Pictures\n"
+        "                   folder, else $HOME; a saved preference wins)\n"
         "  --prefs PATH     preferences file (default: $DYT_PREFS, else the\n"
         "                   standard config location)\n"
         "  --no-prefs       do not load or save preferences\n"
@@ -998,10 +1004,6 @@ public:
      * clearing this restores the stream with nothing to unwind. */
     void set_override(const QImage &img) { override_ = img; update(); }
 
-    /* The gallery list, borrowed from MainWindow (which owns it).  A pointer
-     * rather than a copy because the canvas only reads it at paint time. */
-    void set_gallery(const dyt_vm_gallery_t *g) { gal_ = g; }
-
     /* Apply a measurement key.  Returns 1 if the key was ours, so the window
      * can fall through to whatever else it binds.  The snapshot is refreshed
      * so the overlay switches at once rather than at the next tick; only the
@@ -1307,7 +1309,6 @@ protected:
         if (!override_.isNull()) {
             p.drawImage(QPoint(x0, y0), override_);
             draw_confirm(p);
-            draw_gallery(p);
             return;
         }
 
@@ -1469,70 +1470,9 @@ protected:
          * the placement is here. */
         draw_info_panel(p);
         draw_confirm(p);
-        draw_gallery(p);
     }
 
 private:
-    /* The gallery: a list of the saved stills and clips, with the highlighted
-     * entry picked out.  Every string is the view model's (the entry names,
-     * sizes and the selected row are dyt_vm_gallery_*'s); only the placement
-     * and the colours are here. */
-    void draw_gallery(QPainter &p)
-    {
-        if (!gal_ || !gal_->open)
-            return;
-
-        /* Sized from the canvas's *natural* size, not the widget's: this
-         * rectangle is drawn in canvas coordinates, under the display
-         * transform, so widget dimensions would be the wrong space as soon as
-         * the two differ.  At the natural size they are the same numbers. */
-        const QSize nat    = sizeHint();
-        const int   row_h  = 18;
-        const int   head_h = 20;
-        const int   avail  = std::max(1, (nat.height() - 2 * kPad - head_h) / row_h);
-        const int   rows   = std::min(gal_->n, avail);
-        const int   panel_w = std::min(nat.width() - 2 * kPad, 560);
-        const int panel_h = head_h + rows * row_h + 6;
-        const QRect r(kPad, kPad, panel_w, panel_h);
-
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(0, 0, 0, 210));
-        p.drawRect(r);
-        p.setPen(QColor(120, 120, 120));
-        p.setBrush(Qt::NoBrush);
-        p.drawRect(r);
-
-        char lbl[192];
-        dyt_vm_gallery_label(gal_, lbl, sizeof lbl);
-        p.setPen(QColor(220, 220, 220));
-        p.drawText(r.left() + 6, r.top() + 14, QString::fromUtf8(lbl));
-
-        /* Scroll so the highlighted entry is always on screen. */
-        int first = 0;
-        if (gal_->sel >= rows)
-            first = gal_->sel - rows + 1;
-        if (first > gal_->n - rows)
-            first = std::max(0, gal_->n - rows);
-
-        for (int i = 0; i < rows; i++) {
-            const int idx = first + i;
-            const QRect row(r.left() + 2, r.top() + head_h + i * row_h,
-                            r.width() - 4, row_h);
-            if (idx == gal_->sel) {
-                p.setPen(Qt::NoPen);
-                p.setBrush(QColor(0, 90, 160));
-                p.drawRect(row);
-            }
-            const char *kind = gal_->items[idx].kind == DYT_VM_ITEM_STILL
-                                   ? "still" : "clip";
-            char line[384];
-            std::snprintf(line, sizeof line, "%-5s  %s", kind,
-                          gal_->items[idx].name);
-            p.setPen(QColor(240, 240, 240));
-            p.drawText(row.left() + 4, row.top() + 13,
-                       QString::fromUtf8(line));
-        }
-    }
     /* The device panel: the module serial, the decoded user serial, the four
      * stored radiometric parameters and the slot count, top-left over the
      * image — the reference viewer's placement (draw_info_panel).  A value a
@@ -1648,10 +1588,9 @@ private:
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 
-    /* A saved still being viewed, and the gallery list (both owned elsewhere:
-     * the image by MainWindow, the list by MainWindow too). */
+    /* A saved still or clip frame being viewed.  Owned here; pushed by
+     * MainWindow, which is also where the gallery lives. */
     QImage                    override_;
-    const dyt_vm_gallery_t   *gal_ = nullptr;   /* borrowed */
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -1761,6 +1700,187 @@ private:
     dyt_alarm_state_t alarm_ = DYT_ALARM_NONE;
 };
 
+/* ------------------------------------------------------------- the gallery */
+
+/* The list of saved stills and clips, as a real widget.
+ *
+ * It used to be painted inside FrameView::paintEvent, *under* the canvas's
+ * display transform — so it scaled with the picture, and the two early returns
+ * that skip the overlays (no frame yet, degenerate geometry) skipped it too.
+ * A child widget is composited in *widget* space instead: the transform cannot
+ * move it and no paint path can hide it, which is what makes it appear in
+ * fullscreen as well as windowed.  It also brings mouse selection, double-click
+ * and scrolling with it, none of which the painted version had.
+ *
+ * Everything here is Qt::NoFocus.  The keys belong to MainWindow's single
+ * dispatch, and a focusable list would swallow them the moment it was clicked;
+ * mouse events need no focus, so clicking a row still works.
+ *
+ * The entries and the highlight are dyt_vm_gallery_*'s, never the widget's: the
+ * list is a view of that state, so the keyboard and the mouse cannot disagree
+ * about which row is selected. */
+class GalleryPanel : public QWidget {
+public:
+    GalleryPanel(const dyt_vm_gallery_t *g, QWidget *parent)
+        : QWidget(parent), gal_(g)
+    {
+        setFocusPolicy(Qt::NoFocus);
+        setAutoFillBackground(false);
+
+        head_   = new QLabel(this);
+        folder_ = new QLabel(this);
+        head_->setFocusPolicy(Qt::NoFocus);
+        folder_->setFocusPolicy(Qt::NoFocus);
+        /* Both labels need an explicit colour: the default palette's text is
+         * dark, which is invisible on this panel — a mistake a pixel check
+         * cannot make for you, and one only a render shows. */
+        head_->setStyleSheet(QStringLiteral("color: #e6e6e6;"));
+        folder_->setStyleSheet(QStringLiteral("color: #9aa0a6;"));
+
+        pick_ = new QPushButton(QStringLiteral("Folder\u2026"), this);
+        pick_->setFocusPolicy(Qt::NoFocus);
+        pick_->setCursor(Qt::PointingHandCursor);
+        pick_->setStyleSheet(QStringLiteral(
+            "QPushButton { color:#dcdcdc; background:#303030;"
+            "  border:1px solid #666; padding:2px 8px; }"
+            "QPushButton:hover { background:#3a3a3a; }"));
+        connect(pick_, &QPushButton::clicked, this, [this]() {
+            if (on_choose_folder)
+                on_choose_folder();
+        });
+
+        list_ = new QListWidget(this);
+        list_->setFocusPolicy(Qt::NoFocus);
+        list_->setSelectionMode(QAbstractItemView::SingleSelection);
+        list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        list_->setStyleSheet(QStringLiteral(
+            "QListWidget { background: transparent; border: none;"
+            "  color: #f0f0f0; outline: none; }"
+            "QListWidget::item { padding: 1px 3px; }"
+            "QListWidget::item:selected { background: #005aa0;"
+            "  color: #ffffff; }"));
+        connect(list_, &QListWidget::itemClicked, this,
+                [this](QListWidgetItem *it) {
+                    if (on_select)
+                        on_select(list_->row(it));
+                });
+        connect(list_, &QListWidget::itemDoubleClicked, this,
+                [this](QListWidgetItem *) {
+                    if (on_open)
+                        on_open();
+                });
+
+        auto *top   = new QHBoxLayout();
+        auto *texts = new QVBoxLayout();
+        texts->setSpacing(0);
+        texts->setContentsMargins(0, 0, 0, 0);
+        texts->addWidget(head_);
+        texts->addWidget(folder_);
+        top->addLayout(texts, 1);
+        top->addWidget(pick_, 0, Qt::AlignTop);
+
+        auto *lay = new QVBoxLayout(this);
+        lay->setContentsMargins(8, 6, 8, 8);
+        lay->setSpacing(4);
+        lay->addLayout(top, 0);
+        lay->addWidget(list_, 1);
+
+        /* The parent's resize is what moves the panel: it is a free-floating
+         * overlay, not a row of the layout, so nothing else would reposition
+         * it. */
+        parent->installEventFilter(this);
+    }
+
+    /* The row clicked, the row opened (double-click), and the Folder button. */
+    std::function<void(int)> on_select;
+    std::function<void()>    on_open;
+    std::function<void()>    on_choose_folder;
+
+    void set_folder(const QString &dir)
+    {
+        dir_ = dir;
+        folder_->setText(dir_);
+        folder_->setToolTip(dir_);
+    }
+
+    /* Rebuild the rows from the gallery state.  Called after a scan, so the
+     * widget and dyt_vm_gallery_t are never showing different things. */
+    void reload()
+    {
+        list_->clear();
+        for (int i = 0; i < gal_->n; i++) {
+            const dyt_vm_item_t &it = gal_->items[i];
+            list_->addItem(QStringLiteral("%1  %2")
+                               .arg(QString::fromLatin1(
+                                        it.kind == DYT_VM_ITEM_STILL ? "still"
+                                                                     : "clip"),
+                                    QString::fromUtf8(it.name)));
+        }
+        sync();
+    }
+
+    /* Follow the gallery's own highlight, which is what a key moves. */
+    void sync()
+    {
+        char lbl[192];
+        dyt_vm_gallery_label(gal_, lbl, sizeof lbl);
+        head_->setText(QString::fromUtf8(lbl));
+        list_->setCurrentRow(gal_->sel >= 0 && gal_->sel < list_->count()
+                                 ? gal_->sel
+                                 : -1);
+        reposition();
+    }
+
+    /* The row the panel is showing as current, for --selftest. */
+    int current_row() const { return list_->currentRow(); }
+    QString folder_text() const { return folder_->text(); }
+    QListWidget *list() const { return list_; }
+
+protected:
+    bool eventFilter(QObject *o, QEvent *e) override
+    {
+        if (o == parentWidget() && e->type() == QEvent::Resize)
+            reposition();
+        return QWidget::eventFilter(o, e);
+    }
+
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.setPen(QColor(120, 120, 120));
+        /* Nearly opaque: the device panel is painted on the canvas underneath,
+         * and at 215 the two overlays' text showed through each other. */
+        p.setBrush(QColor(12, 12, 12, 242));
+        p.drawRect(rect().adjusted(0, 0, -1, -1));
+    }
+
+private:
+    /* Fit the rows, but never taller than the canvas — past that the list
+     * scrolls, which is what the QListWidget is here for. */
+    void reposition()
+    {
+        QWidget *par = parentWidget();
+        if (!par)
+            return;
+
+        const int row_h = list_->count() ? list_->sizeHintForRow(0) : 18;
+        const int rows  = std::max(1, std::min(list_->count(), 14));
+        list_->setFixedHeight(rows * row_h + 8);
+
+        const int w = std::min(560, std::max(240, par->width() - 2 * kPad));
+        const int h = std::min(std::max(120, par->height() - 2 * kPad),
+                               sizeHint().height());
+        setGeometry(kPad, kPad, w, h);
+    }
+
+    const dyt_vm_gallery_t *gal_ = nullptr;   /* borrowed */
+    QLabel       *head_   = nullptr;
+    QLabel       *folder_ = nullptr;
+    QPushButton  *pick_   = nullptr;
+    QListWidget  *list_   = nullptr;
+    QString       dir_;
+};
+
 /* --------------------------------------------------------------- the window */
 
 class MainWindow : public QWidget {
@@ -1795,11 +1915,27 @@ public:
         setFocusPolicy(Qt::StrongFocus);
 
         dyt_vm_gallery_init(&gal_);
-        view_->set_gallery(&gal_);
+
+        /* The gallery is an overlay on the canvas, not a row of the layout:
+         * it floats over the top-left of the picture and is hidden until 'g'.
+         * Parented to the canvas so it is composited in widget space, above
+         * the image, and never sees the display transform. */
+        gal_panel_ = new GalleryPanel(&gal_, view_);
+        gal_panel_->on_select = [this](int row) {
+            dyt_vm_gallery_set_sel(&gal_, row);
+            gal_panel_->sync();
+        };
+        gal_panel_->on_open = [this]() { open_gallery_sel(); };
+        gal_panel_->on_choose_folder = [this]() {
+            if (on_choose_folder_)
+                on_choose_folder_();
+        };
+        gal_panel_->hide();
     }
 
     FrameView   *view()  const { return view_; }
     StatusStrip *strip() const { return strip_; }
+    GalleryPanel *gallery_panel() const { return gal_panel_; }
 
     /* The session the on-screen controls act on.  The canvas borrows it too;
      * the window needs its own handle because a few menu items (unit, fusion)
@@ -1834,6 +1970,11 @@ public:
     /* Called when the list is opened, so the front end can rescan and pick up
      * anything saved since it was last looked at. */
     std::function<void()> on_gallery_refresh_;
+
+    /* The Folder… button and the File menu item.  The front end owns the
+     * dialog and the directory, so the window only reports that it was asked
+     * for — the same split as every other callback here. */
+    std::function<void()> on_choose_folder_;
 
     /* The About box.  A callback so --selftest can see the key without a modal
      * dialog blocking the event loop. */
@@ -1886,6 +2027,63 @@ public:
     }
 
     bool viewing() const { return !viewing_label_.isEmpty(); }
+
+    /* The directory the list is showing, for the panel's own header — the one
+     * place a user can see where the files they are looking at actually are. */
+    void set_folder(const QString &dir)
+    {
+        if (gal_panel_)
+            gal_panel_->set_folder(dir);
+    }
+
+    /* Rescan and refill the panel in one step, so nothing can rescan the state
+     * and forget to refresh what is on screen.  The scan itself is the front
+     * end's (it owns the directory). */
+    void rescan_gallery()
+    {
+        if (on_gallery_refresh_)
+            on_gallery_refresh_();
+        if (gal_panel_)
+            gal_panel_->reload();
+    }
+
+    /* Open the highlighted entry, then get out of the way: the panel hides so
+     * the still or the playing clip fills the canvas, and 'g' brings the list
+     * back.  Doing it here rather than in the front end keeps the keyboard and
+     * the mouse on one path. */
+    void open_gallery_sel()
+    {
+        const dyt_vm_item_t *it = dyt_vm_gallery_sel(&gal_);
+        if (!it || !on_gallery_open_)
+            return;                 /* nothing highlighted: leave the list up */
+        on_gallery_open_(it);
+        gal_.open = 0;
+        if (gal_panel_)
+            gal_panel_->hide();
+        if (act_gallery_) {
+            const QSignalBlocker block(act_gallery_);
+            act_gallery_->setChecked(false);
+        }
+        view_->update();
+    }
+
+    /* Show or hide the list, keeping the panel and the state in step.  Closing
+     * returns to the live view, which is the contract 'g' and Esc share. */
+    void set_gallery_open(bool open)
+    {
+        gal_.open = open ? 1 : 0;
+        if (!gal_panel_)
+            return;
+        if (gal_.open) {
+            rescan_gallery();
+            gal_panel_->show();
+            gal_panel_->raise();
+        } else {
+            gal_panel_->hide();
+            clear_viewing();
+        }
+        view_->update();
+    }
 
     /* Size the window to the canvas it has to show.  Called once before the
      * window is shown, and again whenever the canvas changes size.
@@ -2048,31 +2246,29 @@ public:
          * bindings, because a key that moved the highlight must not also change
          * the tool or arm a parameter. */
         if (raw == 'g' && view_) {
-            gal_.open = !gal_.open;
-            if (gal_.open && on_gallery_refresh_)
-                on_gallery_refresh_();
-            else if (!gal_.open)
-                clear_viewing();        /* closing the gallery returns to live */
-            view_->update();
+            set_gallery_open(!gal_.open);
             return 1;
         }
         if (gal_.open) {
             if (raw == Qt::Key_Up || raw == 'k') {
                 dyt_vm_gallery_move(&gal_, -1);
-                view_->update();
+                if (gal_panel_)
+                    gal_panel_->sync();
                 return 1;
             }
             if (raw == Qt::Key_Down || raw == 'j') {
                 dyt_vm_gallery_move(&gal_, +1);
-                view_->update();
+                if (gal_panel_)
+                    gal_panel_->sync();
                 return 1;
             }
             /* Return arrives as 13 when the event carries text and as
              * Qt::Key_Return when it does not (a synthesized event), so both
-             * are matched. */
-            if ((raw == 13 || raw == Qt::Key_Return || raw == Qt::Key_Enter ||
-                 raw == 'o') && on_gallery_open_) {
-                on_gallery_open_(dyt_vm_gallery_sel(&gal_));
+             * are matched.  Opening hides the panel, so it is not a key that
+             * leaves the list up. */
+            if (raw == 13 || raw == Qt::Key_Return || raw == Qt::Key_Enter ||
+                raw == 'o') {
+                open_gallery_sel();
                 return 1;
             }
             if (raw == 'x' && on_gallery_export_) {
@@ -2080,9 +2276,7 @@ public:
                 return 1;
             }
             if (raw == 27) {                    /* Esc closes, back to live */
-                gal_.open = false;
-                clear_viewing();
-                view_->update();
+                set_gallery_open(false);
                 return 1;
             }
             /* Anything else is swallowed rather than acted on: the list has
@@ -2459,6 +2653,7 @@ private:
      * frame and isFullScreen() is not free. */
     bool         fullscreen_ = false;
     dyt_vm_gallery_t gal_{};
+    GalleryPanel *gal_panel_ = nullptr;   /* child of view_, owned by Qt */
     QString      viewing_label_;
 };
 
@@ -4006,20 +4201,28 @@ static int selftest(const opts &o)
         dyt_session_snapshot(sess, &after, nullptr, 0);
         const bool swallowed = after.tool == before.tool;
 
+        /* Opening hides the list, so the entry fills the canvas rather than
+         * sitting under the panel. */
         send_key(Qt::Key_Return);
+        const bool hid = !win.gallery()->open && win.viewing() && opens == 1;
+
+        /* 'x' acts on the highlighted entry and needs the list up, so reopen
+         * first — which is exactly what a user does to export after looking. */
+        send_char('g');
         send_char('x');
         send_esc();
 
-        const bool ok = opened_ok && moved && swallowed && opens == 1 &&
+        const bool ok = opened_ok && moved && swallowed && hid &&
                         exports == 1 && !win.gallery()->open &&
                         !win.viewing() &&
                         opened == &win.gallery()->items[0];
-        std::printf("  %-4s the gallery keys browse and open "
-                    "(open %s, move %s, swallow %s, opened %d, exported %d, "
-                    "closed %s, back to live %s)\n",
+        std::printf("  %-4s the gallery keys browse, open and export "
+                    "(open %s, move %s, swallow %s, opened %d, hid %s, "
+                    "exported %d, closed %s, back to live %s)\n",
                     ok ? "ok" : "FAIL", opened_ok ? "yes" : "NO",
                     moved ? "yes" : "NO", swallowed ? "yes" : "NO", opens,
-                    exports, !win.gallery()->open ? "yes" : "NO",
+                    hid ? "yes" : "NO", exports,
+                    !win.gallery()->open ? "yes" : "NO",
                     !win.viewing() ? "yes" : "NO");
         if (!ok)
             fails++;
@@ -4042,6 +4245,172 @@ static int selftest(const opts &o)
         }
         if (dir2)
             rmdir(dir2);
+    }
+
+    /* 57. The gallery is a real widget, not paint inside the canvas.  This is
+     * the shape of the bug it replaces: the old list was drawn under the
+     * display transform, from a code path the no-frame and degenerate-geometry
+     * early returns skipped — so it could scale with the picture or fail to
+     * appear at all (a fullscreen window showed nothing).  A child widget is
+     * composited in widget space, so it can do neither.  This pins that it is
+     * up on 'g', that it is still up in fullscreen, that it actually *paints*
+     * there (isVisible() alone would not catch a widget that is up but never
+     * drawn), and that it names the folder — the one place a user can see
+     * where the files they are looking at are kept. */
+    {
+        char  tmplw[] = "/tmp/dytqt-galw-XXXXXX";
+        char *dirw    = mkdtemp(tmplw);
+        const std::string dw = dirw ? dirw : ".";
+
+        auto touch = [](const std::string &d, const char *name) {
+            FILE *f = fopen((d + "/" + name).c_str(), "wb");
+            if (f) { fputs("x", f); fclose(f); }
+        };
+        touch(dw, "dyt_20260101-000000.dyt.jpg");
+
+        win.on_gallery_refresh_ = [&]() {
+            dyt_vm_gallery_load(win.gallery(), dw.c_str());
+        };
+        win.on_gallery_open_ = [&](const dyt_vm_item_t *) {};
+        win.set_folder(QString::fromStdString(dw));
+
+        /* Closed first, so the "with the panel" grab has a baseline. */
+        send_key(Qt::Key_F11);                  /* fullscreen, list closed */
+        QApplication::processEvents();
+        const QImage without = win.view()->grab().toImage();
+
+        send_char('g');
+        QApplication::processEvents();
+
+        GalleryPanel *panel = win.gallery_panel();
+        const QImage  with  = win.view()->grab().toImage();
+
+        int diff = 0;
+        if (!without.isNull() && without.size() == with.size())
+            for (int y = 0; y < with.height(); y += 2)
+                for (int x = 0; x < with.width(); x += 2)
+                    if (without.pixel(x, y) != with.pixel(x, y))
+                        diff++;
+
+        const bool shown = panel && panel->isVisible() &&
+                           panel->list()->count() == 1;
+        const bool named = panel &&
+                           panel->folder_text() == QString::fromStdString(dw);
+        const bool fs   = panel && panel->isVisible() && win.fullscreen();
+        const bool drew = diff > 500;           /* the panel is thousands of px */
+
+        send_key(Qt::Key_F11);                  /* back out of fullscreen */
+        QApplication::processEvents();
+        const bool back = panel && panel->isVisible() && !win.fullscreen();
+
+        send_esc();
+        QApplication::processEvents();
+        const bool gone = panel && !panel->isVisible();
+
+        const bool ok = shown && named && fs && drew && back && gone;
+        std::printf("  %-4s the gallery is a real widget: up on 'g', painted "
+                    "and still up in fullscreen, names the folder (shown %s, "
+                    "folder %s, fullscreen %s, painted %d px, back %s, "
+                    "hidden %s)\n",
+                    ok ? "ok" : "FAIL", shown ? "yes" : "NO",
+                    named ? "yes" : "NO", fs ? "yes" : "NO", diff,
+                    back ? "yes" : "NO", gone ? "yes" : "NO");
+        if (!ok)
+            fails++;
+
+        win.on_gallery_refresh_ = nullptr;
+        win.on_gallery_open_    = nullptr;
+
+        {
+            DIR *dp = opendir(dw.c_str());
+            for (struct dirent *e; dp && (e = readdir(dp)) != nullptr;) {
+                if (e->d_name[0] == '.')
+                    continue;
+                unlink((dw + "/" + e->d_name).c_str());
+            }
+            if (dp)
+                closedir(dp);
+        }
+        if (dirw)
+            rmdir(dirw);
+    }
+
+    /* 58. The mouse works on the list.  A click is what a user reaches for
+     * first, and the painted gallery had no mouse handling at all — the click
+     * fell through to the canvas and placed a measurement tool instead.  The
+     * panel is Qt::NoFocus so the keys still reach the window, which is why a
+     * click must be able to select without taking focus. */
+    {
+        char  tmplm[] = "/tmp/dytqt-galm-XXXXXX";
+        char *dirm    = mkdtemp(tmplm);
+        const std::string dm = dirm ? dirm : ".";
+
+        auto touch = [](const std::string &d, const char *name) {
+            FILE *f = fopen((d + "/" + name).c_str(), "wb");
+            if (f) { fputs("x", f); fclose(f); }
+        };
+        touch(dm, "dyt_20260101-000000.dyt.jpg");
+        touch(dm, "dyt_20260101-000001.dyt.jpg");
+
+        int opens = 0;
+        win.on_gallery_refresh_ = [&]() {
+            dyt_vm_gallery_load(win.gallery(), dm.c_str());
+        };
+        win.on_gallery_open_ = [&](const dyt_vm_item_t *) { opens++; };
+
+        send_char('g');
+        QApplication::processEvents();
+
+        GalleryPanel *panel = win.gallery_panel();
+        QListWidget  *lw    = panel ? panel->list() : nullptr;
+
+        auto click_row = [&](int row, QEvent::Type type) {
+            QListWidgetItem *it = lw ? lw->item(row) : nullptr;
+            if (!it)
+                return;
+            const QPoint p = lw->visualItemRect(it).center();
+            QMouseEvent e(type, QPointF(p), QPointF(lw->viewport()->mapToGlobal(p)),
+                          Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(lw->viewport(), &e);
+        };
+
+        /* A press and a release on the same row is a click. */
+        click_row(1, QEvent::MouseButtonPress);
+        click_row(1, QEvent::MouseButtonRelease);
+        QApplication::processEvents();
+        const bool clicked = win.gallery()->sel == 1;
+
+        /* And a double-click opens it. */
+        click_row(1, QEvent::MouseButtonDblClick);
+        QApplication::processEvents();
+        const bool opened = opens == 1;
+
+        send_esc();
+        QApplication::processEvents();
+
+        const bool ok = lw && lw->count() == 2 && clicked && opened;
+        std::printf("  %-4s the gallery takes the mouse (rows %d, click "
+                    "selects %s, double-click opens %s)\n",
+                    ok ? "ok" : "FAIL", lw ? lw->count() : -1,
+                    clicked ? "yes" : "NO", opened ? "yes" : "NO");
+        if (!ok)
+            fails++;
+
+        win.on_gallery_refresh_ = nullptr;
+        win.on_gallery_open_    = nullptr;
+
+        {
+            DIR *dp = opendir(dm.c_str());
+            for (struct dirent *e; dp && (e = readdir(dp)) != nullptr;) {
+                if (e->d_name[0] == '.')
+                    continue;
+                unlink((dm + "/" + e->d_name).c_str());
+            }
+            if (dp)
+                closedir(dp);
+        }
+        if (dirm)
+            rmdir(dirm);
     }
 
     /* 43. The view keys reach the session through the window: palette, the
@@ -4965,10 +5334,21 @@ static int run_gui(const opts &o_in, QApplication &app)
     /* A saved preference fills in only what the command line did not name, so
      * an explicit flag always wins. */
     opts o = o_in;
+    bool dir_from_prefs = false;
     if (!o.no_prefs) {
         prefs p;
         prefs_load(prefs_path(o_in), p);
+        dir_from_prefs = !o.capture_dir_set && !p.capture_dir.empty();
         opts_apply_prefs(o, p);
+    }
+
+    /* Where captures go when neither the flag nor a saved preference said.
+     * Not "." — a menu launch has no meaningful working directory, so the
+     * gallery would scan somewhere the user never chose. */
+    if (!o.capture_dir_set && !dir_from_prefs) {
+        char dir[4096];
+        if (dyt_vm_default_capture_dir(dir, sizeof dir) == 0)
+            o.capture_dir = dir;
     }
 
     dyt_session_t *sess = setup_session(o);
@@ -5208,8 +5588,27 @@ static int run_gui(const opts &o_in, QApplication &app)
      * saved.  Opening an entry renders it through a throwaway session, so the
      * live stream (if any) is untouched: the window shows the still as an
      * override while the pump keeps running underneath. */
+    win.set_folder(QString::fromStdString(o.capture_dir));
     win.on_gallery_refresh_ = [&]() {
         dyt_vm_gallery_load(win.gallery(), o.capture_dir.c_str());
+    };
+
+    /* Choosing the folder.  One directory serves both browsing and saving, so
+     * what was saved is what the list shows; the choice rides out at exit
+     * through prefs_from_session(), which already persists the capture dir. */
+    win.on_choose_folder_ = [&]() {
+        const QString dir = QFileDialog::getExistingDirectory(
+            &win, QStringLiteral("Folder for stills and clips"),
+            QString::fromStdString(o.capture_dir),
+            QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+        if (dir.isEmpty())
+            return;                             /* cancelled */
+        o.capture_dir     = dir.toStdString();
+        o.capture_dir_set = true;               /* so the default cannot override it */
+        pm.capture.dir    = o.capture_dir;
+        win.set_folder(dir);
+        win.rescan_gallery();
+        pm.notice("gallery folder: " + o.capture_dir, 150);
     };
 
     win.on_about_ = [&]() {
@@ -5334,8 +5733,9 @@ static int run_gui(const opts &o_in, QApplication &app)
         }
         const char *base = strrchr(path, '/');
         base = base ? base + 1 : path;
+        /* No rescan: the export is a .png, which is not a gallery item — the
+         * list holds the containers and the clips, and it is unchanged. */
         pm.notice(std::string("exported ") + base, 150);
-        dyt_vm_gallery_load(win.gallery(), o.capture_dir.c_str());
     };
 
     win.on_close_ = [&]() {
