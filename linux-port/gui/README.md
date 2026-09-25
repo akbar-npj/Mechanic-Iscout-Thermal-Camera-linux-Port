@@ -234,15 +234,65 @@ which the reads answer cleanly — and rides out of the worker in the job's `out
 because that is a plain C struct). A value a runtime write superseded is
 suffixed `*`, with `(* = set this session)` added to the slot line — but only a
 write that returned `rc == 0`, so a rejected write cannot claim to have changed
-the device. A reconnect clears the panel, the override table and any armed
-candidate, because the re-opened device's own stored values are authoritative
-again.
+the device. The `*` therefore means *written, not yet confirmed*, not
+*verified*: the confirmation can only arrive later, for the reason below. A
+reconnect clears the panel, the override table and any armed candidate, because
+the re-opened device's own stored values are authoritative again.
+
+#### Verifying the write
+
+`capture.h` says to verify a write by reading the same index back, and the app
+now does — but it cannot do it where the write is made, and that is the whole
+story.
+
+`dyt_write_param()` is two OUT transfers with **no status poll**, so it works
+while the isochronous stream runs. `dyt_read_param()` polls status register
+`0x0200`, and the stream starves that poll. Measured 2026-09-25 on 0bda:5840:
+while streaming, every slot read fails (`rc -1`), all four of them, at every
+delay tried; stop the stream and all four answer. So the read-back is deferred
+to the teardown, which is the first moment the device is idle again and the last
+one before the handle closes.
+
+Two measured quirks shape the code, both worth stating because each would
+otherwise look like a bug in the app:
+
+* **The read is not ready the instant the stream stops.** It answered anywhere
+  from immediately to about 2 s later across runs. A guessed settle would
+  therefore sometimes report a failure that is only impatience, so
+  `verify_writes()` waits *until the device answers* instead: up to eight
+  250 ms attempts, each a single errored transfer. In the common case the first
+  attempt succeeds and a verified close costs ~0.3 s.
+* **A read taken too early returns the pre-write value.** Measured `127` at
+  +100 ms where the write landed at +200 ms. That is a false `MISMATCH`, the
+  one outcome worse than a slow answer, and it is the other reason not to guess
+  a settle.
+
+The verdict is `param_raw_matches()`'s, and it compares in the **encoded**
+domain. `sendOrder` quantises — emissivity and distance to 1/128, ambient and
+reflected to whole kelvin — so a decoded-float compare would call almost every
+write a mismatch: `0.80` encodes to `102`, which decodes to `0.796875` and never
+reads back as `0.80`. That function is pure, so `--selftest` pins it with no
+device (assertion 36); the read itself is the hardware-only half.
+
+Each written slot reports `confirmed`, `MISMATCH`, or `read-back failed` on
+stderr, and a reconnect also puts a one-line verdict on the status strip
+(`write confirmed by read-back` / `write NOT confirmed (n of m)`) for anyone not
+watching the transcript. The exit path's teardown budget went from 1 s to 3 s to
+cover the wait, though it is only paid when the session actually wrote
+something.
+
+One device quirk the harness surfaced, since it is exactly the silent failure
+the read-back exists to catch: **a single `sendOrder` is not always applied.** A
+standalone harness that wrote emissivity `1.00` once read `127` back every time,
+while two orders 250 ms apart read `128`. Writes from the app have persisted on
+every measured run, so this looks like a device quirk rather than a port bug —
+but it is the reason the `*` says "written" and not "verified".
 
 Two behaviours are inherited from the viewer. The panel is visible by default.
 And the write changes the device's *stored* value, not just the host's
 thermometry: the host conversion's ambient is fixed at open, so a write to
 ambient does not by itself re-scale the picture the window is showing — the
-device's own reading changes, which is exactly what a read-back confirms.
+device's own reading changes, which is exactly what the read-back confirms.
 
 ## The toolkit decision — Qt6 Widgets
 
@@ -411,6 +461,7 @@ $ ./build/dytqt --selftest
   ok   the device panel is painted over the image (fill yes, toggle yes)
   ok   the confirmation is painted only while armed (idle 0, armed 7048, cancelled 0)
   ok   q quits and is never swallowed (idle yes, armed yes)
+  ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
 === ALL PASS ===
 ```
 
@@ -471,15 +522,21 @@ the measurement shapes: rather than sampling one pixel of a drawn rectangle, 33
 samples three interior pixels that the panel's opaque background must cover, and
 34 *counts* the confirmation's fill colour with the candidate armed and without
 (`idle 0, armed 7048, cancelled 0`) so an unlucky palette pixel cannot make it
-pass on its own. 35 pins that `q` quits and is never swallowed, armed or not.
+pass on its own. 35 pins that `q` quits and is never swallowed, armed or not. 36
+pins `param_raw_matches()`, the verdict the deferred read-back reaches: that
+`0.80` matches the device's `102` (and `103` does not) even though `102/128` is
+not `0.80`, that an exact step does not tolerate a one-LSB error, and that the
+two Celsius types compare as whole kelvin.
 
-What these cannot pin is the write's real return code and the worker's `SetParam`
-branch, because both need a live `dyt_capture_t`. That was verified against the
-camera instead: arming emissivity with `e` and confirming with `y` printed
-`dytqt: set emissivity = 1.00 -> rc 0`, and `probe --read --param 3` then read the
-slot back as `128  1.0000` (it had been `127  0.9922`) — the read-back the
-`params.h` contract says to verify with. The original value was written back
-afterwards.
+What these cannot pin is the write's real return code, the worker's `SetParam`
+branch, and the read-back itself, because all three need a live `dyt_capture_t`.
+Those were verified against the camera instead. Arming emissivity with `e` and
+confirming with `y` printed `dytqt: set emissivity = 1.00 -> rc 0`; quitting then
+printed `dytqt: verify emissivity = 1.00 -> confirmed (raw 128)` from the
+teardown read-back, and the same line appeared on the `r` reconnect path; a
+separate `probe --read --param 3` read the slot as `128  1.0000` where it had
+been `127  0.9922`. The original value was written back afterwards, and confirmed
+by read-back.
 
 ## Where the frames come from, and on which thread
 
@@ -585,8 +642,9 @@ timeout. It cannot be joined (that would hang the exit) and it cannot be left
 to finish (it would call back into Qt after the application is gone), so the
 only safe move is to leave immediately — flushing stdio by hand, skipping
 static teardown, leaking the session the wedged thread may still be writing
-into. Otherwise a final teardown job runs and the exit waits up to 1 s for it,
-then abandons it the same way.
+into. Otherwise a final teardown job runs and the exit waits up to 3 s for it —
+1 s of it being the slot read-back's wait for the device to answer, paid only
+when the session wrote a parameter — then abandons it the same way.
 
 ## What is *not* established
 
@@ -599,13 +657,19 @@ then abandons it the same way.
   its device handle and the leaked session with it, because there is no way to
   cancel it without a timeout in vendored libuvc. Adding one there was the
   alternative weighed and not taken.
-* **The runtime write is only verified on hardware.** `dyt_capture_set_param()`
+* **The runtime write is only exercised on hardware.** `dyt_capture_set_param()`
   is the one device write the port makes, and `--selftest` intercepts the send
-  rather than issuing it, so the worker's `SetParam` branch and the real return
-  code are exercised only against the camera (see "Runtime parameters and the
+  rather than issuing it, so the worker's `SetParam` branch, the real return code
+  and the deferred read-back are all camera-only (see "Runtime parameters and the
   device panel"). The claim that a control transfer does not disturb the
   isochronous stream rests on the vendor doing the same thing, not on a
   measurement of this port.
+* **A write cannot be confirmed while it is being used.** The read-back needs the
+  stream stopped, so the verdict arrives at the teardown — which means a write
+  followed by a clean exit with no reconnect is confirmed only on stderr, and a
+  write the user never follows with `r` shows `*` in the panel for the rest of
+  the session. That is a device limitation, not a choice: see "Verifying the
+  write" for the measurements behind it.
 * **The ladder has no rung for the device's own defaults.** Emissivity is
   `127/128` on the reference unit and the ladder steps `1.00, 0.95, …`, so a
   write cannot restore the stored value through the UI. The live check put

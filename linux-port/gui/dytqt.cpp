@@ -15,6 +15,8 @@
  * run:    ./build/dytqt [--fixture PATH] [--palette N] [--zoom N]
  *         ./build/dytqt --selftest
  */
+#include <unistd.h>     /* usleep — the settle before the teardown read-back */
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -461,6 +463,28 @@ static int apply_measure_key(dyt_session_t *sess, int key)
     return 0;
 }
 
+/* --------------------------------------------------- write verification
+ *
+ * Does the raw slot value the device returned match what `value` encodes to?
+ *
+ * This is the load-bearing part of verifying a runtime write, and it has to
+ * compare in the *encoded* domain.  sendOrder quantises — emissivity and
+ * distance to 1/128, ambient and reflected to whole kelvin — so comparing the
+ * decoded float would report a mismatch for every value that does not happen
+ * to land on an exact step: 0.80 encodes to 102, which decodes to 0.796875 and
+ * never reads back as 0.80.
+ *
+ * The read itself is dyt_capture_read_param(); this decides its verdict, and
+ * being pure it is pinned by --selftest with no device. */
+static int param_raw_matches(dyt_order_type_t type, float value, uint16_t raw)
+{
+    const int expect = (type == DYT_ORDER_EMISSIVITY ||
+                        type == DYT_ORDER_DISTANCE)
+                           ? (int)dyt_param_encode_ratio(value)
+                           : (int)dyt_param_encode_kelvin(value);
+    return (int)raw == expect;
+}
+
 /* ------------------------------------------------------------- the canvas */
 
 /* Paints the engine's frame, and owns the pointer interaction.
@@ -621,6 +645,17 @@ public:
             override_on_[type] = 1;
         }
         update();
+    }
+
+    /* Copy the runtime writes this session made, so the teardown can read the
+     * slots back and confirm them.  Taken before clear_info() wipes the table.
+     * `v` and `on` are 5 entries, indexed by dyt_order_type_t (1..4). */
+    void param_overrides(float *v, int *on) const
+    {
+        for (int i = 0; i < 5; i++) {
+            v[i]  = override_v_[i];
+            on[i] = override_on_[i];
+        }
     }
 
     /* The front end owns the device handle, so the write is reached through a
@@ -2262,6 +2297,37 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 36. The read-back comparison is in the encoded domain, which is the
+     * whole reason a verification can pass at all: sendOrder quantises, so a
+     * decoded float compare would call every write a mismatch.  The read
+     * itself needs a device; this is the part that decides the verdict. */
+    {
+        /* 0.80 encodes to 102 and never reads back as 0.80 — 102/128 is
+         * 0.796875 — so the naive compare fails and the encoded one passes. */
+        const bool quantised =
+            param_raw_matches(DYT_ORDER_EMISSIVITY, 0.80f, 102) &&
+            !param_raw_matches(DYT_ORDER_EMISSIVITY, 0.80f, 103) &&
+            std::fabs((double)dyt_param_decode_ratio(102) - 0.80) > 0.001;
+
+        /* 1.00 is an exact step, and a one-LSB error must not pass. */
+        const bool exact = param_raw_matches(DYT_ORDER_EMISSIVITY, 1.00f, 128) &&
+                           !param_raw_matches(DYT_ORDER_EMISSIVITY, 1.00f, 127) &&
+                           param_raw_matches(DYT_ORDER_DISTANCE, 1.00f, 128);
+
+        /* The Celsius types encode to whole kelvin, by truncation. */
+        const bool kelvin = param_raw_matches(DYT_ORDER_AMBIENT, 25.0f, 298) &&
+                            !param_raw_matches(DYT_ORDER_AMBIENT, 25.0f, 299) &&
+                            param_raw_matches(DYT_ORDER_REFLECTED, 20.0f, 293);
+
+        const bool ok = quantised && exact && kelvin;
+        std::printf("  %-4s the read-back compares in the encoded domain "
+                    "(quantised %s, exact %s, kelvin %s)\n", ok ? "ok" : "FAIL",
+                    quantised ? "yes" : "NO", exact ? "yes" : "NO",
+                    kelvin ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
     /* Leave the view model's state as the rest of the run found it. */
     fv->clear_info();
     win.on_quit_  = nullptr;
@@ -2293,6 +2359,12 @@ struct live {
      * is copied by value, so anything non-POD here would break that. */
     dyt_device_info_t      info{};
     int                    have_info = 0;
+};
+
+/* What the teardown's parameter read-back found.  See verify_writes(). */
+struct VerifyOut {
+    int checked = 0;   /* slots this session wrote and the device was asked for */
+    int bad     = 0;   /* of those, the ones that did not confirm */
 };
 
 /* Bring the device up, or fail leaving `L` in a state tear_down_live() can
@@ -2351,13 +2423,104 @@ static int bring_up_live(const dyt_capture_opts &cap, dyt_session_t *sess, live 
     return 0;
 }
 
+/* ------------------------------------------------------- write verification
+ *
+ * A runtime write cannot be verified where it is made.  dyt_write_param() is
+ * two OUT transfers with no status poll, so it works while the isochronous
+ * stream runs; dyt_read_param() polls status register 0x0200, and the stream
+ * starves that poll.  Measured 2026-09-25 on 0bda:5840: while streaming every
+ * slot read fails (rc -1), and all four answer the moment the stream is
+ * stopped.  So the read-back is deferred to the teardown, which is the first
+ * moment the device is idle again — and the only one before the handle closes.
+ *
+ * It is also why the panel's `*` means "written this session, not yet
+ * confirmed" rather than "verified": the confirmation can only arrive here.
+ */
+
+/* Read back every slot this session wrote, and report each.  `want`/`on` are
+ * the front end's override table, indexed by dyt_order_type_t (1..4).
+ *
+ * Two measured quirks shape this, both 2026-09-25 on 0bda:5840:
+ *
+ *  1. The slot read is not ready the instant the stream stops.  It answers
+ *     anywhere from immediately to ~2 s later, so a guessed settle would
+ *     sometimes report a failure that is only impatience.
+ *  2. A read taken too early returns the *pre-write* value — measured 127 at
+ *     +100 ms where the write landed at +200 ms — which would be a false
+ *     MISMATCH, the one outcome worth more than a slow one.
+ *
+ * So this waits until the device answers at all rather than for a fixed time.
+ * A failed attempt is a single errored transfer, so the wait costs the sleep
+ * and little else; 8 x 250 ms bounds it at 2 s, and the ready check doubles as
+ * the read of the first slot, which is why it is not repeated below. */
+static void verify_writes(dyt_capture_t *cap, const float *want, const int *on,
+                          VerifyOut &out)
+{
+    int first = 0;
+
+    for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++)
+        if (on && on[t]) {
+            first = t;
+            break;
+        }
+    if (!first)
+        return;
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint16_t probe = 0;
+        usleep(250000);
+        if (dyt_capture_read_param(cap, first, &probe) == 0)
+            break;
+    }
+
+    for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++) {
+        const dyt_vm_ladder_t *L;
+        char     w[32];
+        uint16_t raw = 0;
+        int      rc;
+
+        if (!on || !on[t])
+            continue;
+
+        out.checked++;
+        L = dyt_vm_ladder((dyt_order_type_t)t);
+        dyt_vm_param_format((dyt_order_type_t)t, want[t], w, sizeof w);
+
+        rc = dyt_capture_read_param(cap, t, &raw);
+        if (rc != 0) {
+            std::fprintf(stderr,
+                         "dytqt: verify %s = %s -> read-back failed (rc %d)\n",
+                         L ? L->name : "?", w, rc);
+            out.bad++;
+        } else if (param_raw_matches((dyt_order_type_t)t, want[t], raw)) {
+            std::fprintf(stderr, "dytqt: verify %s = %s -> confirmed (raw %u)\n",
+                         L ? L->name : "?", w, (unsigned)raw);
+        } else {
+            std::fprintf(stderr,
+                         "dytqt: verify %s = %s -> MISMATCH (device %u)\n",
+                         L ? L->name : "?", w, (unsigned)raw);
+            out.bad++;
+        }
+    }
+}
+
 /* Unwind in reverse.  dyt_capture_stop() comes first because it joins libuvc's
  * callback thread, and that thread is writing into the session through the
  * adapter — freeing either before it stops is a use-after-free.  Everything
- * here is NULL-safe and idempotent, so it is also the failure path. */
-static void tear_down_live(live &L)
+ * here is NULL-safe and idempotent, so it is also the failure path.
+ *
+ * `want`/`on` are the writes to verify, or NULL for none: the read-back has to
+ * happen after the stop (device idle) and before the close (handle gone), so
+ * it lives here rather than beside the write.  A failed bring-up passes
+ * neither, because a device that never came up has nothing to verify. */
+static void tear_down_live(live &L, const float *want = nullptr,
+                           const int *on = nullptr, VerifyOut *out = nullptr)
 {
-    if (L.cap) dyt_capture_stop(L.cap);
+    if (L.cap) {
+        dyt_capture_stop(L.cap);
+        if (want && on && out)
+            verify_writes(L.cap, want, on, *out);
+    }
     if (L.fs)  dyt_frame_source_close(L.fs);
     if (L.cap) dyt_capture_close(L.cap);
     if (L.sc)  dyt_session_capture_free(L.sc);
@@ -2386,6 +2549,14 @@ struct Job {
     dyt_capture_t   *dev = nullptr;
     dyt_order_type_t ptype = (dyt_order_type_t)0;
     float            pvalue = 0.f;
+
+    /* TearDown: the runtime writes this session made, so the teardown can read
+     * the slots back once the device is idle — the only moment a read answers
+     * (see verify_writes).  Copied from the view's override table before it is
+     * cleared.  `verify` is the result, filled on the worker. */
+    float            want_v[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
+    int              want_on[5] = { 0, 0, 0, 0, 0 };
+    VerifyOut        verify{};
 
     int              rc = -1;
 };
@@ -2431,7 +2602,10 @@ public:
                 if (job->rc != 0)
                     tear_down_live(job->out);
             } else if (job->kind == Job::TearDown) {
-                tear_down_live(job->in);
+                /* The read-back rides here: after the stop makes the device
+                 * idle, before the close takes the handle away. */
+                tear_down_live(job->in, job->want_v, job->want_on,
+                               &job->verify);
             } else {
                 /* SetParam.  Borrows the handle and owns nothing, so there is
                  * nothing to unwind.  This is the one device write the port
@@ -2549,6 +2723,14 @@ static int run_gui(const opts &o, QApplication &app)
         pm.bringup_done = false;      /* CONNECTING, not LIVE over a dead stream */
         pm.stall.reset();
         attempt = 0;
+
+        /* Snapshot the writes before the table is cleared: the teardown reads
+         * those slots back while the device is briefly idle, which is the only
+         * moment a read answers (verify_writes). */
+        float want_v[5];
+        int   want_on[5];
+        win.view()->param_overrides(want_v, want_on);
+
         /* The device is about to be re-opened, so its identity and the writes
          * this session made no longer describe it — and a candidate armed
          * against it is meaningless.  The fresh bring-up re-reads both. */
@@ -2568,8 +2750,24 @@ static int run_gui(const opts &o, QApplication &app)
         auto job  = std::make_shared<Job>();
         job->kind = Job::TearDown;
         job->in   = L;                /* the worker owns them from here */
+        for (int i = 0; i < 5; i++) {
+            job->want_v[i]  = want_v[i];
+            job->want_on[i] = want_on[i];
+        }
         L = live{};
-        worker.post(job, [&, afterwards](const std::shared_ptr<Job> &) {
+        worker.post(job, [&, afterwards](const std::shared_ptr<Job> &j) {
+            /* The read-back's verdict, for anyone not watching stderr.  Only
+             * when something was actually written and checked. */
+            if (j->verify.checked > 0) {
+                if (j->verify.bad == 0) {
+                    pm.msg = "write confirmed by read-back";
+                } else {
+                    pm.msg = "write NOT confirmed (" +
+                             std::to_string(j->verify.bad) + " of " +
+                             std::to_string(j->verify.checked) + ")";
+                }
+                pm.msg_ttl = 150;
+            }
             afterwards();
         });
     };
@@ -2719,6 +2917,11 @@ static int run_gui(const opts &o, QApplication &app)
         auto job  = std::make_shared<Job>();
         job->kind = Job::TearDown;
         job->in   = L;
+        /* The last chance to verify this session's writes: the teardown stops
+         * the stream, and a stopped device is the only one that answers a
+         * parameter read.  The verdict goes to stderr, which is where an
+         * exiting app's evidence lives. */
+        win.view()->param_overrides(job->want_v, job->want_on);
         L = live{};
         QEventLoop loop;
         bool done = false;
@@ -2726,7 +2929,12 @@ static int run_gui(const opts &o, QApplication &app)
             done = true;
             loop.quit();
         });
-        QTimer::singleShot(1000, &loop, &QEventLoop::quit);
+        /* 3 s, not 1: the teardown now waits for the device to be ready to
+         * answer a slot read (up to 2 s, see verify_writes) before it closes
+         * the handle, and a budget that no longer matches the work would
+         * report a normal close as "device did not stop".  It is only paid
+         * when this session actually wrote something. */
+        QTimer::singleShot(3000, &loop, &QEventLoop::quit);
         loop.exec();
         if (!done) {
             std::fprintf(stderr,

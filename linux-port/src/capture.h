@@ -193,6 +193,23 @@ int dyt_capture_read_info(dyt_capture_t *c, dyt_device_info_t *out);
  * reading the same index back with dyt_read_param(). */
 int dyt_capture_set_param(dyt_capture_t *c, int type, float value);
 
+/* Read one stored parameter slot back — the same index dyt_capture_set_param()
+ * writes (params.h).  This is how a write is verified: set_param's return says
+ * the transfer was issued, not that the device stored the value.
+ *
+ * `index` is a dyt_order_type_t (1..4).  On success writes the raw 16-bit slot
+ * value to *raw and returns DYT_READ_OK; otherwise a negative dyt_read_param
+ * error, with *raw untouched.
+ *
+ * A handful of control transfers, so never from a frame callback — the same
+ * rule as set_param, and it runs on the caller's thread for the same reason
+ * (libusb serialises a control transfer against the isochronous stream).
+ * Unlike the identity reads it is a single slot and so does not need the
+ * device idle; but the device is known to drop most slots when the whole block
+ * is read while streaming (capture.c), so a failure means "unverified", not
+ * "the write failed". */
+int dyt_capture_read_param(dyt_capture_t *c, int index, uint16_t *raw);
+
 /* Settle gap enforced after each successful write order (µs). */
 #define DYT_ORDER_SETTLE_US 250000
 

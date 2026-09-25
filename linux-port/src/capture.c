@@ -787,6 +787,24 @@ int dyt_capture_set_param(dyt_capture_t *c, int type, float value)
     return rc;
 }
 
+int dyt_capture_read_param(dyt_capture_t *c, int index, uint16_t *raw)
+{
+    dyt_transfer_fn xfer;
+
+    if (!c || !raw)
+        return DYT_READ_RANGE;
+
+    xfer = dyt_libusb_transfer(NULL);
+    if (!xfer || !c->usb)
+        return DYT_READ_IO;
+
+    /* Same plumbing as dyt_capture_set_param: the VideoControl interface is
+     * already claimed by uvc_open(), and this is a raw libusb control transfer
+     * that libusb serialises against the isochronous stream — so no
+     * ctrl_thread(), and legal from the caller's thread (never a callback). */
+    return dyt_read_param(xfer, c->usb, (unsigned)index, raw);
+}
+
 #else /* !DYT_HAVE_LIBUSB — no live UVC stack, so every entry point declines. */
 
 struct dyt_capture { int dummy; };
@@ -868,6 +886,13 @@ int dyt_capture_set_param(dyt_capture_t *c, int type, float value)
 {
     (void)c; (void)type; (void)value;
     fprintf(stderr, "capture: built without libusb — parameter write unavailable\n");
+    return -1;
+}
+
+int dyt_capture_read_param(dyt_capture_t *c, int index, uint16_t *raw)
+{
+    (void)c; (void)index; (void)raw;
+    fprintf(stderr, "capture: built without libusb — parameter read unavailable\n");
     return -1;
 }
 
