@@ -360,38 +360,98 @@ static void test_transform(void)
     /* project() is the inverse of map(): the centre of a magnified block maps
      * back to the pixel it came from.  This is what keeps a marker on the
      * right pixel when the image is mirrored, so it is checked over every
-     * flip/zoom combination rather than one example. */
+     * flip/zoom/sr combination rather than one example. */
     {
         dyt_view_transform_t t2;
-        int fh, fv, z, sx, sy, ox, oy, bx, by, bad = 0;
+        int fh, fv, z, s, sx, sy, ox, oy, bx, by, bad = 0;
 
         for (fh = 0; fh < 2; fh++) {
             for (fv = 0; fv < 2; fv++) {
                 for (z = 1; z <= 4; z++) {
-                    int dw2, dh2, k;
+                    for (s = 1; s <= 2; s++) {
+                        int dw2, dh2, k;
 
-                    dyt_view_transform_init(&t2);
-                    t2.flip_h = fh;
-                    t2.flip_v = fv;
-                    for (k = 1; k < z; k++)
-                        dyt_view_transform_zoom(&t2, 1);
+                        dyt_view_transform_init(&t2);
+                        t2.flip_h = fh;
+                        t2.flip_v = fv;
+                        for (k = 1; k < z; k++)
+                            dyt_view_transform_zoom(&t2, 1);
+                        dyt_view_transform_set_sr(&t2, s);
 
-                    dyt_view_transform_size(&t2, 4, 3, &dw2, &dh2);
+                        dyt_view_transform_size(&t2, 4, 3, &dw2, &dh2);
 
-                    for (sy = 0; sy < 3; sy++) {
-                        for (sx = 0; sx < 4; sx++) {
-                            if (dyt_view_transform_project(&t2, 4, 3, dw2, dh2,
-                                                           sx, sy, &ox, &oy) != 0 ||
-                                dyt_view_transform_map(&t2, 4, 3, dw2, dh2,
-                                                       ox, oy, &bx, &by) != 0 ||
-                                bx != sx || by != sy)
-                                bad = 1;
+                        for (sy = 0; sy < 3; sy++) {
+                            for (sx = 0; sx < 4; sx++) {
+                                if (dyt_view_transform_project(&t2, 4, 3, dw2, dh2,
+                                                               sx, sy, &ox, &oy) != 0 ||
+                                    dyt_view_transform_map(&t2, 4, 3, dw2, dh2,
+                                                           ox, oy, &bx, &by) != 0 ||
+                                    bx != sx || by != sy)
+                                    bad = 1;
+                            }
                         }
                     }
                 }
             }
         }
-        intcheck("project/map round trip over all flip x zoom", bad, 0);
+        intcheck("project/map round trip over all flip x zoom x sr", bad, 0);
+    }
+
+    /* The super-resolution factor magnifies like the zoom does, so the mapping
+     * divides by the product and still returns *source* pixels.  This is the
+     * property the whole design rests on: a 2x render needs no arithmetic in
+     * the front end, because map() already knows the factor. */
+    {
+        dyt_view_transform_t t3;
+
+        printf("-- super-resolution factor --\n");
+
+        dyt_view_transform_init(&t3);
+        intcheck("init sr", t3.sr, DYT_SR_MIN);
+        dyt_view_transform_set_sr(&t3, 99);
+        intcheck("set_sr clamps at max", t3.sr, DYT_SR_MAX);
+        dyt_view_transform_set_sr(&t3, 0);
+        intcheck("set_sr clamps at min", t3.sr, DYT_SR_MIN);
+        dyt_view_transform_set_sr(NULL, 2);        /* must not crash */
+        ok("set_sr tolerates NULL");
+
+        dyt_view_transform_init(&t3);
+        dyt_view_transform_set_sr(&t3, 2);
+        dyt_view_transform_size(&t3, 4, 3, &dw, &dh);
+        intcheck("sr 2 width", dw, 8);
+        intcheck("sr 2 height", dh, 6);
+        mapcheck("sr 2 origin",     &t3, 4, 3, 0, 0, 0, 0);
+        mapcheck("sr 2 in-block",   &t3, 4, 3, 1, 1, 0, 0);
+        mapcheck("sr 2 next block", &t3, 4, 3, 2, 2, 1, 1);
+        mapcheck("sr 2 far corner", &t3, 4, 3, 7, 5, 3, 2);
+
+        /* sr and zoom compose: 2 x 2 is a 4x4 block per source pixel. */
+        dyt_view_transform_init(&t3);
+        dyt_view_transform_set_sr(&t3, 2);
+        dyt_view_transform_zoom(&t3, 1);
+        dyt_view_transform_size(&t3, 4, 3, &dw, &dh);
+        intcheck("sr 2 + zoom 2 width", dw, 16);
+        mapcheck("sr 2 + zoom 2 origin",     &t3, 4, 3, 0, 0, 0, 0);
+        mapcheck("sr 2 + zoom 2 in-block",   &t3, 4, 3, 3, 3, 0, 0);
+        mapcheck("sr 2 + zoom 2 next block", &t3, 4, 3, 4, 4, 1, 1);
+        mapcheck("sr 2 + zoom 2 far corner", &t3, 4, 3, 15, 11, 3, 2);
+
+        /* The defensive default: a transform that was never initialised has
+         * sr == 0, which must read as 1 rather than divide by zero.  A plain
+         * `= { 0 }` is how a future caller is most likely to get this wrong. */
+        {
+            dyt_view_transform_t z0;
+            int dw0 = 0, dh0 = 0, sx0 = -1, sy0 = -1;
+
+            memset(&z0, 0, sizeof z0);
+            dyt_view_transform_size(&z0, 4, 3, &dw0, &dh0);
+            intcheck("zero-init size is the identity",
+                     dw0 == 4 && dh0 == 3, 1);
+            intcheck("zero-init map is the identity",
+                     dyt_view_transform_map(&z0, 4, 3, dw0, dh0, 3, 2,
+                                            &sx0, &sy0) == 0 &&
+                     sx0 == 3 && sy0 == 2, 1);
+        }
     }
 
     /* project() rejects out-of-range sources and bad arguments. */

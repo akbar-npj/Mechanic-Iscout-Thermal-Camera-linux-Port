@@ -120,13 +120,24 @@ void dyt_display_update(dyt_display_t *d, const dyt_frame_stats_t *st);
 #define DYT_ZOOM_MIN 1
 #define DYT_ZOOM_MAX 8
 
+/* The super-resolution magnification.  It is a *render* property — the session
+ * sets it to 2 when it produced a super-resolved frame and 1 when it did not —
+ * but it lives in the transform because it behaves exactly like the zoom: it
+ * magnifies the source.  That is what lets the front end keep passing
+ * `src = snapshot width/height` and `dst = the image it was handed`, so the
+ * pointer mapping, the H/L markers, the tool overlays and the measurements all
+ * stay in source pixels without any of them doing arithmetic on the factor. */
+#define DYT_SR_MIN 1
+#define DYT_SR_MAX 2
+
 typedef struct {
     int flip_h;   /* mirror left<->right */
     int flip_v;   /* mirror top<->bottom */
     int zoom;     /* integer magnification, DYT_ZOOM_MIN..DYT_ZOOM_MAX */
+    int sr;       /* super-resolution magnification, DYT_SR_MIN..DYT_SR_MAX */
 } dyt_view_transform_t;
 
-/* Identity: no flip, zoom 1. */
+/* Identity: no flip, zoom 1, sr 1. */
 void dyt_view_transform_init(dyt_view_transform_t *t);
 
 /* Toggle the mirrors.  Backs the viewer's "h"/"v" keys. */
@@ -136,15 +147,21 @@ void dyt_view_transform_toggle_flip_v(dyt_view_transform_t *t);
 /* Step the zoom by `delta`, clamped to DYT_ZOOM_MIN..DYT_ZOOM_MAX. */
 void dyt_view_transform_zoom(dyt_view_transform_t *t, int delta);
 
-/* Size of the transformed output for a given source size. */
+/* Set the super-resolution magnification, clamped to DYT_SR_MIN..DYT_SR_MAX.
+ * The session calls this from its render, so the factor carried in a snapshot
+ * is the one the image the front end is holding was actually produced at. */
+void dyt_view_transform_set_sr(dyt_view_transform_t *t, int sr);
+
+/* Size of the transformed output for a given source size: the source magnified
+ * by zoom * sr. */
 void dyt_view_transform_size(const dyt_view_transform_t *t,
                              int src_w, int src_h, int *dst_w, int *dst_h);
 
 /* Map output pixel (ox, oy) in a dst_w x dst_h image back to source pixel
  * coordinates in a src_w x src_h image.
  *
- * The output is the source magnified by `zoom` and then mirrored, so the
- * mapping undoes the mirror in output space and then divides by the zoom.
+ * The output is the source magnified by `zoom * sr` and then mirrored, so the
+ * mapping undoes the mirror in output space and then divides by that product.
  * Nearest-neighbour semantics: every output pixel maps to exactly one source
  * pixel.  Returns 0 on success, -1 if the point falls outside the source
  * (which a caller iterating its own output should not see). */

@@ -193,6 +193,7 @@ void dyt_view_transform_init(dyt_view_transform_t *t)
     t->flip_h = 0;
     t->flip_v = 0;
     t->zoom   = DYT_ZOOM_MIN;
+    t->sr     = DYT_SR_MIN;
 }
 
 void dyt_view_transform_toggle_flip_h(dyt_view_transform_t *t)
@@ -220,10 +221,33 @@ void dyt_view_transform_zoom(dyt_view_transform_t *t, int delta)
     t->zoom = z;
 }
 
+void dyt_view_transform_set_sr(dyt_view_transform_t *t, int sr)
+{
+    if (!t)
+        return;
+
+    if (sr < DYT_SR_MIN) sr = DYT_SR_MIN;
+    if (sr > DYT_SR_MAX) sr = DYT_SR_MAX;
+    t->sr = sr;
+}
+
+/* The magnification the transform actually applies: the user's zoom times the
+ * super-resolution factor.  Both fields are defended the same way — a value
+ * below its own minimum means the field was never set, so it reads as 1 — which
+ * is what keeps a zero-initialised transform behaving as the identity rather
+ * than as a division by zero. */
+static int transform_scale(const dyt_view_transform_t *t)
+{
+    int z = (t->zoom >= DYT_ZOOM_MIN) ? t->zoom : DYT_ZOOM_MIN;
+    int s = (t->sr   >= DYT_SR_MIN)   ? t->sr   : DYT_SR_MIN;
+
+    return z * s;
+}
+
 void dyt_view_transform_size(const dyt_view_transform_t *t,
                              int src_w, int src_h, int *dst_w, int *dst_h)
 {
-    int z = (t && t->zoom >= DYT_ZOOM_MIN) ? t->zoom : DYT_ZOOM_MIN;
+    int z = t ? transform_scale(t) : DYT_ZOOM_MIN;
 
     if (dst_w) *dst_w = src_w * z;
     if (dst_h) *dst_h = src_h * z;
@@ -240,10 +264,11 @@ int dyt_view_transform_map(const dyt_view_transform_t *t,
     if (ox < 0 || oy < 0 || ox >= dst_w || oy >= dst_h)
         return -1;
 
-    z = t->zoom >= DYT_ZOOM_MIN ? t->zoom : DYT_ZOOM_MIN;
+    z = transform_scale(t);
 
     /* The output is the source magnified then mirrored, so undo the mirror
-     * in output space first, then divide by the zoom (nearest-neighbour). */
+     * in output space first, then divide by the magnification (nearest-
+     * neighbour). */
     x = t->flip_h ? (dst_w - 1 - ox) : ox;
     y = t->flip_v ? (dst_h - 1 - oy) : oy;
     x /= z;
@@ -268,7 +293,7 @@ int dyt_view_transform_project(const dyt_view_transform_t *t,
     if (sx < 0 || sy < 0 || sx >= src_w || sy >= src_h)
         return -1;
 
-    z = t->zoom >= DYT_ZOOM_MIN ? t->zoom : DYT_ZOOM_MIN;
+    z = transform_scale(t);
 
     /* Centre of the magnified block, then the mirror — the exact inverse of
      * dyt_view_transform_map's "undo mirror, then divide". */
