@@ -37,9 +37,11 @@
 #include <QCloseEvent>
 #include <QColor>
 #include <QDialog>
+#include <QDoubleSpinBox>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -147,6 +149,9 @@ static const char kDarkQss[] =
     "QStatusBar { background: #2b2b2b; color: #9aa0a6; }"
     "QLabel#srstatus { color: #00b4d8; font-size: 9px; }"
     "QLabel#srhint { color: #7a8085; font-size: 8px; }"
+    "QPushButton#setting { min-width: 64px; }"
+    "QLabel#settingstatus { color: #9aa0a6; font-size: 9px; }"
+    "QTextBrowser#contact { background: #2b2b2b; border: 1px solid #3a3a3a; }"
     "QFrame[frameShape=\"6\"] { border: 1px solid #00b4d8; }"  /* canvas border */
     ;
 
@@ -1365,6 +1370,13 @@ public:
             on[i] = override_on_[i];
         }
     }
+
+    /* The device identity read at bring-up, so the Settings dialog can show
+     * each parameter's *stored* value as its starting point.  The four
+     * decoders return NaN for a slot the device did not answer, which is how
+     * the dialog tells "the device says 0.95" from "the device did not say" —
+     * the same distinction the info panel's row count makes. */
+    const dyt_device_info_t &device_info() const { return info_; }
 
     /* The front end owns the device handle, so the write is reached through a
      * callback rather than a pointer kept here.  It returns 1 when the write
@@ -2855,6 +2867,228 @@ private:
     dyt_sr_t     sr_mode_ = DYT_SR_OFF;
 };
 
+/* --------------------------------------------------------- settings dialog */
+
+/* The rail's Setting item — the Windows app's own Setting button.
+ *
+ * It presents the four runtime radiometric parameters the `e`/`A`/`R`/`D`
+ * ladder walks as numeric fields, so a value the ladder cannot *step* to is
+ * still reachable.  That is not a widening of what the device accepts: the
+ * encoder (params.c) truncates any value in range, and the reference's own
+ * panel uses editable numeric fields for its thresholds.  The spin boxes are
+ * bounded by the ladder's own range, so the dialog can offer more values than
+ * the keyboard but never one outside what the keyboard could reach.
+ *
+ * What it deliberately does not do is write anything itself.  Each row's Send
+ * goes through FrameView::on_param_send_, the same callback the ladder's 'y'
+ * uses, so there is one write path and the two cannot diverge in what they
+ * send — or in what they say when the device refuses.  The dialog adds an
+ * input method, nothing else.
+ *
+ * One Send per row rather than one for the dialog: a parameter is armed and
+ * confirmed on its own, never as a batch, and a batch would need an
+ * all-or-nothing semantics the device does not have.
+ *
+ * A parameter the device never reported starts at the ladder's first rung and
+ * says "not read" rather than showing a plausible zero. */
+class SettingsDialog : public QDialog {
+public:
+    explicit SettingsDialog(std::function<bool(dyt_order_type_t, float)> send,
+                            QWidget *parent = nullptr)
+        : QDialog(parent), send_(std::move(send))
+    {
+        setWindowTitle(QStringLiteral("Settings"));
+
+        auto *outer = new QVBoxLayout(this);
+        outer->setContentsMargins(12, 12, 12, 12);
+        outer->setSpacing(10);
+
+        auto *grid = new QGridLayout;
+        grid->setHorizontalSpacing(10);
+        grid->setVerticalSpacing(6);
+
+        for (int i = 0; i < dyt_vm_ladder_count(); i++) {
+            const dyt_vm_ladder_t *L = dyt_vm_ladder_at(i);
+            if (!L)
+                continue;
+
+            /* The ladder's own extent and its finest step, so a spin box
+             * cannot offer a value the ladder's range excludes. */
+            float lo = L->vals[0], hi = L->vals[0], step = 0.f;
+            for (int k = 1; k < L->n; k++) {
+                lo = std::min(lo, L->vals[k]);
+                hi = std::max(hi, L->vals[k]);
+                const float gap = std::fabs(L->vals[k] - L->vals[k - 1]);
+                if (gap > 0.f && (step == 0.f || gap < step))
+                    step = gap;
+            }
+            if (step <= 0.f)
+                step = (hi - lo) / 10.f;
+
+            QString name = QString::fromUtf8(L->name);
+            if (!name.isEmpty())
+                name[0] = name[0].toUpper();
+
+            auto *lab = new QLabel(name, this);
+
+            auto *spin = new QDoubleSpinBox(this);
+            spin->setObjectName(QStringLiteral("setting"));
+            spin->setDecimals(decimals(L->type));
+            spin->setRange(lo, hi);
+            spin->setSingleStep(step);
+            spin->setSuffix(suffix(L->type));
+            spin->setKeyboardTracking(false);
+            spin->setValue(L->vals[0]);
+
+            auto *btn = new QPushButton(QStringLiteral("Send"), this);
+            btn->setObjectName(QStringLiteral("setting"));
+            QObject::connect(btn, &QPushButton::clicked, this, [this, L, spin]() {
+                const float v = (float)spin->value();
+                const bool  ok = send_ && send_(L->type, v);
+                char shown[32];
+                dyt_vm_param_format(L->type, v, shown, sizeof shown);
+                status_->setText(
+                    QStringLiteral("%1 = %2 — %3")
+                        .arg(QString::fromUtf8(L->name),
+                             QString::fromUtf8(shown),
+                             ok ? QStringLiteral("sent")
+                                : QStringLiteral("refused; see the status bar")));
+            });
+
+            const int row = grid->rowCount();
+            grid->addWidget(lab,  row, 0);
+            grid->addWidget(spin, row, 1);
+            grid->addWidget(btn,  row, 2);
+            labs_[L->type]  = lab;
+            spins_[L->type] = spin;
+            sends_[L->type] = btn;
+        }
+        grid->setColumnStretch(1, 1);
+        outer->addLayout(grid);
+
+        status_ = new QLabel(this);
+        status_->setObjectName(QStringLiteral("settingstatus"));
+        status_->setWordWrap(true);
+        outer->addWidget(status_);
+
+        auto *close = new QPushButton(QStringLiteral("Close"), this);
+        close->setObjectName(QStringLiteral("setting"));
+        QObject::connect(close, &QPushButton::clicked, this, &QDialog::accept);
+        outer->addWidget(close, 0, Qt::AlignRight);
+
+        seed(nullptr);
+    }
+
+    /* Point every row at the value the session knows, and label the ones the
+     * device never reported.  Called on every open, not just at construction:
+     * the values are the device's, and a write made since the last open — or a
+     * device that has come and gone — must not leave the fields showing a
+     * value nothing holds.  `current` is indexed by dyt_order_type_t, with NaN
+     * for "not known"; NULL means every row is unknown. */
+    void seed(const float *current)
+    {
+        for (int i = 0; i < dyt_vm_ladder_count(); i++) {
+            const dyt_vm_ladder_t *L = dyt_vm_ladder_at(i);
+            if (!L)
+                continue;
+            const bool known = current && std::isfinite(current[L->type]);
+
+            QString name = QString::fromUtf8(L->name);
+            if (!name.isEmpty())
+                name[0] = name[0].toUpper();
+            if (labs_[L->type])
+                labs_[L->type]->setText(
+                    known ? name : name + QStringLiteral(" (not read)"));
+            if (spins_[L->type])
+                spins_[L->type]->setValue(known ? current[L->type]
+                                                : L->vals[0]);
+        }
+
+        if (status_)
+            status_->setText(
+                QStringLiteral("A parameter is written to the device the moment "
+                               "it is sent, and the reading changes with it."));
+    }
+
+    /* -- what --selftest drives.  The rows are indexed by dyt_order_type_t, so
+     * a test asks for the parameter by the same name the ladder uses. */
+    QDoubleSpinBox *spin(dyt_order_type_t t) const
+    {
+        return t >= 0 && t <= DYT_ORDER_DISTANCE ? spins_[t] : nullptr;
+    }
+    QPushButton *send_button(dyt_order_type_t t) const
+    {
+        return t >= 0 && t <= DYT_ORDER_DISTANCE ? sends_[t] : nullptr;
+    }
+    QString status_text() const { return status_ ? status_->text() : QString(); }
+
+private:
+    static int decimals(dyt_order_type_t t)
+    {
+        return t == DYT_ORDER_EMISSIVITY ? 2
+             : t == DYT_ORDER_DISTANCE   ? 2 : 1;
+    }
+    static QString suffix(dyt_order_type_t t)
+    {
+        if (t == DYT_ORDER_EMISSIVITY)
+            return QString();                       /* dimensionless */
+        if (t == DYT_ORDER_DISTANCE)
+            return QStringLiteral(" m");
+        return QStringLiteral(" \u00b0C");          /* ambient, reflected */
+    }
+
+    std::function<bool(dyt_order_type_t, float)> send_;
+    QLabel *status_ = nullptr;
+    /* Indexed by dyt_order_type_t (1..4; 0 unused), like the override tables
+     * FrameView keeps — the same indexing the wire protocol uses. */
+    QLabel         *labs_[DYT_ORDER_DISTANCE + 1]  = {};
+    QDoubleSpinBox *spins_[DYT_ORDER_DISTANCE + 1] = {};
+    QPushButton    *sends_[DYT_ORDER_DISTANCE + 1] = {};
+};
+
+/* ---------------------------------------------------------- contact dialog */
+
+/* The rail's Contact item.  Static vendor contact details — the Windows app's
+ * "Contact us" is a plain information panel with nothing to act on, so this is
+ * a read-only dialog rather than a message box, which would let the user copy
+ * an address out of it. */
+class ContactDialog : public QDialog {
+public:
+    explicit ContactDialog(QWidget *parent = nullptr) : QDialog(parent)
+    {
+        setWindowTitle(QStringLiteral("Contact us"));
+
+        auto *outer = new QVBoxLayout(this);
+        outer->setContentsMargins(12, 12, 12, 12);
+        outer->setSpacing(10);
+
+        auto *text = new QTextBrowser(this);
+        text->setObjectName(QStringLiteral("contact"));
+        text->setReadOnly(true);
+        text->setOpenExternalLinks(false);
+        text->setPlainText(QStringLiteral(
+            "DYT / Mechanic-Ti thermal camera\n"
+            "\n"
+            "This is an independent Linux port of the vendor's Windows and "
+            "Android clients, built from the recovered USB protocol.  It is "
+            "not affiliated with or supported by the vendor.\n"
+            "\n"
+            "For the camera hardware, its calibration and its warranty, "
+            "contact the vendor you bought the unit from.\n"
+            "\n"
+            "For this port, see the project's own issue tracker.  Please "
+            "include:\n"
+            "  - the output of  dytqt --version\n"
+            "  - the camera serial shown on the status bar\n"
+            "  - what you did, and what happened instead"));
+        outer->addWidget(text, 1);
+
+        auto *close = new QPushButton(QStringLiteral("Close"), this);
+        QObject::connect(close, &QPushButton::clicked, this, &QDialog::accept);
+        outer->addWidget(close, 0, Qt::AlignRight);
+    }
+};
+
 /* --------------------------------------------------------------- the window */
 
 class MainWindow : public QWidget {
@@ -2883,6 +3117,29 @@ public:
         /* Every panel control runs the one dispatch, exactly as the rail does
          * and as the menu items did. */
         panel_->on_key = [this](int k) { handle_key(k); };
+
+        /* The rail's bottom group.  Setting and Contact are the two that open a
+         * dialog rather than acting on the session, so they are wired here;
+         * the rest still fall through to the stub below and are wired in a
+         * later step, one at a time, as each gains its meaning. */
+        rail_->on_action = [this](IconRail::RailItem i) {
+            switch (i) {
+            case IconRail::Setting: {
+                SettingsDialog *d = settings_dialog();
+                d->show();
+                d->raise();
+                d->activateWindow();
+                break;
+            }
+            case IconRail::ContactUs: {
+                ContactDialog d(this);
+                d.exec();
+                break;
+            }
+            default:
+                break;
+            }
+        };
 
         auto *centre = new QWidget(this);
         auto *clay = new QVBoxLayout(centre);
@@ -2934,6 +3191,69 @@ public:
     bool sr_model_loaded() const
     {
         return sess_ && dyt_session_sr_capable(sess_) != 0;
+    }
+
+    /* The Settings dialog, created on first use and then reused.  Shown rather
+     * than exec()'d: the whole point of sending a parameter is watching the
+     * reading change, and a modal dialog would put the reading behind it.
+     * Public, like rail() and panel(), so --selftest can drive it without
+     * entering a nested event loop. */
+    SettingsDialog *settings_dialog()
+    {
+        if (!settings_) {
+            /* The write path is the ladder's own: on_param_send_ is what the
+             * 'y' key calls, so the dialog and the keyboard cannot send
+             * different values or disagree about a refusal. */
+            settings_ = new SettingsDialog(
+                [this](dyt_order_type_t t, float v) {
+                    return view_ && view_->on_param_send_ &&
+                           view_->on_param_send_(t, v);
+                }, this);
+        }
+        settings_->seed(settings_current());
+        return settings_;
+    }
+
+    /* The current value of each runtime parameter as the session knows it: a
+     * write this session made, else what the device reported at bring-up, else
+     * NaN.  The override wins because the device cannot be re-read while
+     * streaming (RE Docs 04 §4.8) — the table is the only place the new value
+     * exists. */
+    const float *settings_current()
+    {
+        for (int t = 0; t <= DYT_ORDER_DISTANCE; t++)
+            settings_cur_[t] = NAN;
+
+        if (view_) {
+            float ov[5];
+            int   ov_on[5];
+            view_->param_overrides(ov, ov_on);
+            const dyt_device_info_t &d = view_->device_info();
+
+            for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++) {
+                if (ov_on[t]) {
+                    settings_cur_[t] = ov[t];
+                    continue;
+                }
+                switch (t) {
+                case DYT_ORDER_REFLECTED:
+                    settings_cur_[t] = dyt_radiometry_reflected_c(&d.radio);
+                    break;
+                case DYT_ORDER_AMBIENT:
+                    settings_cur_[t] = dyt_radiometry_ambient_c(&d.radio);
+                    break;
+                case DYT_ORDER_EMISSIVITY:
+                    settings_cur_[t] = dyt_radiometry_emissivity(&d.radio);
+                    break;
+                case DYT_ORDER_DISTANCE:
+                    settings_cur_[t] = dyt_radiometry_distance_m(&d.radio);
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+        return settings_cur_;
     }
 
     FrameView   *view()  const { return view_; }
@@ -3744,6 +4064,11 @@ private:
     StatusStrip *strip_ = nullptr;
     IconRail    *rail_  = nullptr;   /* the left icon rail, a child of this */
     ControlPanel *panel_ = nullptr;  /* the right tabbed panel, a child of this */
+    /* The Settings dialog, created on first use.  A child of this, so it is
+     * destroyed with the window and needs no lifetime of its own. */
+    SettingsDialog *settings_ = nullptr;
+    /* The scratch the dialog is seeded from, indexed by dyt_order_type_t. */
+    float settings_cur_[DYT_ORDER_DISTANCE + 1] = {};
     dyt_session_t *sess_ = nullptr;      /* borrowed */
     /* The clip playing on the canvas, if any.  Borrowed from the pump, which
      * advances it — the same pattern as sess_: the window reads and steers the
@@ -6296,6 +6621,125 @@ static int selftest(const opts &o)
                     ok ? "ok" : "FAIL", n, want, have);
         if (!ok)
             fails++;
+    }
+
+    /* 53e. The Settings dialog.  Five things, each a different failure: the
+     * rail's Setting item opens it at all; it is non-modal, so the reading it
+     * exists to change is not hidden behind it; each parameter starts from the
+     * value the session knows, an override superseding the stored value and a
+     * *failed* write not doing so; a Send reaches FrameView::on_param_send_ —
+     * the very callback the ladder's 'y' uses — with exactly the value the
+     * field holds, so the dialog is an input method and not a second write
+     * path; and a refusal is reported rather than swallowed. */
+    {
+        /* A known starting state, the same one assertion 34 left: an
+         * emissivity write that succeeded, and a distance write that did not. */
+        fv->set_param_result(DYT_ORDER_EMISSIVITY, 0.80f, 0);
+        fv->set_param_result(DYT_ORDER_DISTANCE, 5.0f, -1);
+
+        dyt_order_type_t got_type  = (dyt_order_type_t)0;
+        float            got_value = -1.f;
+        int              calls     = 0;
+        bool             accept    = true;
+        fv->on_param_send_ = [&](dyt_order_type_t t, float v) {
+            got_type = t; got_value = v; calls++;
+            return accept;
+        };
+
+        /* Through the rail, which is how a user reaches it. */
+        QPushButton *rail_setting = win.rail()
+            ? win.rail()->button(IconRail::Setting) : nullptr;
+        if (rail_setting)
+            rail_setting->click();
+        QApplication::processEvents();
+
+        SettingsDialog *dlg = win.settings_dialog();
+        const bool opened  = rail_setting && dlg && dlg->isVisible();
+        /* Non-modal on purpose: sending a parameter is only useful if you can
+         * watch the reading move, and exec() would put the reading behind the
+         * dialog.  A modal dialog here would also block the pump's timer. */
+        const bool modeless = dlg && dlg->isModal() == false;
+
+        int rows = 0;
+        for (int i = 0; i < dyt_vm_ladder_count(); i++) {
+            const dyt_vm_ladder_t *L = dyt_vm_ladder_at(i);
+            if (L && dlg->spin(L->type) && dlg->send_button(L->type))
+                rows++;
+        }
+
+        /* Three seeding rules, and each needs a different value to be visible.
+         * Assertion 32 left the device reporting emissivity 0.75 and distance
+         * 1.00 m, and this assertion left an emissivity write of 0.80 that
+         * succeeded beside a distance write of 5.00 that did not — so:
+         *
+         *   emissivity  0.80  the override supersedes the stored 0.75;
+         *   distance    1.00  the failed write did NOT supersede the stored
+         *                     value (5.00 would be the wrong answer);
+         *   ambient    20.00  the device never reported it, so the row falls
+         *                     back to the ladder's first rung rather than to a
+         *                     zero that looks like a reading.
+         *
+         * All three are distinct from the value a row would show if it simply
+         * echoed the ladder, so a seeding bug cannot pass. */
+        QDoubleSpinBox *se = dlg->spin(DYT_ORDER_EMISSIVITY);
+        QDoubleSpinBox *sd = dlg->spin(DYT_ORDER_DISTANCE);
+        QDoubleSpinBox *sa = dlg->spin(DYT_ORDER_AMBIENT);
+        const bool seeded =
+            se && sd && sa &&
+            std::fabs(se->value() - 0.80)  < 1e-6 &&
+            std::fabs(sd->value() - 1.00)  < 1e-6 &&
+            std::fabs(sa->value() - 20.00) < 1e-6;
+
+        /* Send what the field holds, and require the write path to see exactly
+         * that.  0.50 is a ladder rung, so the value is one the keyboard could
+         * also produce — the dialog may reach more values, never others. */
+        bool sent = false, refused = false;
+        if (se) {
+            se->setValue(0.50);
+            QPushButton *b = dlg->send_button(DYT_ORDER_EMISSIVITY);
+            if (b)
+                b->click();
+            sent = calls == 1 && got_type == DYT_ORDER_EMISSIVITY &&
+                   std::fabs(got_value - 0.50f) < 1e-6 &&
+                   dlg->status_text().contains(QStringLiteral("sent"));
+
+            /* Now a refusal — the device is busy, or there is none — must be
+             * reported, not swallowed. */
+            accept = false;
+            if (b)
+                b->click();
+            refused = calls == 2 &&
+                      dlg->status_text().contains(QStringLiteral("refused"));
+        }
+
+        /* Re-seeded on every open: a value written since must be what the field
+         * shows, not the one it was built with. */
+        bool reseeded = false;
+        if (se) {
+            fv->set_param_result(DYT_ORDER_EMISSIVITY, 0.10f, 0);
+            win.settings_dialog();          /* as the rail's handler does */
+            reseeded = std::fabs(se->value() - 0.10) < 1e-6;
+        }
+
+        const bool ok = opened && modeless && rows == dyt_vm_ladder_count() &&
+                        seeded && sent && refused && reseeded;
+        std::printf("  %-4s the Settings dialog opens from the rail, is "
+                    "modeless, and sends what its fields hold through the "
+                    "ladder's own write path (%d row(s), open %s, modeless %s, "
+                    "seeded %s, sent %s, refusal %s, re-seeded %s)\n",
+                    ok ? "ok" : "FAIL", rows,
+                    opened ? "yes" : "NO", modeless ? "yes" : "NO",
+                    seeded ? "yes" : "NO",
+                    sent ? "yes" : "NO", refused ? "yes" : "NO",
+                    reseeded ? "yes" : "NO");
+        if (!ok)
+            fails++;
+
+        if (dlg)
+            dlg->hide();
+        fv->on_param_send_ = nullptr;
+        /* Leave the override table as the run found it. */
+        fv->set_param_result(DYT_ORDER_EMISSIVITY, 0.80f, 0);
     }
 
     /* 56. No toolbar row is overflowing.  Qt hides the buttons that do not fit

@@ -116,6 +116,46 @@ the unthemed metrics they were calibrated against.
 > Design`). Widening the column is the change that has to happen before the
 > remaining tabs land; at 224 px even a third tab would overflow.
 
+### The rail's dialogs
+
+The rail's bottom group is Setting and Contact, the two items that open a dialog
+rather than act on the session. They are the first rail items to be wired; the
+rest still fall through to a no-op stub and are wired one at a time as each
+gains its meaning (step 3).
+
+**Settings** presents the four runtime radiometric parameters the `e`/`A`/`R`/`D`
+ladder walks as numeric fields. That is not a widening of what the device
+accepts: the encoder truncates any value in range (`params.c`), and the
+reference's own panel uses editable numeric fields for its thresholds. The spin
+boxes are bounded by the *ladder's own* range, so the dialog can offer more
+values than the keyboard but never one outside what the keyboard could reach.
+
+It deliberately does not write anything itself. Each row's Send goes through
+`FrameView::on_param_send_` — the same callback the ladder's `y` uses — so there
+is one write path and the two cannot diverge in what they send, or in what they
+report when the device refuses. The dialog adds an input method, nothing else.
+One Send per row rather than one for the dialog, because a parameter is armed and
+confirmed on its own and a batch would need an all-or-nothing semantics the
+device does not have.
+
+It is **non-modal**, and that is the point: sending a parameter is only useful if
+you can watch the reading move, and `exec()` would put the reading behind the
+dialog (it would also block the pump's timer). The dialog is created on first use
+and reused, and re-seeded on every open — the values are the device's, and a write
+made since the last open must not leave the fields showing a value nothing holds.
+A parameter the device never reported is labelled "(not read)" and starts at the
+ladder's first rung, rather than showing a plausible zero.
+
+Seeding has three rules, and assertion 53e pins each with a value that would be
+wrong if the rule were missing: an override this session made supersedes the
+stored value; a *failed* write does not; and a parameter the device never
+reported falls back to the ladder. The same assertion drives the rail's Setting
+button, so the wiring is pinned too, and requires the dialog to be modeless.
+
+**Contact** is a read-only information panel — the Windows app's "Contact us" has
+nothing to act on — in a `QTextBrowser` so an address can be selected, which a
+`QMessageBox` label would not allow.
+
 `FrameView::render_canvas()` draws the canvas's content at the canvas's own
 size, in canvas coordinates, and is what the overlay assertions sample. A
 widget `grab()` would be cropped once the rail and panel take their columns —
@@ -925,6 +965,7 @@ $ ./build/dytqt --selftest
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 222)
+  ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
