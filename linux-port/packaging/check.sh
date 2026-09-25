@@ -88,6 +88,16 @@ else
     fail "Icon names a source the build ships (got '${icon_name:-<missing>}')"
 fi
 
+# The name a person reads lives in two files: the menu entry's Name, and the
+# window title and About box, which share one constant.  A rename that touches
+# one and not the other is invisible until someone opens the menu.
+app_name=$(key Name)
+if [ -n "$app_name" ] && grep -qF "kAppName[] = \"$app_name\"" gui/dytqt.cpp; then
+    ok "the menu name and the window title are one name ($app_name)"
+else
+    fail "the menu name and the window title are one name (menu '${app_name:-<missing>}')"
+fi
+
 # --- the icon ---
 if command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
     im=$(command -v magick || command -v convert)

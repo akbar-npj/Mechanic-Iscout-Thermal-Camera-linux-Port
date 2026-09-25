@@ -71,6 +71,12 @@
 #endif
 static const char kAppVersion[] = DYT_VERSION;
 
+/* The name a person reads: the window title, the About box, and the desktop
+ * entry's Name — which packaging/check.sh ties back to this string.  The
+ * binary and the package stay `dytqt`; only what the user sees is the product
+ * name. */
+static const char kAppName[] = "Mechanic iScout Thermal Camera";
+
 static const int kBarW   = 22;   /* colour-bar width, px */
 static const int kBarGap = 14;   /* image -> bar gap */
 static const int kLabelW  = 96;  /* room for the bar's labels */
@@ -257,7 +263,8 @@ static void usage(const char *prog)
         "  --selftest       headless check over the fixture; needs no display\n"
         "\n"
         "live capture (replaces the fixture):\n"
-        "  --live           stream from the camera instead of replaying a file\n"
+        "  --live           stream from the camera instead of replaying a file;\n"
+        "                   automatic when the default fixture is not present\n"
         "  --vid V --pid P  USB ids (0x0000 0x0000 = first matching device)\n"
         "  --format-index N UVC bFormatIndex (0 = auto, uncompressed 16-bpp)\n"
         "  --height N       capture height (0 = auto)\n"
@@ -1682,7 +1689,7 @@ public:
         lay->addWidget(view_, 1);
         lay->addWidget(strip_, 0);
 
-        setWindowTitle("dytqt — DYT thermal camera");
+        setWindowTitle(kAppName);
         /* So 'R' reaches keyPressEvent rather than being dropped. */
         setFocusPolicy(Qt::StrongFocus);
 
@@ -3558,7 +3565,7 @@ static int selftest(const opts &o)
         const std::string t  = about_text(true);
         const std::string t0 = about_text(false);
         const bool named = kAppVersion[0] != '\0' &&
-                           t.find("dytqt") != std::string::npos &&
+                           t.find(kAppName) != std::string::npos &&
                            t.find(kAppVersion) != std::string::npos;
         const bool keys  = t.find("z Z") != std::string::npos;
         const bool model = t.find("a model is loaded") != std::string::npos &&
@@ -4038,8 +4045,7 @@ static std::string about_text(bool have_model)
 {
     std::string s;
 
-    s += std::string("dytqt ") + kAppVersion +
-         " \xe2\x80\x94 DYT thermal camera\n\n";
+    s += std::string(kAppName) + " " + kAppVersion + "\n\n";
     s += "A Linux port of the Mechanic-Ti / DYT USB thermal camera viewer.\n";
     s += "Every pixel and every string comes from libdyt, the same engine\n";
     s += "the OpenCV viewer (tools/dytview) draws with.\n\n";
@@ -4332,7 +4338,7 @@ static int run_gui(const opts &o_in, QApplication &app)
         dyt_snapshot_t snap{};
         const bool have_model =
             dyt_session_snapshot(sess, &snap, nullptr, 0) == 0 && snap.sr_cap;
-        QMessageBox::about(&win, QStringLiteral("About dytqt"),
+        QMessageBox::about(&win, QString("About ") + kAppName,
                            QString::fromStdString(about_text(have_model)));
     };
 
@@ -4440,6 +4446,16 @@ static int run_gui(const opts &o_in, QApplication &app)
         retry_timer.stop();
         pm.fs = nullptr;
     };
+
+    /* The default source is the source tree's fixture, and that path is
+     * relative to the checkout.  An installed binary launched from the menu
+     * runs with cwd $HOME, so there is no fixture to replay — and replaying a
+     * frozen file is not what someone opening a camera viewer wants anyway.
+     * So: replay the fixture when it is actually there, and otherwise use the
+     * camera.  An explicit --fixture that cannot be read stays an error rather
+     * than becoming a silent switch to the device. */
+    if (!o.live && !o.fixture_set && access(o.fixture.c_str(), R_OK) != 0)
+        o.live = true;
 
     if (!o.live) {
         pm.fs = dyt_frame_source_open_fixture(

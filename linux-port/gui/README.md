@@ -6,6 +6,12 @@ that presentation live in `src/view_model.c`, which the OpenCV viewer
 (`tools/dytview.cpp`) consumes too. Neither front end owns a formatting rule, so
 they cannot drift apart.
 
+**Naming:** the product is *Mechanic iScout Thermal Camera*. That is what the
+desktop entry's `Name`, the window title and the About box say, all from one
+`kAppName` constant (which `packaging/check.sh` ties back to the entry). The
+binary and the packages stay **`dytqt`**, which is why `Exec=`, `Icon=`,
+`StartupWMClass` and every install path still read `dytqt`.
+
 | file | what it is |
 |---|---|
 | `dytqt.cpp` | the Qt6 Widgets application |
@@ -552,7 +558,7 @@ feature takes, and the reason `make check` passes both ways. See
 ## Run
 
 ```
-./build/dytqt                          # replays the default fixture
+./build/dytqt                          # the fixture, or the camera if it is absent
 ./build/dytqt --selftest               # headless check, needs no display
 ./build/dytqt --palette 5 --zoom 3
 ./build/dytqt --png /tmp/canvas.png    # save the window and exit
@@ -560,9 +566,18 @@ feature takes, and the reason `make check` passes both ways. See
 ./build/dytqt --live --vid 0x0bda --pid 0x5840
 ```
 
+The default source is the fixture — but that path is **relative to the
+checkout**, so an installed binary launched from the menu (cwd `$HOME`) has
+none to replay, and would otherwise exit with `testdata/…raw: No such file or
+directory`. So the app replays the fixture when it is actually readable and
+otherwise uses the camera, which is what someone opening a camera viewer wants
+anyway. An explicit `--fixture` that cannot be read is still an error rather
+than a silent switch to the device. `--selftest` always opens the fixture and
+is unaffected.
+
 | option | meaning |
 |---|---|
-| `--fixture PATH` | raw payload to replay (default `testdata/mode1000_256x384_default.raw`) |
+| `--fixture PATH` | raw payload to replay (default `testdata/mode1000_256x384_default.raw`; the camera is used when it is absent) |
 | `--width N` | sensor width of the fixture (default 256); with `--live`, the capture width override instead |
 | `--palette N` | 1-based palette index (default 1) |
 | `--palette-dir D` | where the `*.dat` ramps live (default: search) |
@@ -578,7 +593,7 @@ feature takes, and the reason `make check` passes both ways. See
 | `--prefs PATH` | preferences file (default `$DYT_PREFS`, else Qt's config location) |
 | `--no-prefs` | neither read nor write saved preferences |
 | `--selftest` | headless check over the fixture; needs no display |
-| `--live` | stream from the camera instead of replaying a fixture |
+| `--live` | stream from the camera instead of replaying a fixture (automatic when the default fixture is absent) |
 | `--vid V --pid P` | USB vendor/product id (`0x0000 0x0000` = first matching device) |
 | `--format-index N` | UVC bFormatIndex (0 = auto, uncompressed 16-bpp) |
 | `--height N` | capture height (0 = auto) |
@@ -915,10 +930,21 @@ staged share loads the staged model and passes the full selftest. That last one
 is the end-to-end check that the two relative paths (the rpath and the data
 search) are right.
 
+The RPM was then installed for real — `sudo dnf install ./build/dytqt-*.rpm` —
+and the **GUI launched from `/usr/bin/dytqt`**, which is exactly what the
+staged-tree `--selftest` could not catch: the default source was the
+source-tree fixture, so a menu launch (cwd `$HOME`) died on a missing
+`testdata/…raw` before a window appeared. The default now falls back to the
+camera when no fixture is readable — see "Run" — and launching the installed
+binary from both a checkout and `/tmp` is the check that covers it.
+
 `make check` runs `packaging/check.sh`, which pins the cross-file invariants a
 syntax linter cannot see: that the entry's `Exec`, `Icon` and `StartupWMClass`
 name the binary the Makefile installs, the icon it ships, and the WM_CLASS the
 app actually sets — `("dytqt","dytqt")`, measured with `xprop`, not assumed —
+that the entry's `Name` and the window title are one string (they share the
+`kAppName` constant, so a rename that touched only one would show up as a menu
+entry that opens a window titled something else),
 that the icon rasterises to something non-blank at 16 and 256 px, that the model
 ships where the app's own search looks, that a binary linking `libMNN.so` carries
 an rpath covering both packaged layouts and no path into the build tree, and that
@@ -1124,12 +1150,12 @@ only when the session wrote a parameter — then abandons it the same way.
   Driving the window with XTEST needs `QT_QPA_PLATFORM=xcb`: under the Wayland
   platform plugin the window is a native Wayland surface that X11 cannot see, and
   the key sender reports "no window matching" for a window that is plainly there.
-* **Neither package is installed by its own package manager here.** Both are
-  built, inspected with `rpm -qp`/`dpkg-deb`, and *run from their staged trees*,
-  which is what the file lists and the selftest establish. What is not exercised
-  is an actual transaction: `rpm --root` needs root for its lock and `dpkg -i` is
-  not run, so the dependency closure is checked by resolving every `Requires`
-  against the host's rpmdb rather than by installing.
+* **The `.deb` is not installed by its own package manager here.** The RPM *is*:
+  `sudo dnf install` completed on 2026-09-25 and laid the files out under `/usr`,
+  which is what surfaced the fixture-default bug above. The deb is only built,
+  inspected with `dpkg-deb` and run from its staged tree — `dpkg -i` is not run,
+  and its dependency closure is checked by resolving every `Requires` against
+  the host's package database rather than by installing.
 * **The RPM is a local artifact, not a Fedora submission.** It builds with this
   host's `rpmbuild` (6.0.2) and has not been through a Fedora review, `fedpkg` or
   `mock`. It ships no AppStream metainfo — `rpmlint` would say

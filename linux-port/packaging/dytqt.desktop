@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=dytqt
+Name=Mechanic iScout Thermal Camera
 GenericName=Thermal Camera
 Comment=View and record from a DYT/Mechanic-Ti USB thermal camera
 Exec=dytqt

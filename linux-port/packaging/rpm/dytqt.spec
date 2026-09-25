@@ -30,7 +30,7 @@
 Name:           dytqt
 Version:        %{_dytqt_version}
 Release:        1%{?dist}
-Summary:        Viewer and recorder for DYT/Mechanic-Ti USB thermal cameras
+Summary:        Mechanic iScout thermal camera viewer (DYT/Mechanic-Ti USB)
 
 # GPLv3 *only*: LICENSE is the unmodified GPLv3 text, packaging/deb/copyright
 # says "version 3", and no source header grants "or later".
@@ -40,10 +40,11 @@ License:        GPL-3.0-only
 Requires:       hicolor-icon-theme
 
 %description
-dytqt views and records from a DYT/Mechanic-Ti USB thermal camera.  It
-renders radiometric frames through the vendor's palettes, measures
-point/line/ROI temperatures with the same thermometry the device uses,
-and writes stills (DYT container) and clips (mp4).
+The Mechanic iScout Thermal Camera application (dytqt) views and records from
+a DYT/Mechanic-Ti USB thermal camera.  It renders radiometric frames through
+the vendor's palettes, measures point/line/ROI temperatures with the same
+thermometry the device uses, and writes stills (DYT container) and clips
+(mp4).
 
 It is a clean-room Linux port, not a vendor product, and shares no code
 with the Windows application.
