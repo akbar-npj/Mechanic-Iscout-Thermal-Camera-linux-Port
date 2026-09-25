@@ -381,6 +381,44 @@ typedef struct {
  * Returns 0 on success, or -1 when the file is not a DYT container. */
 int dyt_vm_still_info(const char *path, dyt_vm_still_info_t *info);
 
+/* The window's browsing state: what was found, which entry is highlighted, and
+ * whether the list is showing.  It is here rather than in the widget because
+ * the highlight rules — wrap at both ends, keep the selection across a rescan —
+ * are decisions a front end should not make twice, and they are testable with
+ * no window. */
+#define DYT_VM_GALLERY_MAX 32
+
+typedef struct {
+    dyt_vm_item_t items[DYT_VM_GALLERY_MAX];
+    int           n;      /* entries held, 0..DYT_VM_GALLERY_MAX */
+    int           sel;    /* highlighted index, -1 when there is none */
+    int           open;   /* the list is showing */
+} dyt_vm_gallery_t;
+
+/* Zero the state: no entries, no highlight, closed.  A plain `= { 0 }` would
+ * leave `sel` at 0 — a highlight on nothing — which is the one value the
+ * invariant forbids, so the caller must not hand-roll it. */
+void dyt_vm_gallery_init(dyt_vm_gallery_t *g);
+
+/* Rescan `dir` into `g`.  The highlight stays on the entry it was on when that
+ * entry is still there (matched by name), and otherwise moves to the newest —
+ * so a rescan while browsing does not jump the user somewhere else.  Returns
+ * the number of entries, or -1 on a bad argument or an unreadable directory, in
+ * which case the list is emptied and the highlight cleared. */
+int dyt_vm_gallery_load(dyt_vm_gallery_t *g, const char *dir);
+
+/* Move the highlight by `delta`, wrapping at both ends.  Does nothing when the
+ * list is empty. */
+void dyt_vm_gallery_move(dyt_vm_gallery_t *g, int delta);
+
+/* The highlighted entry, or NULL when there is none. */
+const dyt_vm_item_t *dyt_vm_gallery_sel(const dyt_vm_gallery_t *g);
+
+/* "gallery 3/12  dyt_...dyt.jpg  219 KB", or "gallery: no saved stills or
+ * clips".  Returns the number of characters that would have been written, or
+ * -1 on a bad argument. */
+int dyt_vm_gallery_label(const dyt_vm_gallery_t *g, char *out, size_t n);
+
 /* -------------------------------------------------------------- utilities */
 
 /* The directory the running executable lives in, or "" when it cannot be

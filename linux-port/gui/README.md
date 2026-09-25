@@ -361,6 +361,47 @@ The state lives in the pump (`CaptureCtl`), and the two keys reach it through
 for the same no-moc reason. `--selftest` drives both callbacks against a
 temporary directory and looks at the files that land.
 
+### The gallery
+
+| key | effect |
+|---|---|
+| `g` | show or hide the list; hiding also returns to the live view |
+| `↑` / `k`, `↓` / `j` | move the highlight (wraps at both ends) |
+| `Return` / `o` | open the highlighted entry |
+| `x` | export the highlighted still as a PNG |
+| `Esc` | close the list and return to the live view |
+
+The list is scanned from the same directory `s` and `v` write to, newest first,
+so it shows what this session and earlier ones saved. While it is up it has the
+keyboard: any key it does not bind is swallowed rather than reaching the tool,
+alarm or parameter bindings — a key that moved the highlight must not also
+change the tool.
+
+**Opening a still re-renders it, it does not just show a JPEG.** The entry's
+container is opened as a frame source (`dyt_frame_source_open_still`) and
+replayed through the same pipeline a live frame takes, with the app's current
+palette — so what you see is the saved radiometric data, not a picture of it. A
+container the vendor wrote has no geometry record; then the app's `--width` is
+the fallback, and if that does not resolve either, the entry is reported as
+unopenable rather than shown wrong. The render happens in a throwaway session,
+so the live stream (if any) is never disturbed: the still is drawn as an
+*override* over the running pump, and closing the gallery simply clears it.
+
+**Export writes the pixels you are looking at.** `x` renders the highlighted
+still the same way `o` does — the two share one `render_still()` so they cannot
+disagree — and writes it as a `dyt_<ts>.png` in the capture directory. That is
+the "same still, different palette" case the container exists to make possible.
+
+**A clip is listed but not played.** The port has no mp4 decoder wired into the
+window, so opening one says so rather than pretending. Export refuses a clip the
+same way. Both are honest gaps, not silent no-ops.
+
+The browsing state — the entries, the highlight, whether the list is up — is
+`dyt_vm_gallery_t` in the view model, because the rules that matter (wrap at the
+ends, keep the highlight on the same *file* across a rescan rather than the same
+index) are decisions a front end should not make twice, and they are pinned in
+`view_model_test`. The canvas only decides where the rows go.
+
 ## The toolkit decision — Qt6 Widgets
 
 Qt6 was chosen as the toolkit, and within Qt6, **Widgets** rather than Quick/QML.
@@ -481,9 +522,10 @@ reading the flat plane; it is the path the vendor's AD-mode tools use, and is
 only there because the port's super-resolution model was recovered against it.
 
 Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
-alarm and `i` shows the isotherm, `s` saves a still and `v` records a clip, and
-with `--live` the window reconnects on its own while `R` retries immediately —
-see "Measurement and alarm" and "Capture: stills and clips".
+alarm and `i` shows the isotherm, `s` saves a still and `v` records a clip, `g`
+browses what has been saved, and with `--live` the window reconnects on its own
+while `R` retries immediately — see "Measurement and alarm", "Capture: stills
+and clips" and "The gallery".
 
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
@@ -532,9 +574,11 @@ $ ./build/dytqt --selftest
   ok   q quits and is never swallowed (idle yes, armed yes)
   ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
   ok   a still writes the container and the PNG (wrote yes, 1 + 1, sized yes)
+  ok   the gallery opens a saved still (scan 1, still 0, frame 256x192, temps 31.41..32.41 C)
   ok   a clip starts, takes frames, and stops (start yes, label yes, fed yes, 5 frames, 1 file, gone yes)
   ok   a clip is refused where there is no disk (refused yes, says why yes)
   ok   the capture keys route (still 1, record 1)
+  ok   the gallery keys browse and open (open yes, move yes, swallow yes, opened 1, exported 1, closed yes, back to live yes)
 === ALL PASS ===
 ```
 
@@ -601,24 +645,35 @@ pins `param_raw_matches()`, the verdict the deferred read-back reaches: that
 not `0.80`, that an exact step does not tolerate a one-LSB error, and that the
 two Celsius types compare as whole kelvin.
 
-37–40 cover capture. They write into a `mkdtemp` directory and look at what
-landed, which is why the fixture now installs the raw payload: 37 asserts that
-`save_still()` writes *both* halves — one `.dyt.jpg` and one `.png`, each over a
-kilobyte — and that its message starts with `saved `; 38 drives the `CaptureCtl`
-state machine through start/feed/stop, checks the indicator is non-empty while
-running and empty after, and confirms one `.mp4` was written (or, in a build
-without OpenCV, that the refusal names OpenCV — the gate is the point); 39 points
-the guard at a directory that cannot exist and pins that it refuses *and* says
-why; 40 pins that `s` and `v` reach `on_still_`/`on_record_` at all. What they
-cannot pin is the mp4's playability and the container's parse — those were
-checked by hand against a real run (below).
+37–42 cover capture and the gallery. They write into a `mkdtemp` directory and
+look at what landed, which is why the fixture now installs the raw payload: 37
+asserts that `save_still()` writes *both* halves — one `.dyt.jpg` and one `.png`,
+each over a kilobyte — and that its message starts with `saved `; 38 scans that
+directory, opens the still as a frame source and checks it renders 256×192 with
+real temperatures (31–32 C, not the filler's ~238.85 C), which is what makes
+"opening a still goes through the live pipeline" more than a claim; 39 drives the
+`CaptureCtl` state machine through start/feed/stop, checks the indicator is
+non-empty while running and empty after, and confirms one `.mp4` was written (or,
+in a build without OpenCV, that the refusal names OpenCV — the gate is the
+point); 40 points the guard at a directory that cannot exist and pins that it
+refuses *and* says why; 41 pins that `s` and `v` reach
+`on_still_`/`on_record_` at all; 42 drives the real gallery keys and pins that
+`g` opens the list and rescans, the arrows move the highlight, `Return` and `x`
+reach their callbacks, a key the list does not bind is swallowed rather than
+reaching the tool, and closing returns to the live view. What they cannot pin is
+the mp4's playability and the container's parse — those were checked by hand
+against a real run (below).
 
-The capture was checked end to end through the real window as well: a fixture
-run driven with `s`/`v`/`v`/`q` wrote a `.dyt.jpg` (219 KB), a `.png` (70 KB,
-`file` says `PNG image data, 256 x 192, 8-bit/color RGB`) and an `.mp4` (31 KB,
-`ffprobe` says `h264 256x192 25/1 50 frames`, 2.0 s), and the port's own
-`dyt_dyt_read()` parsed the container back (rc 0, blob 1656 B, 196608 raw bytes,
-geometry 256×192 total 384 flags 0x1).
+The capture and the gallery were checked end to end through the real window as
+well: a fixture run driven with `s`/`v`/`v`/`q` wrote a `.dyt.jpg` (219 KB), a
+`.png` (70 KB, `file` says `PNG image data, 256 x 192, 8-bit/color RGB`) and an
+`.mp4` (31 KB, `ffprobe` says `h264 256x192 25/1 50 frames`, 2.0 s), and the
+port's own `dyt_dyt_read()` parsed the container back (rc 0, blob 1656 B, 196608
+raw bytes, geometry 256×192 total 384 flags 0x1). A second run over a directory
+of three saved items, driven with `g`/`o`/`x`/`g`/`q`, drew the list (the
+screenshots show `gallery 1/3` with the highlight on the newest), opened the
+still (line 3 read `viewing dyt_20260925-192004.dyt.jpg`) and exported a fresh
+70 KB `256x192` PNG.
 
 What these cannot pin is the write's real return code, the worker's `SetParam`
 branch, and the read-back itself, because all three need a live `dyt_capture_t`.
@@ -785,6 +840,15 @@ only when the session wrote a parameter — then abandons it the same way.
   the command line (`--zoom`) but not from the window, so the mirror is still
   unexercised interactively — which is why assertion 16 drives the transform
   directly.
+* **No clip playback.** The gallery lists `.mp4` clips and reports their size,
+  but the window has no mp4 decoder wired in, so opening one says so instead of
+  playing it. Export refuses a clip for the same reason. A recorded clip is
+  still playable by anything that reads mp4 (`ffplay`, `dytrec`'s output is a
+  normal h264 file) — what is missing is playback *inside* the app.
+* **A still being viewed has no colour bar and no measurement.** The override
+  draws the image and names it, but the bar and the tool overlays belong to the
+  live session's snapshot and range, which a still's render does not share.
+  Measuring a saved still is a later task.
 * **High-DPI and scaling.** The window paints at 1:1 device pixels, and the
   pointer math assumes it: at a device pixel ratio above 1 Qt scales the drawn
   image, so a widget coordinate would no longer be an image pixel and a click

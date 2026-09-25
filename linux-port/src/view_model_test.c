@@ -943,6 +943,64 @@ static void test_gallery(void)
     intcheck("gal: a NULL path is refused", dyt_vm_still_info(NULL, &info), -1);
     intcheck("gal: a NULL info is refused", dyt_vm_still_info(still, NULL), -1);
 
+    /* The browsing state: load, move, keep the highlight across a rescan. */
+    {
+        dyt_vm_gallery_t g;
+        dyt_vm_gallery_init(&g);
+        char             b[192];
+
+        intcheck("gal: the initial highlight is none", g.sel, -1);
+        intcheck("gal: an empty list loads as 0",
+                 dyt_vm_gallery_load(&g, "/nonexistent-dir-xyz/sub"), -1);
+        intcheck("gal: and leaves no highlight", g.sel, -1);
+        dyt_vm_gallery_move(&g, 1);
+        intcheck("gal: moving an empty list is harmless", g.sel, -1);
+
+        intcheck("gal: loading the directory", dyt_vm_gallery_load(&g, dir), 3);
+        intcheck("gal: the newest is highlighted first", g.sel, 0);
+        intcheck("gal: and it is the still",
+                 dyt_vm_gallery_sel(&g)->kind, DYT_VM_ITEM_STILL);
+
+        dyt_vm_gallery_move(&g, 1);
+        intcheck("gal: down moves the highlight", g.sel, 1);
+        intcheck("gal: onto the clip",
+                 dyt_vm_gallery_sel(&g)->kind, DYT_VM_ITEM_CLIP);
+        dyt_vm_gallery_move(&g, 2);
+        intcheck("gal: moving past the end wraps", g.sel, 0);
+        dyt_vm_gallery_move(&g, -1);
+        intcheck("gal: moving before the start wraps", g.sel, 2);
+
+        /* The size in the label is the file's, so assert the shape and the
+         * name rather than a byte count that depends on the encoder. */
+        dyt_vm_gallery_label(&g, b, sizeof b);
+        if (strncmp(b, "gallery 3/3  ", 13) == 0 &&
+            strstr(b, g.items[2].name) && strstr(b, "KB"))
+            ok("gal: the label names the entry and its size");
+        else
+            fail("gal: the label names the entry and its size", b);
+
+        /* A rescan keeps the highlight on the same entry, not on its index. */
+        dyt_vm_gallery_move(&g, -1);
+        intcheck("gal: the highlight is on the middle entry", g.sel, 1);
+        strcheck("gal: which is the clip",
+                 dyt_vm_gallery_sel(&g)->name, "dyt_20260101-000001.mp4");
+        dyt_vm_gallery_load(&g, dir);
+        intcheck("gal: a rescan keeps the selection", g.sel, 1);
+        strcheck("gal: still on the same file",
+                 dyt_vm_gallery_sel(&g)->name, "dyt_20260101-000001.mp4");
+
+        /* The label of an empty list says so rather than showing 0/0. */
+        {
+            dyt_vm_gallery_t e;
+            dyt_vm_gallery_init(&e);
+            dyt_vm_gallery_label(&e, b, sizeof b);
+            strcheck("gal: an empty list says so", b,
+                     "gallery: no saved stills or clips");
+        }
+        intcheck("gal: a NULL gallery label is refused",
+                 dyt_vm_gallery_label(NULL, b, sizeof b), -1);
+    }
+
     remove(still);
     remove(clip);
     remove(decoy);

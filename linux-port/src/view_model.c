@@ -880,6 +880,99 @@ int dyt_vm_still_info(const char *path, dyt_vm_still_info_t *info)
     return rc;
 }
 
+/* A file size a person reads at a glance. */
+static void human_size(long long bytes, char *out, size_t n)
+{
+    if (bytes >= (1LL << 20))
+        snprintf(out, n, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    else
+        snprintf(out, n, "%lld KB", (bytes + 512) / 1024);
+}
+
+void dyt_vm_gallery_init(dyt_vm_gallery_t *g)
+{
+    if (!g)
+        return;
+    memset(g, 0, sizeof *g);
+    g->sel = -1;
+}
+
+int dyt_vm_gallery_load(dyt_vm_gallery_t *g, const char *dir)
+{
+    char keep[DYT_VM_NAME_CAP];
+    int  had = 0, n, i;
+
+    if (!g)
+        return -1;
+
+    /* Remember what was highlighted, by name, before the list is replaced. */
+    if (g->sel >= 0 && g->sel < g->n) {
+        snprintf(keep, sizeof keep, "%s", g->items[g->sel].name);
+        had = 1;
+    }
+
+    n = dyt_vm_scan(dir, g->items, DYT_VM_GALLERY_MAX);
+    if (n < 0) {
+        g->n   = 0;
+        g->sel = -1;
+        return -1;
+    }
+    g->n = n > DYT_VM_GALLERY_MAX ? DYT_VM_GALLERY_MAX : n;
+
+    g->sel = g->n ? 0 : -1;
+    if (had) {
+        for (i = 0; i < g->n; i++) {
+            if (strcmp(g->items[i].name, keep) == 0) {
+                g->sel = i;
+                break;
+            }
+        }
+    }
+    return g->n;
+}
+
+void dyt_vm_gallery_move(dyt_vm_gallery_t *g, int delta)
+{
+    if (!g || g->n <= 0) {
+        if (g)
+            g->sel = -1;
+        return;
+    }
+    if (g->sel < 0)
+        g->sel = 0;
+    else
+        g->sel = (int)(((long long)g->sel + delta) % g->n);
+    if (g->sel < 0)
+        g->sel += g->n;
+}
+
+const dyt_vm_item_t *dyt_vm_gallery_sel(const dyt_vm_gallery_t *g)
+{
+    if (!g || g->sel < 0 || g->sel >= g->n)
+        return NULL;
+    return &g->items[g->sel];
+}
+
+int dyt_vm_gallery_label(const dyt_vm_gallery_t *g, char *out, size_t n)
+{
+    const dyt_vm_item_t *it;
+    char                 sz[32];
+
+    if (!g || !out || n == 0)
+        return -1;
+
+    if (g->n == 0)
+        return snprintf(out, n, "gallery: no saved stills or clips");
+
+    it = dyt_vm_gallery_sel(g);
+    if (!it)
+        return snprintf(out, n, "gallery: %d item(s), none selected", g->n);
+
+    human_size(it->bytes, sz, sizeof sz);
+    return snprintf(out, n, "gallery %d/%d  %s  %s", g->sel + 1, g->n,
+                    it->name, sz);
+}
+
 /* -------------------------------------------------------------- utilities */
 
 int dyt_vm_exe_dir(char *out, size_t n)

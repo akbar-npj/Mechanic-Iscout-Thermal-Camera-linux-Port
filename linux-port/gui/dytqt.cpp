@@ -753,6 +753,15 @@ public:
      * last real frame instead of flickering back to the placeholder. */
     void set_placeholder(const QString &s) { placeholder_ = s; update(); }
 
+    /* A saved still being viewed.  The pump keeps painting the live frame
+     * underneath — live keeps streaming, the fixture keeps ticking — so
+     * clearing this restores the stream with nothing to unwind. */
+    void set_override(const QImage &img) { override_ = img; update(); }
+
+    /* The gallery list, borrowed from MainWindow (which owns it).  A pointer
+     * rather than a copy because the canvas only reads it at paint time. */
+    void set_gallery(const dyt_vm_gallery_t *g) { gal_ = g; }
+
     /* Apply a measurement key.  Returns 1 if the key was ours, so the window
      * can fall through to whatever else it binds.  The snapshot is refreshed
      * so the overlay switches at once rather than at the next tick; only the
@@ -959,6 +968,17 @@ protected:
         const int x0 = kPad, y0 = kPad;
         p.drawImage(QPoint(x0, y0), img_);
 
+        /* A saved still takes the canvas.  It is drawn at the source's own
+         * size, which is what the still source renders, so no scaling is
+         * needed; the confirm overlay stays because the parameter keys are
+         * still live over a still. */
+        if (!override_.isNull()) {
+            p.drawImage(QPoint(x0, y0), override_);
+            draw_confirm(p);
+            draw_gallery(p);
+            return;
+        }
+
         /* The colour bar.  The tick rule — which palette entry belongs to
          * which row — is the view model's, so the Qt bar and the OpenCV one
          * cannot disagree about which end is hot. */
@@ -1117,9 +1137,65 @@ protected:
          * the placement is here. */
         draw_info_panel(p);
         draw_confirm(p);
+        draw_gallery(p);
     }
 
 private:
+    /* The gallery: a list of the saved stills and clips, with the highlighted
+     * entry picked out.  Every string is the view model's (the entry names,
+     * sizes and the selected row are dyt_vm_gallery_*'s); only the placement
+     * and the colours are here. */
+    void draw_gallery(QPainter &p)
+    {
+        if (!gal_ || !gal_->open)
+            return;
+
+        const int row_h  = 18;
+        const int head_h = 20;
+        const int avail  = std::max(1, (height() - 2 * kPad - head_h) / row_h);
+        const int rows   = std::min(gal_->n, avail);
+        const int panel_w = std::min(width() - 2 * kPad, 560);
+        const int panel_h = head_h + rows * row_h + 6;
+        const QRect r(kPad, kPad, panel_w, panel_h);
+
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 210));
+        p.drawRect(r);
+        p.setPen(QColor(120, 120, 120));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(r);
+
+        char lbl[192];
+        dyt_vm_gallery_label(gal_, lbl, sizeof lbl);
+        p.setPen(QColor(220, 220, 220));
+        p.drawText(r.left() + 6, r.top() + 14, QString::fromUtf8(lbl));
+
+        /* Scroll so the highlighted entry is always on screen. */
+        int first = 0;
+        if (gal_->sel >= rows)
+            first = gal_->sel - rows + 1;
+        if (first > gal_->n - rows)
+            first = std::max(0, gal_->n - rows);
+
+        for (int i = 0; i < rows; i++) {
+            const int idx = first + i;
+            const QRect row(r.left() + 2, r.top() + head_h + i * row_h,
+                            r.width() - 4, row_h);
+            if (idx == gal_->sel) {
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(0, 90, 160));
+                p.drawRect(row);
+            }
+            const char *kind = gal_->items[idx].kind == DYT_VM_ITEM_STILL
+                                   ? "still" : "clip";
+            char line[384];
+            std::snprintf(line, sizeof line, "%-5s  %s", kind,
+                          gal_->items[idx].name);
+            p.setPen(QColor(240, 240, 240));
+            p.drawText(row.left() + 4, row.top() + 13,
+                       QString::fromUtf8(line));
+        }
+    }
     /* The device panel: the module serial, the decoded user serial, the four
      * stored radiometric parameters and the slot count, top-left over the
      * image — the reference viewer's placement (draw_info_panel).  A value a
@@ -1227,6 +1303,11 @@ private:
     bool                show_info_   = true;
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
+
+    /* A saved still being viewed, and the gallery list (both owned elsewhere:
+     * the image by MainWindow, the list by MainWindow too). */
+    QImage                    override_;
+    const dyt_vm_gallery_t   *gal_ = nullptr;   /* borrowed */
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -1354,6 +1435,9 @@ public:
         setWindowTitle("dytqt — DYT thermal camera");
         /* So 'R' reaches keyPressEvent rather than being dropped. */
         setFocusPolicy(Qt::StrongFocus);
+
+        dyt_vm_gallery_init(&gal_);
+        view_->set_gallery(&gal_);
     }
 
     FrameView   *view()  const { return view_; }
@@ -1373,6 +1457,37 @@ public:
      * --selftest drives the real keys and then looks at what changed. */
     std::function<void()> on_still_;
     std::function<void()> on_record_;
+
+    /* The gallery.  `on_gallery_open_` is handed the highlighted entry (NULL
+     * when there is none) and `on_gallery_export_` likewise; both are the front
+     * end's, because one needs the pipeline and the other the disk. */
+    std::function<void(const dyt_vm_item_t *)> on_gallery_open_;
+    std::function<void(const dyt_vm_item_t *)> on_gallery_export_;
+    /* Called when the list is opened, so the front end can rescan and pick up
+     * anything saved since it was last looked at. */
+    std::function<void()> on_gallery_refresh_;
+
+    /* The browsing state, owned here and read by the canvas at paint time. */
+    dyt_vm_gallery_t *gallery() { return &gal_; }
+
+    /* Show a saved still: the canvas draws it and line 3 names it.  The pump
+     * keeps painting the live frame underneath, so clear_viewing() restores the
+     * stream with no source to swap back. */
+    void set_viewing(const QImage &img, const QString &label)
+    {
+        viewing_label_ = label;
+        view_->set_override(img);
+        strip_->set_lines(strip_->line(0), strip_->line(1), label);
+        fit_to_view();
+    }
+
+    void clear_viewing()
+    {
+        viewing_label_.clear();
+        view_->set_override(QImage());
+    }
+
+    bool viewing() const { return !viewing_label_.isEmpty(); }
 
     /* Size the window to the canvas it has to show.  Called once before the
      * window is shown, and again whenever the canvas changes size.
@@ -1412,7 +1527,7 @@ public:
         dyt_vm_status_line(&snap, mode, a, sizeof a);
         dyt_vm_readout_line(&snap, msg, b, sizeof b);
         strip_->set_lines(QString::fromUtf8(a), QString::fromUtf8(b),
-                          state_line(st, snap, fps));
+                          viewing() ? viewing_label_ : state_line(st, snap, fps));
         strip_->set_alarm(snap.alarm_on != 0, snap.alarm);
         fit_to_view();
     }
@@ -1422,7 +1537,7 @@ public:
     void set_state_line(DevState st, const dyt_snapshot_t &snap, double fps)
     {
         strip_->set_lines(strip_->line(0), strip_->line(1),
-                          state_line(st, snap, fps));
+                          viewing() ? viewing_label_ : state_line(st, snap, fps));
     }
 
 protected:
@@ -1481,6 +1596,54 @@ protected:
             return;
         }
 
+        /* The gallery.  'g' toggles the list; while it is open the arrows (and
+         * j/k) move the highlight, 'o' or Enter opens the entry and 'x' exports
+         * it, and Esc closes.  While the list is open it swallows the other
+         * bindings, because a key that moved the highlight must not also change
+         * the tool or arm a parameter. */
+        if (raw == 'g' && view_) {
+            gal_.open = !gal_.open;
+            if (gal_.open && on_gallery_refresh_)
+                on_gallery_refresh_();
+            else if (!gal_.open)
+                clear_viewing();        /* closing the gallery returns to live */
+            view_->update();
+            return;
+        }
+        if (gal_.open) {
+            if (raw == Qt::Key_Up || raw == 'k') {
+                dyt_vm_gallery_move(&gal_, -1);
+                view_->update();
+                return;
+            }
+            if (raw == Qt::Key_Down || raw == 'j') {
+                dyt_vm_gallery_move(&gal_, +1);
+                view_->update();
+                return;
+            }
+            /* Return arrives as 13 when the event carries text and as
+             * Qt::Key_Return when it does not (a synthesized event), so both
+             * are matched. */
+            if ((raw == 13 || raw == Qt::Key_Return || raw == Qt::Key_Enter ||
+                 raw == 'o') && on_gallery_open_) {
+                on_gallery_open_(dyt_vm_gallery_sel(&gal_));
+                return;
+            }
+            if (raw == 'x' && on_gallery_export_) {
+                on_gallery_export_(dyt_vm_gallery_sel(&gal_));
+                return;
+            }
+            if (raw == 27) {                    /* Esc closes, back to live */
+                gal_.open = false;
+                clear_viewing();
+                view_->update();
+                return;
+            }
+            /* Anything else is swallowed rather than acted on: the list has
+             * the keyboard while it is up. */
+            return;
+        }
+
         /* Capture: 's' saves a still, 'v' toggles a clip.  Both are free of
          * the device keys (r/d), the measurement keys (p/l/b/n/a/i) and the
          * parameter ladder (e/A/R/D/y), and both are lowercase. */
@@ -1509,6 +1672,8 @@ private:
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
     QSize        fitted_{};
+    dyt_vm_gallery_t gal_{};
+    QString      viewing_label_;
 };
 
 /* ------------------------------------------------------------ the pump
@@ -2846,6 +3011,91 @@ static int selftest(const opts &o)
         win.on_record_ = nullptr;
     }
 
+    /* 42. The gallery keys.  'g' opens the list and rescans, the arrows move
+     * the highlight, Return opens the highlighted entry and 'x' exports it,
+     * Esc closes — and while the list is up every other binding is swallowed,
+     * so a key that moved the highlight cannot also change the tool. */
+    {
+        char  tmpl2[] = "/tmp/dytqt-gal-XXXXXX";
+        char *dir2    = mkdtemp(tmpl2);
+        const std::string d2 = dir2 ? dir2 : ".";
+
+        std::string m;
+        save_still(sess, d2, m);          /* one entry to browse */
+
+        int                  opens = 0, exports = 0, refreshes = 0;
+        const dyt_vm_item_t *opened = nullptr;
+
+        win.on_gallery_refresh_ = [&]() {
+            refreshes++;
+            dyt_vm_gallery_load(win.gallery(), d2.c_str());
+        };
+        win.on_gallery_open_   = [&](const dyt_vm_item_t *it) {
+            opens++;
+            opened = it;
+            /* Stand in for the real render, so the test can pin that closing
+             * the gallery clears the still and returns to the stream. */
+            QImage probe(4, 4, QImage::Format_RGB888);
+            probe.fill(Qt::black);
+            win.set_viewing(probe, QStringLiteral("viewing test"));
+        };
+        win.on_gallery_export_ = [&](const dyt_vm_item_t *) { exports++; };
+
+        send_char('g');
+        const bool opened_ok = win.gallery()->open && refreshes == 1 &&
+                               win.gallery()->n == 1 && win.gallery()->sel == 0;
+
+        /* On a one-entry list both moves land back on it. */
+        send_key(Qt::Key_Down);
+        send_key(Qt::Key_Up);
+        const bool moved = win.gallery()->sel == 0;
+
+        /* A key the list does not bind must not reach the measurement set. */
+        dyt_snapshot_t before{};
+        dyt_session_snapshot(sess, &before, nullptr, 0);
+        send_char('p');
+        dyt_snapshot_t after{};
+        dyt_session_snapshot(sess, &after, nullptr, 0);
+        const bool swallowed = after.tool == before.tool;
+
+        send_key(Qt::Key_Return);
+        send_char('x');
+        send_esc();
+
+        const bool ok = opened_ok && moved && swallowed && opens == 1 &&
+                        exports == 1 && !win.gallery()->open &&
+                        !win.viewing() &&
+                        opened == &win.gallery()->items[0];
+        std::printf("  %-4s the gallery keys browse and open "
+                    "(open %s, move %s, swallow %s, opened %d, exported %d, "
+                    "closed %s, back to live %s)\n",
+                    ok ? "ok" : "FAIL", opened_ok ? "yes" : "NO",
+                    moved ? "yes" : "NO", swallowed ? "yes" : "NO", opens,
+                    exports, !win.gallery()->open ? "yes" : "NO",
+                    !win.viewing() ? "yes" : "NO");
+        if (!ok)
+            fails++;
+
+        win.on_gallery_refresh_ = nullptr;
+        win.on_gallery_open_    = nullptr;
+        win.on_gallery_export_  = nullptr;
+
+        {
+            DIR *dp = opendir(d2.c_str());
+            for (struct dirent *e; dp && (e = readdir(dp)) != nullptr;) {
+                if (e->d_name[0] == '.')
+                    continue;
+                char full[600];
+                snprintf(full, sizeof full, "%s/%s", d2.c_str(), e->d_name);
+                unlink(full);
+            }
+            if (dp)
+                closedir(dp);
+        }
+        if (dir2)
+            rmdir(dir2);
+    }
+
     /* Leave the view model's state as the rest of the run found it. */
     fv->clear_info();
     win.on_quit_  = nullptr;
@@ -3410,6 +3660,107 @@ static int run_gui(const opts &o, QApplication &app)
         } else {
             pm.notice(why, 200);          /* the refusal, held longer */
         }
+    };
+
+    /* The gallery.  It scans the capture directory — the same place 's' and
+     * 'v' write, so the gallery shows what this session and earlier ones
+     * saved.  Opening an entry renders it through a throwaway session, so the
+     * live stream (if any) is untouched: the window shows the still as an
+     * override while the pump keeps running underneath. */
+    win.on_gallery_refresh_ = [&]() {
+        dyt_vm_gallery_load(win.gallery(), o.capture_dir.c_str());
+    };
+
+    /* Render a still at the source's own size with the app's palette, into
+     * `rgb`.  Returns false and leaves `rgb` empty when it cannot.  Shared by
+     * open and export so the two cannot show/export different pixels. */
+    auto render_still = [&](const dyt_vm_item_t *it, std::vector<uint8_t> &rgb,
+                            int &w, int &h) -> bool {
+        dyt_session_t      *gs = nullptr;
+        dyt_frame_source_t *sf = nullptr;
+        const uint8_t      *px = nullptr;
+        bool                ok = false;
+
+        if (!it || it->kind != DYT_VM_ITEM_STILL)
+            return false;
+
+        gs = setup_session(o);
+        if (gs)
+            sf = dyt_frame_source_open_still(
+                gs, it->path, o.width, DYT_MODE_1000, DYT_PLANE_BOTTOM_HALF,
+                o.cap.t_amb, o.cap.sensor_mode, o.cap.fix_mode);
+        if (sf && dyt_frame_source_next(sf, &px, &w, &h) == DYT_FS_FRAME && px) {
+            rgb.assign(px, px + (size_t)w * (size_t)h * 3);
+            ok = true;
+        }
+        dyt_frame_source_close(sf);
+        dyt_session_free(gs);
+        return ok;
+    };
+
+    win.on_gallery_open_ = [&](const dyt_vm_item_t *it) {
+        if (!it) {
+            pm.notice("gallery: nothing selected");
+            return;
+        }
+        if (it->kind != DYT_VM_ITEM_STILL) {
+            /* The port has no mp4 decoder wired in; saying so is better than
+             * pretending the clip opened. */
+            pm.notice("clip playback is not implemented; 'x' exports a still",
+                      200);
+            return;
+        }
+
+        std::vector<uint8_t> rgb;
+        int                  w = 0, h = 0;
+        if (!render_still(it, rgb, w, h)) {
+            pm.notice(std::string("cannot open ") + it->name, 200);
+            return;
+        }
+
+        dyt_vm_still_info_t info;
+        QString             label = QStringLiteral("viewing %1")
+                                        .arg(QString::fromUtf8(it->name));
+        if (dyt_vm_still_info(it->path, &info) == 0 && !info.have_thermal)
+            label += QStringLiteral("   (no thermal geometry)");
+
+        const QImage img(rgb.data(), w, h, w * 3, QImage::Format_RGB888);
+        win.set_viewing(img.copy(), label);
+        pm.notice(std::string("opened ") + it->name, 120);
+    };
+
+    win.on_gallery_export_ = [&](const dyt_vm_item_t *it) {
+        if (!it) {
+            pm.notice("gallery: nothing selected");
+            return;
+        }
+        if (it->kind != DYT_VM_ITEM_STILL) {
+            pm.notice("only a still can be exported as a PNG", 200);
+            return;
+        }
+
+        std::vector<uint8_t> rgb;
+        int                  w = 0, h = 0;
+        if (!render_still(it, rgb, w, h)) {
+            pm.notice(std::string("cannot export ") + it->name, 200);
+            return;
+        }
+
+        char ts[32], path[512];
+        if (dyt_vm_timestamp(ts, sizeof ts) != 0 ||
+            dyt_vm_capture_name(path, sizeof path, o.capture_dir.c_str(), ts,
+                                "png") != 0) {
+            pm.notice("cannot export: no usable file name", 200);
+            return;
+        }
+        if (dyt_write_png(path, rgb.data(), w, h) != 0) {
+            pm.notice("cannot export: the PNG was not written", 200);
+            return;
+        }
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        pm.notice(std::string("exported ") + base, 150);
+        dyt_vm_gallery_load(win.gallery(), o.capture_dir.c_str());
     };
 
     win.on_close_ = [&]() {
