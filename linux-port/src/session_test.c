@@ -573,11 +573,114 @@ static void test_measurement(void)
     intcheck("line: empty when the tool is not LINE",
              dyt_session_profile(s, prof, 64), 0);
 
-    /* Clearing the points leaves the tool selected but unplaced. */
+    /* Polygon ROI.  The triangle (0,0) (4,0) (0,4) covers 10 pixels of the
+     * ramp; measure_test pins the same geometry, so this is the session
+     * plumbing around it, not a second opinion on the arithmetic. */
+    {
+        dyt_point_t tri[3];
+        tri[0].x = 0; tri[0].y = 0;
+        tri[1].x = 4; tri[1].y = 0;
+        tri[2].x = 0; tri[2].y = 4;
+
+        dyt_session_set_tool(s, DYT_TOOL_POLYGON);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: tool reported", (int)snap.tool, DYT_TOOL_POLYGON);
+        intcheck("poly: an empty outline has no reading", snap.roi_ok, 0);
+        intcheck("poly: and no vertices", snap.poly_n, 0);
+
+        /* Two vertices are still not a region. */
+        intcheck("poly: first vertex taken",
+                 dyt_session_polygon_add(s, 0, 0), 0);
+        intcheck("poly: second vertex taken",
+                 dyt_session_polygon_add(s, 4, 0), 0);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: two vertices is not a region", snap.roi_ok, 0);
+        intcheck("poly: vertices reported", snap.poly_n, 2);
+        intcheck("poly: vertex 1 x", snap.poly[1].x, 4);
+        intcheck("poly: vertex 1 y", snap.poly[1].y, 0);
+
+        /* The third completes it, and the reading is live from then on. */
+        intcheck("poly: third vertex taken",
+                 dyt_session_polygon_add(s, 0, 4), 0);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: ok once it has three", snap.roi_ok, 1);
+        intcheck("poly: n == 10", snap.roi.n, 10);
+        floatcheck("poly: min == 10", snap.roi.min, 10.0f, 1e-5f);
+        floatcheck("poly: max == 34", snap.roi.max, 34.0f, 1e-5f);
+        floatcheck("poly: mean == 19", snap.roi.mean, 19.0f, 1e-5f);
+        floatcheck("poly: median == 18.5", snap.roi.median, 18.5f, 1e-5f);
+
+        /* Undo takes the vertex back and reopens the outline. */
+        intcheck("poly: undo leaves two", dyt_session_polygon_undo(s), 2);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: undone is not a region", snap.roi_ok, 0);
+        intcheck("poly: the vertices came with it", snap.poly_n, 2);
+
+        /* Closing needs three vertices; with fewer it does nothing. */
+        dyt_session_set_polygon_closed(s, 1);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: too few to close", snap.poly_closed, 0);
+
+        dyt_session_set_polygon_pts(s, tri, 3);
+        dyt_session_set_polygon_closed(s, 1);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: closed reported", snap.poly_closed, 1);
+        intcheck("poly: closed still measures", snap.roi.n, 10);
+
+        /* A click after closing starts a new outline instead of extending the
+         * finished one. */
+        intcheck("poly: a click after closing is taken",
+                 dyt_session_polygon_add(s, 7, 3), 0);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: and starts a new outline", snap.poly_n, 1);
+        intcheck("poly: which is reopened", snap.poly_closed, 0);
+        intcheck("poly: the new outline has no reading", snap.roi_ok, 0);
+
+        /* A full outline is refused, not recycled: the shape is not lost. */
+        {
+            dyt_point_t many[DYT_POLYGON_MAX_VTX];
+            int i;
+            for (i = 0; i < DYT_POLYGON_MAX_VTX; i++) {
+                many[i].x = i % 8;
+                many[i].y = (i / 8) % 4;
+            }
+            dyt_session_set_polygon_pts(s, many, DYT_POLYGON_MAX_VTX);
+            dyt_session_snapshot(s, &snap, NULL, 0);
+            intcheck("poly: max vertices accepted", snap.poly_n,
+                     DYT_POLYGON_MAX_VTX);
+            intcheck("poly: one more is refused",
+                     dyt_session_polygon_add(s, 0, 0), -1);
+            dyt_session_snapshot(s, &snap, NULL, 0);
+            intcheck("poly: and the outline is intact", snap.poly_n,
+                     DYT_POLYGON_MAX_VTX);
+        }
+
+        /* An overlong or NULL list is refused rather than truncated, so a
+         * refused set cannot move the boundary. */
+        dyt_session_set_polygon_pts(s, tri, 3);
+        dyt_session_set_polygon_pts(s, tri, DYT_POLYGON_MAX_VTX + 1);
+        dyt_session_set_polygon_pts(s, NULL, 3);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: bad lists leave the outline alone", snap.poly_n, 3);
+
+        /* A NaN inside the outline is skipped, not counted. */
+        ramp[0] = NAN;                           /* was the minimum, 10 */
+        dyt_session_process(s, &fi);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: NaN skipped", snap.roi.n, 9);
+        floatcheck("poly: NaN cannot be the min", snap.roi.min, 11.0f, 1e-5f);
+        ramp[0] = 10.0f;
+        dyt_session_process(s, &fi);
+    }
+
+    /* Clearing the points leaves the tool selected but unplaced — and takes
+     * the polygon with them, because a front end has one clear action. */
     dyt_session_clear_points(s);
     dyt_session_snapshot(s, &snap, NULL, 0);
     intcheck("clear: p0 unset", snap.p0.x, -1);
     intcheck("clear: p1 unset", snap.p1.x, -1);
+    intcheck("clear: the polygon went too", snap.poly_n, 0);
+    intcheck("clear: and is reopened", snap.poly_closed, 0);
 
     dyt_session_free(s);
 }

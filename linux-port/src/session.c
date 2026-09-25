@@ -38,9 +38,13 @@ struct dyt_session {
     /* Measurement.  The points are in source pixels; -1 means "unset".  The
      * scratch buffer is for the ROI median, which is far too expensive for
      * the callback thread — so it is done in snapshot(), on the GUI thread,
-     * and grown here on demand. */
+     * and grown here on demand.  The polygon's outline is a second placement
+     * (session.h) and shares the same scratch. */
     dyt_tool_t   tool;
     dyt_point_t  p0, p1;
+    dyt_point_t  poly[DYT_POLYGON_MAX_VTX];
+    int          poly_n;
+    int          poly_closed;
     float       *roi_scratch;
     int          roi_cap;
 
@@ -390,6 +394,11 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
     out->p0   = s->p0;
     out->p1   = s->p1;
 
+    out->poly_n      = s->poly_n;
+    out->poly_closed = s->poly_closed;
+    if (s->poly_n > 0)
+        memcpy(out->poly, s->poly, (size_t)s->poly_n * sizeof out->poly[0]);
+
     out->point_ok = 0;
     out->point_c  = NAN;
     out->roi_ok   = 0;
@@ -446,14 +455,15 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
         }
     }
 
-    if (s->tool == DYT_TOOL_BOX) {
-        int need = s->width * s->height;   /* the largest possible box */
-        int rc;
+    if (s->tool == DYT_TOOL_BOX || s->tool == DYT_TOOL_POLYGON) {
+        int need = s->width * s->height;   /* the largest possible region */
+        int rc   = -1;
 
-        /* dyt_measure_roi() only computes the median when it is given a
-         * buffer, so the session must always own one — passing NULL would
+        /* Both measure functions only compute the median when they are given
+         * a buffer, so the session must always own one — passing NULL would
          * silently report NaN.  Size it for the whole frame once, and reuse
-         * it for every smaller box. */
+         * it for every smaller region.  That size also rules out -2: neither
+         * region can cover more pixels than the frame. */
         if (s->roi_cap < need) {
             float *grown = realloc(s->roi_scratch,
                                    (size_t)need * sizeof *grown);
@@ -463,9 +473,17 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
             }
         }
 
-        rc = dyt_measure_roi(s->temps, s->width, s->height,
-                             s->p0.x, s->p0.y, s->p1.x, s->p1.y,
-                             s->roi_scratch, s->roi_cap, &out->roi);
+        if (s->tool == DYT_TOOL_BOX)
+            rc = dyt_measure_roi(s->temps, s->width, s->height,
+                                 s->p0.x, s->p0.y, s->p1.x, s->p1.y,
+                                 s->roi_scratch, s->roi_cap, &out->roi);
+        else
+            rc = dyt_measure_polygon(s->temps, s->width, s->height,
+                                     s->poly, s->poly_n,
+                                     s->roi_scratch, s->roi_cap, &out->roi);
+
+        /* Fewer than three polygon vertices is rc == -1, which leaves roi_ok
+         * clear: an unfinished outline has no region to report. */
         out->roi_ok = (rc == 0 && out->roi.n > 0);
     }
 
@@ -1047,6 +1065,86 @@ void dyt_session_clear_points(dyt_session_t *s)
     pthread_mutex_lock(&s->m);
     s->p0.x = s->p0.y = -1;
     s->p1.x = s->p1.y = -1;
+    /* The polygon is a placement too, so "forget the measurement" forgets it:
+     * a front end has one clear action, not one per tool (session.h). */
+    s->poly_n      = 0;
+    s->poly_closed = 0;
+    pthread_mutex_unlock(&s->m);
+}
+
+int dyt_session_polygon_add(dyt_session_t *s, int x, int y)
+{
+    int rc = 0;
+
+    if (!s)
+        return -1;
+
+    pthread_mutex_lock(&s->m);
+
+    if (s->poly_closed) {
+        /* The user declared the outline finished, so this vertex begins a new
+         * one rather than extending the shape they just closed. */
+        s->poly_n      = 0;
+        s->poly_closed = 0;
+    } else if (s->poly_n >= DYT_POLYGON_MAX_VTX) {
+        rc = -1;                /* full: refuse, never recycle (session.h) */
+    }
+
+    if (rc == 0) {
+        s->poly[s->poly_n].x = x;
+        s->poly[s->poly_n].y = y;
+        s->poly_n++;
+    }
+
+    pthread_mutex_unlock(&s->m);
+    return rc;
+}
+
+int dyt_session_polygon_undo(dyt_session_t *s)
+{
+    int n;
+
+    if (!s)
+        return -1;
+
+    pthread_mutex_lock(&s->m);
+    /* Reopening is part of the undo: the user is stepping back through the
+     * shape, so it has to accept vertices again. */
+    s->poly_closed = 0;
+    if (s->poly_n > 0)
+        s->poly_n--;
+    n = s->poly_n;
+    pthread_mutex_unlock(&s->m);
+    return n;
+}
+
+void dyt_session_set_polygon_closed(dyt_session_t *s, int closed)
+{
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->m);
+    /* A region needs three vertices, so closing a shorter outline would claim
+     * a shape that cannot exist. */
+    s->poly_closed = (closed && s->poly_n >= 3) ? 1 : 0;
+    pthread_mutex_unlock(&s->m);
+}
+
+void dyt_session_set_polygon_pts(dyt_session_t *s, const dyt_point_t *pts, int n)
+{
+    if (!s)
+        return;
+    if (n < 0 || n > DYT_POLYGON_MAX_VTX)
+        return;                     /* refused, not truncated */
+    if (n > 0 && !pts)
+        return;
+
+    pthread_mutex_lock(&s->m);
+    if (n > 0)
+        memcpy(s->poly, pts, (size_t)n * sizeof s->poly[0]);
+    s->poly_n = n;
+    /* A whole new outline is not the finished shape a previous close
+     * declared. */
+    s->poly_closed = 0;
     pthread_mutex_unlock(&s->m);
 }
 

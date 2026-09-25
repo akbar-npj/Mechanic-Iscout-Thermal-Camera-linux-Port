@@ -191,9 +191,17 @@ int dyt_vm_readout_line(const dyt_snapshot_t *snap, const char *msg,
         appf(out, n, &off, "box (%d,%d)-(%d,%d) n=%d",
              snap->p0.x, snap->p0.y, snap->p1.x, snap->p1.y, snap->roi.n);
         break;
+    case DYT_TOOL_POLYGON:
+        /* The closed flag is worth showing: it is the difference between "the
+         * next click extends this" and "the next click starts over". */
+        appf(out, n, &off, "polygon %d pts%s n=%d",
+             snap->poly_n, snap->poly_closed ? " (closed)" : "",
+             snap->roi.n);
+        break;
     case DYT_TOOL_NONE:
     default:
-        app(out, n, &off, "tool: none (p point, l line, b box, n clear)");
+        app(out, n, &off,
+            "tool: none (p point, l line, b box, o polygon, n clear)");
         break;
     }
 
@@ -521,15 +529,22 @@ int dyt_vm_tool_mouse(dyt_session_t *s, dyt_vm_pointer_t *p,
 
     if (ev == DYT_VM_MOUSE_DOWN) {
         p->dragging = 1;
-        if (ok) {
-            dyt_session_set_point(s, 0, sx, sy);
-            dyt_session_set_point(s, 1, sx, sy);
-            return 1;
-        }
-        return 0;
+        if (!ok)
+            return 0;
+        /* The polygon is placed a click at a time, not dragged: each press
+         * adds a vertex, and the shape is measured as soon as it has three.
+         * A press after the outline was closed begins a new one (the session
+         * decides that, so both front ends get the same gesture). */
+        if (tool == DYT_TOOL_POLYGON)
+            return dyt_session_polygon_add(s, sx, sy) == 0;
+        dyt_session_set_point(s, 0, sx, sy);
+        dyt_session_set_point(s, 1, sx, sy);
+        return 1;
     }
 
-    if (ev == DYT_VM_MOUSE_MOVE && p->dragging) {
+    /* Only the drag tools move point 1: for the polygon a move has nothing to
+     * place, and the front end draws its own rubber band to the cursor. */
+    if (ev == DYT_VM_MOUSE_MOVE && p->dragging && tool != DYT_TOOL_POLYGON) {
         if (ok) {
             dyt_session_set_point(s, 1, sx, sy);
             return 1;

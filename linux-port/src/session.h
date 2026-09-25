@@ -64,7 +64,8 @@ typedef enum {
     DYT_TOOL_NONE = 0,   /* no measurement */
     DYT_TOOL_POINT,      /* a single pixel, at p0 */
     DYT_TOOL_LINE,       /* a profile from p0 to p1 */
-    DYT_TOOL_BOX         /* a rectangle ROI spanned by p0 and p1 */
+    DYT_TOOL_BOX,        /* a rectangle ROI spanned by p0 and p1 */
+    DYT_TOOL_POLYGON     /* an arbitrary region through poly[] */
 } dyt_tool_t;
 
 /* A consistent view of the session for the GUI thread.  Everything here is
@@ -92,11 +93,24 @@ typedef struct {
     dyt_tool_t  tool;         /* which tool is active */
     dyt_point_t p0, p1;       /* the placed points, in source pixels */
 
+    /* The polygon tool's outline, in source pixels.  `poly_closed` is the
+     * placement state, not the geometry: the region is always measured as a
+     * closed shape, and the flag only says whether the user has declared the
+     * outline finished (so the next vertex starts a new one instead of
+     * extending it). */
+    int         poly_n;                           /* vertices placed, 0..MAX */
+    dyt_point_t poly[DYT_POLYGON_MAX_VTX];
+    int         poly_closed;
+
     int   point_ok;           /* 1 when tool == POINT and p0 has a reading */
     float point_c;            /* the reading at p0, Celsius */
 
-    int             roi_ok;   /* 1 when tool == BOX and the box is non-empty */
-    dyt_roi_stats_t roi;      /* stats over p0..p1 */
+    /* The area tool's statistics: the box (p0..p1) or the polygon, whichever
+     * `tool` selects.  One set of fields rather than two, because a front end
+     * shows them in the same place and only one area tool is ever active —
+     * `tool` is what says which geometry produced them. */
+    int             roi_ok;   /* 1 when the region is non-empty */
+    dyt_roi_stats_t roi;
 
     int             iso_on;   /* the alarm band is being shown as an isotherm */
     dyt_isotherm_t  iso;      /* pixels inside [iso_lo, iso_hi] */
@@ -337,8 +351,46 @@ void dyt_session_set_tool(dyt_session_t *s, dyt_tool_t t);
  * simply reports no reading, rather than the front-end having to clamp. */
 void dyt_session_set_point(dyt_session_t *s, int which, int x, int y);
 
-/* Forget both points (the viewer's "n" key). */
+/* Forget the whole measurement — both points and the polygon outline (the
+ * viewer's "n" key).  One action rather than one per tool: a front end has a
+ * single "clear" affordance, and leaving a polygon behind after the user
+ * cleared would be a measurement they cannot see the provenance of. */
 void dyt_session_clear_points(dyt_session_t *s);
+
+/* ---- the polygon tool ---------------------------------------------------
+ * The outline is the vertices the user placed, in source pixels.  The session
+ * closes it automatically, so the region is measured as soon as the third
+ * vertex lands and updates with each further one; there is no "commit" step.
+ * Until then the tool reports no reading, which is the honest answer for a
+ * region that does not exist yet. */
+
+/* Add one vertex.  While the outline is closed this *starts a new one* rather
+ * than extending the finished shape — the standard polygon-tool gesture, and
+ * the reason the closed flag exists at all.
+ *
+ * Returns 0 when the vertex was taken, -1 when the outline is full
+ * (DYT_POLYGON_MAX_VTX vertices and not closed) or on a bad argument.  A full
+ * outline is refused rather than recycled, because silently dropping the shape
+ * the user was drawing would lose their work; the front end says so and the
+ * user closes it or undoes a vertex. */
+int dyt_session_polygon_add(dyt_session_t *s, int x, int y);
+
+/* Take back the most recent vertex, and reopen a closed outline — the user is
+ * stepping back through the shape, so it must accept vertices again.  Returns
+ * the number of vertices left, or -1 on a bad argument. */
+int dyt_session_polygon_undo(dyt_session_t *s);
+
+/* Declare the outline finished (or reopen it).  Closing with fewer than three
+ * vertices does nothing: a region needs three, so the flag would claim a shape
+ * that cannot exist. */
+void dyt_session_set_polygon_closed(dyt_session_t *s, int closed);
+
+/* Replace the whole outline.  `n` above DYT_POLYGON_MAX_VTX, or a NULL list
+ * with n > 0, is refused rather than truncated — dropping a vertex would move
+ * the boundary the user drew.  Replaces the placement, so any previous close
+ * is cleared with it. */
+void dyt_session_set_polygon_pts(dyt_session_t *s, const dyt_point_t *pts,
+                                 int n);
 
 /* Copy the current line profile into `out` (cap floats).  Returns the number
  * of points written, -1 if there is no frame, or the negated requirement if

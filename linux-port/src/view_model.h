@@ -221,10 +221,13 @@ typedef struct {
  * A press places both points, a move while dragging moves point 1, and a
  * release ends the drag — so one gesture draws a line or a box, and a plain
  * click leaves both points on the same pixel, which is exactly a point probe.
- * A pointer outside the image still updates x/y (for the readout) but places
- * nothing.
+ * The polygon is the exception: it is placed a click at a time, so a press
+ * adds a vertex and a move places nothing (the front end draws its own rubber
+ * band from the last vertex to the cursor).  A pointer outside the image still
+ * updates x/y (for the readout) but places nothing.
  *
- * Returns 1 when the session's geometry changed, 0 otherwise. */
+ * Returns 1 when the session's geometry changed, 0 otherwise — which for the
+ * polygon includes a press refused because the outline is full. */
 int dyt_vm_tool_mouse(dyt_session_t *s, dyt_vm_pointer_t *p,
                       dyt_vm_mouse_ev_t ev, dyt_tool_t tool,
                       const dyt_view_transform_t *xform,

@@ -335,7 +335,7 @@ static void test_readout_line(void)
     s.tool = DYT_TOOL_NONE;
     dyt_vm_readout_line(&s, NULL, b, sizeof b);
     strcheck("readout: no tool", b,
-             "tool: none (p point, l line, b box, n clear)");
+             "tool: none (p point, l line, b box, o polygon, n clear)");
 
     s.tool = DYT_TOOL_POINT;
     s.point_ok = 1;
@@ -352,6 +352,19 @@ static void test_readout_line(void)
     s.p1.x = 3; s.p1.y = 4;
     dyt_vm_readout_line(&s, NULL, b, sizeof b);
     strcheck("readout: a line", b, "line (1,2)-(3,4)");
+
+    s.tool = DYT_TOOL_POLYGON;
+    s.poly_n = 5;
+    s.poly_closed = 1;
+    s.roi.n = 77;
+    dyt_vm_readout_line(&s, NULL, b, sizeof b);
+    strcheck("readout: a closed polygon", b, "polygon 5 pts (closed) n=77");
+
+    /* An open outline says so: it is the difference between the next click
+     * extending the shape and starting a new one. */
+    s.poly_closed = 0;
+    dyt_vm_readout_line(&s, NULL, b, sizeof b);
+    strcheck("readout: an open polygon", b, "polygon 5 pts n=77");
 
     s.tool = DYT_TOOL_BOX;
     s.p0.x = 0; s.p0.y = 0;
@@ -821,6 +834,42 @@ static void test_tool_mouse(void)
     intcheck("tool: a press off-image places nothing",
              dyt_vm_tool_mouse(s, &p, DYT_VM_MOUSE_DOWN, DYT_TOOL_BOX,
                                &xf, 16, 16, 16, 16, 99, 99), 0);
+
+    /* The polygon is placed a click at a time, not dragged.  The triangle
+     * (1,1) (9,1) (1,9) covers 36 pixels of the 16x16 ramp. */
+    dyt_session_set_tool(s, DYT_TOOL_POLYGON);
+    intcheck("tool: polygon click 1",
+             dyt_vm_tool_mouse(s, &p, DYT_VM_MOUSE_DOWN, DYT_TOOL_POLYGON,
+                               &xf, 16, 16, 16, 16, 1, 1), 1);
+    intcheck("tool: polygon click 2",
+             dyt_vm_tool_mouse(s, &p, DYT_VM_MOUSE_DOWN, DYT_TOOL_POLYGON,
+                               &xf, 16, 16, 16, 16, 9, 1), 1);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("tool: two polygon vertices are not a region", snap.roi_ok, 0);
+
+    intcheck("tool: a polygon move places nothing",
+             dyt_vm_tool_mouse(s, &p, DYT_VM_MOUSE_MOVE, DYT_TOOL_POLYGON,
+                               &xf, 16, 16, 16, 16, 9, 9), 0);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("tool: and adds no vertex", snap.poly_n, 2);
+
+    intcheck("tool: polygon click 3",
+             dyt_vm_tool_mouse(s, &p, DYT_VM_MOUSE_DOWN, DYT_TOOL_POLYGON,
+                               &xf, 16, 16, 16, 16, 1, 9), 1);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("tool: three vertices placed", snap.poly_n, 3);
+    intcheck("tool: the region is measured", snap.roi.n, 36);
+    /* The polygon is a separate placement: the box's points are untouched, so
+     * switching back to BOX still has the region the user drew. */
+    intcheck("tool: the polygon left point 0 alone", snap.p0.x, 3);
+    intcheck("tool: and point 1", snap.p1.x, 9);
+
+    /* A release after a polygon click changes nothing, but does end the
+     * press-to-release span like any other tool. */
+    intcheck("tool: a polygon release changes no geometry",
+             dyt_vm_tool_mouse(s, &p, DYT_VM_MOUSE_UP, DYT_TOOL_POLYGON,
+                               &xf, 16, 16, 16, 16, 1, 9), 0);
+    intcheck("tool: and closes the drag", p.dragging, 0);
 
     dyt_session_free(s);
 }

@@ -353,14 +353,16 @@ static cv::Mat waiting_canvas(viewer *v, const char *msg){
              20, 220, cv::Scalar(130, 130, 130), 0.45);
     put_text(m, "      h/v mirror   +/- zoom   s still   w png   q quit",
              20, 244, cv::Scalar(130, 130, 130), 0.45);
-    put_text(m, "      p point   l line   b box   n clear   a alarm   i isotherm",
+    put_text(m, "      p point   l line   b box   o polygon   n clear",
              20, 268, cv::Scalar(130, 130, 130), 0.45);
-    put_text(m, "      f fusion   [ ] align X   ; ' align Y",
+    put_text(m, "      a alarm   i isotherm",
              20, 292, cv::Scalar(130, 130, 130), 0.45);
-    put_text(m, "      d device info",
+    put_text(m, "      f fusion   [ ] align X   ; ' align Y",
              20, 316, cv::Scalar(130, 130, 130), 0.45);
-    put_text(m, "      e emis  A amb  R refl  D dist  (then y to send)",
+    put_text(m, "      d device info",
              20, 340, cv::Scalar(130, 130, 130), 0.45);
+    put_text(m, "      e emis  A amb  R refl  D dist  (then y to send)",
+             20, 364, cv::Scalar(130, 130, 130), 0.45);
     return m;
 }
 
@@ -562,6 +564,51 @@ static cv::Mat render(viewer *v)
                 }
             }
         }
+
+        if (snap.tool == DYT_TOOL_POLYGON && snap.poly_n > 0) {
+            std::vector<cv::Point> verts, outline;
+
+            for (int i = 0; i < snap.poly_n; i++) {
+                int px = 0, py = 0;
+                if (proj(snap.poly[i].x, snap.poly[i].y, px, py))
+                    verts.push_back(cv::Point(px, py));
+            }
+            outline = verts;
+
+            /* A rubber band to the cursor while the outline is still open:
+             * without it the user cannot see where the next click will land.
+             * A closed outline has no next click, so it gets none. */
+            if (!snap.poly_closed && v->ptr.x >= 0)
+                outline.push_back(cv::Point(v->ptr.x, v->ptr.y));
+
+            if (outline.size() >= 2) {
+                const cv::Point *pp  = outline.data();
+                const int        npt = (int)outline.size();
+                const bool       shut = snap.poly_closed && verts.size() >= 3;
+
+                cv::polylines(canvas, &pp, &npt, 1, shut,
+                              cv::Scalar(0, 0, 0), 3);
+                cv::polylines(canvas, &pp, &npt, 1, shut,
+                              cv::Scalar(0, 255, 255), 1);
+            }
+            for (size_t i = 0; i < verts.size(); i++)
+                cv::circle(canvas, verts[i], 3,
+                           i == 0 ? cv::Scalar(0, 128, 255)
+                                  : cv::Scalar(0, 255, 255),
+                           cv::FILLED);
+
+            if (snap.roi_ok && !verts.empty()) {
+                char buf[160];
+                std::snprintf(buf, sizeof buf,
+                              "min %s  max %s  avg %s  med %s",
+                              tstr(snap, snap.roi.min).c_str(),
+                              tstr(snap, snap.roi.max).c_str(),
+                              tstr(snap, snap.roi.mean).c_str(),
+                              tstr(snap, snap.roi.median).c_str());
+                put_text(canvas, buf, verts[0].x + 6, verts[0].y - 6,
+                         cv::Scalar(0, 255, 255), 0.5);
+            }
+        }
     }
 
     /* ---- device identity overlay (Phase 3) ---- */
@@ -620,6 +667,12 @@ static void on_mouse(int event, int x, int y, int flags, void *user)
     case cv::EVENT_LBUTTONDOWN: ev = DYT_VM_MOUSE_DOWN; break;
     case cv::EVENT_MOUSEMOVE:   ev = DYT_VM_MOUSE_MOVE; break;
     case cv::EVENT_LBUTTONUP:   ev = DYT_VM_MOUSE_UP;   break;
+    case cv::EVENT_RBUTTONDOWN:
+        /* The polygon's own gesture: finish the outline.  Not routed through
+         * the shared placement, which only knows presses, moves and drags. */
+        if (v->tool == DYT_TOOL_POLYGON)
+            dyt_session_set_polygon_closed(v->sess, 1);
+        return;
     default:                    return;
     }
 
@@ -733,7 +786,8 @@ static void usage(const char *prog)
         "      h/v mirror · + / - zoom · q or ESC quit\n"
         "      s save a DYT still (picture + raw payload) · w save a PNG of the\n"
         "      whole window\n"
-        "      p point · l line · b box · n clear points (click/drag to place)\n"
+        "      p point · l line · b box · o polygon (click per vertex,\n"
+        "      right-click or Enter to close) · n clear (click/drag to place)\n"
         "      a alarm on/off · i isotherm (alarm band) overlay\n"
         "      f cycle fusion · [ ] align visible X · ; ' align visible Y\n"
         "      d device-info panel (serial + stored parameters)\n"
@@ -1029,15 +1083,25 @@ int main(int argc, char **argv)
             dyt_session_zoom(v.sess, 1);
         } else if (key == '-' || key == '_') {
             dyt_session_zoom(v.sess, -1);
-        } else if (key == 'p' || key == 'l' || key == 'b' || key == 'n') {
+        } else if (key == 'p' || key == 'l' || key == 'b' || key == 'o' ||
+                   key == 'n') {
             /* One key per tool; "n" also forgets the placed points so the
              * next tool starts clean. */
-            v.tool = (key == 'p') ? DYT_TOOL_POINT :
-                     (key == 'l') ? DYT_TOOL_LINE  :
-                     (key == 'b') ? DYT_TOOL_BOX   : DYT_TOOL_NONE;
+            v.tool = (key == 'p') ? DYT_TOOL_POINT   :
+                     (key == 'l') ? DYT_TOOL_LINE    :
+                     (key == 'b') ? DYT_TOOL_BOX     :
+                     (key == 'o') ? DYT_TOOL_POLYGON : DYT_TOOL_NONE;
             dyt_session_set_tool(v.sess, v.tool);
             if (key == 'n')
                 dyt_session_clear_points(v.sess);
+        } else if ((key == 13 || key == 10) && v.tool == DYT_TOOL_POLYGON) {
+            /* Enter closes the outline, so the next click starts a new one
+             * instead of extending the shape just finished.  Kept out of the
+             * tool chain above because it is a polygon gesture, not a tool
+             * key — and "e" is already emissivity. */
+            dyt_session_set_polygon_closed(v.sess, 1);
+        } else if (key == 'z' && v.tool == DYT_TOOL_POLYGON) {
+            dyt_session_polygon_undo(v.sess);
         } else if (key == 'a') {
             /* Arm the alarm across the middle of whatever range is on
              * screen, so the hottest and coldest parts of the scene trip it.
