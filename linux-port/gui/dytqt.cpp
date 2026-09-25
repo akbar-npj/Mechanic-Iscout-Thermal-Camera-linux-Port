@@ -1770,15 +1770,52 @@ public:
      *
      * Keyed off the canvas hint so it fires once when the first frame arrives
      * and again only if the zoom changes — not on every frame, which would
-     * fight a user who resized the window by hand. */
+     * fight a user who resized the window by hand.
+     *
+     * Nothing here while fullscreen is on.  This runs on every painted frame
+     * (set_frame_status), and resize() on a fullscreen window is not harmless:
+     * the window manager owns that geometry and may drop the fullscreen hint,
+     * and on the offscreen platform resize() really does change the size — so
+     * a zoom during fullscreen would resize the window out from under
+     * showFullScreen().  The guard sits *before* the cache, so `fitted_` is not
+     * advanced while fullscreen either and leaving it re-fits if the canvas
+     * changed size in the meantime. */
     void fit_to_view()
     {
+        if (fullscreen_)
+            return;
+
         const QSize want = view_->sizeHint();
         if (want == fitted_)
             return;
         fitted_ = want;
         resize(sizeHint());
     }
+
+    /* Full screen, the vendor viewer's F11.  A window state, not a canvas one:
+     * the canvas draws the same picture either way and scales it to whatever
+     * room it is given, so there is nothing to tell FrameView here beyond a
+     * repaint.
+     *
+     * showNormal() restores the geometry the window had before, but `fitted_`
+     * is deliberately cleared: if the canvas grew while fullscreen (a zoom, or
+     * a super-resolved frame) the window would otherwise come back too small
+     * and clip the picture.  fit_to_view() then re-fits to the new hint. */
+    void toggle_fullscreen()
+    {
+        fullscreen_ = !fullscreen_;
+        if (fullscreen_) {
+            showFullScreen();
+        } else {
+            showNormal();
+            fitted_ = QSize();
+            fit_to_view();
+        }
+        if (view_)
+            view_->update();
+    }
+
+    bool fullscreen() const { return fullscreen_; }
 
     /* A painted frame: all three lines. */
     void set_frame_status(const dyt_snapshot_t &snap, DevState st, double fps,
@@ -1820,6 +1857,15 @@ public:
     {
         if (view_ && view_->param_key(raw))
             return 1;
+
+        /* Full screen.  Placed after the ladder, so it is swallowed while a
+         * write is armed like every other key but 'q'.  Qt::Key_F11, not a
+         * character: an event for it carries no text, so keyPressEvent's
+         * unfold leaves the key code in `raw` untouched. */
+        if (raw == Qt::Key_F11) {
+            toggle_fullscreen();
+            return 1;
+        }
 
         /* Quit.  'q' is deliberately never swallowed, armed or not. */
         if (raw == 'q') {
@@ -1966,6 +2012,10 @@ private:
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
     QSize        fitted_{};
+    /* Whether showFullScreen() is in force.  Tracked here rather than asked of
+     * the window manager, because fit_to_view() consults it on every painted
+     * frame and isFullScreen() is not free. */
+    bool         fullscreen_ = false;
     dyt_vm_gallery_t gal_{};
     QString      viewing_label_;
 };
@@ -3774,6 +3824,36 @@ static int selftest(const opts &o)
             fails++;
 
         dyt_session_set_sr(sess, was);
+    }
+
+    /* 49. F11 is full screen, and leaving it puts the window back.  No window
+     * manager is involved under the offscreen platform, so what this pins is
+     * the route (the key is not swallowed before it gets here), the state flag
+     * the canvas and the menu read, and the re-fit on the way out — the guard
+     * in fit_to_view() must not leave the window stuck at the screen's size. */
+    {
+        const QSize before = win.size();
+        const bool  was    = win.isFullScreen();
+
+        send_key(Qt::Key_F11);
+        QApplication::processEvents();
+        const bool on = win.isFullScreen() && win.fullscreen();
+
+        send_key(Qt::Key_F11);
+        QApplication::processEvents();
+        const bool off = !win.isFullScreen() && !win.fullscreen();
+
+        /* The window came back the size it went in at. */
+        const bool refit = win.size() == before;
+
+        const bool ok = !was && on && off && refit;
+        std::printf("  %-4s F11 is full screen, and leaving it re-fits the "
+                    "window (entered %s, left %s, back to %dx%d %s)\n",
+                    ok ? "ok" : "FAIL", on ? "yes" : "NO", off ? "yes" : "NO",
+                    win.size().width(), win.size().height(),
+                    refit ? "yes" : "NO");
+        if (!ok)
+            fails++;
     }
 
     /* Leave the view model's state as the rest of the run found it. */
