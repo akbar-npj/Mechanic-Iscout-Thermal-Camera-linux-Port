@@ -2440,44 +2440,81 @@ static int bring_up_live(const dyt_capture_opts &cap, dyt_session_t *sess, live 
 /* Read back every slot this session wrote, and report each.  `want`/`on` are
  * the front end's override table, indexed by dyt_order_type_t (1..4).
  *
- * Two measured quirks shape this, both 2026-09-25 on 0bda:5840:
+ * Three measured behaviours shape this, all 2026-09-25 on 0bda:5840:
  *
- *  1. The slot read is not ready the instant the stream stops.  It answers
- *     anywhere from immediately to ~2 s later, so a guessed settle would
- *     sometimes report a failure that is only impatience.
- *  2. A read taken too early returns the *pre-write* value — measured 127 at
- *     +100 ms where the write landed at +200 ms — which would be a false
- *     MISMATCH, the one outcome worth more than a slow one.
+ *  1. A runtime order is *deferred* while the stream is young.  Written at 1 s
+ *     with the stream left running, it lands by ~6.7 s; written at 4.7 s it
+ *     lands just the same.  So the order is not dropped, it is held until the
+ *     stream has run ~6.7 s and applied then — and a stream that stops before
+ *     that discards it.  That is the "single sendOrder" quirk: a harness that
+ *     wrote once and stopped after a few seconds saw nothing, while the app,
+ *     whose writes come after the user has been watching, saw them persist.
+ *  2. The device answers a slot *before* it reflects the order.  In one run
+ *     the first read, +500 ms after the stop, returned the pre-write 127, and
+ *     only the +1000 ms read returned the written 128; the next four runs of
+ *     the same shape were fresh at +500 ms.  So the lag is real but not fixed,
+ *     and no single successful read can tell a lost order from a slow commit.
+ *  3. While the device still holds an unapplied order it does not answer slot
+ *     reads at all — every attempt fails at the transfer level (rc -1) — and
+ *     it stays that way for ~8-9 s (measured through the app, whose stream was
+ *     stopped with the write still pending).  A budget shorter than that
+ *     reports "read-back failed" for a lost order instead of MISMATCH: the
+ *     honest verdict, and the budget stays short so a normal quit is not held
+ *     hostage to the worst case.
  *
- * So this waits until the device answers at all rather than for a fixed time.
- * A failed attempt is a single errored transfer, so the wait costs the sleep
- * and little else; 8 x 250 ms bounds it at 2 s, and the ready check doubles as
- * the read of the first slot, which is why it is not repeated below. */
+ * The asymmetry in (2) is what makes a verdict possible: reading the *written*
+ * value back cannot be faked, whereas reading anything else may still be the
+ * lag.  So this polls until every armed slot has shown its written value, or
+ * until the budget runs out, and then judges the last value seen.  A confirmed
+ * write costs one pass; a lost one costs the budget.  A failed attempt is a
+ * single errored transfer, so polling costs the sleep and little else. */
 static void verify_writes(dyt_capture_t *cap, const float *want, const int *on,
                           VerifyOut &out)
 {
-    int first = 0;
+    uint16_t last[5] = { 0, 0, 0, 0, 0 };
+    int      have[5] = { 0, 0, 0, 0, 0 };
+    int      good[5] = { 0, 0, 0, 0, 0 };
+    int      rclast[5] = { 0, 0, 0, 0, 0 };
+    int      armed   = 0;
+    /* 2.25 s keeps the whole teardown inside run_gui's 3 s exit timeout. */
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2250);
 
     for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++)
-        if (on && on[t]) {
-            first = t;
-            break;
-        }
-    if (!first)
+        if (on && on[t])
+            armed++;
+    if (!armed)
         return;
 
-    for (int attempt = 0; attempt < 8; attempt++) {
-        uint16_t probe = 0;
-        usleep(250000);
-        if (dyt_capture_read_param(cap, first, &probe) == 0)
+    for (;;) {
+        int pending = 0;
+
+        for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++) {
+            uint16_t raw = 0;
+            int      rc;
+
+            if (!on || !on[t] || good[t])
+                continue;
+            pending++;                         /* still unconfirmed */
+            rc = dyt_capture_read_param(cap, t, &raw);
+            rclast[t] = rc;
+            if (rc != 0)
+                continue;                      /* not answering yet */
+            last[t] = raw;
+            have[t] = 1;
+            if (param_raw_matches((dyt_order_type_t)t, want[t], raw)) {
+                good[t] = 1;                   /* cannot be faked */
+                pending--;
+            }
+        }
+        if (!pending || std::chrono::steady_clock::now() >= deadline)
             break;
+        usleep(250000);
     }
 
     for (int t = DYT_ORDER_REFLECTED; t <= DYT_ORDER_DISTANCE; t++) {
         const dyt_vm_ladder_t *L;
-        char     w[32];
-        uint16_t raw = 0;
-        int      rc;
+        char w[32];
 
         if (!on || !on[t])
             continue;
@@ -2486,19 +2523,18 @@ static void verify_writes(dyt_capture_t *cap, const float *want, const int *on,
         L = dyt_vm_ladder((dyt_order_type_t)t);
         dyt_vm_param_format((dyt_order_type_t)t, want[t], w, sizeof w);
 
-        rc = dyt_capture_read_param(cap, t, &raw);
-        if (rc != 0) {
+        if (!have[t]) {
             std::fprintf(stderr,
                          "dytqt: verify %s = %s -> read-back failed (rc %d)\n",
-                         L ? L->name : "?", w, rc);
+                         L ? L->name : "?", w, rclast[t]);
             out.bad++;
-        } else if (param_raw_matches((dyt_order_type_t)t, want[t], raw)) {
+        } else if (good[t]) {
             std::fprintf(stderr, "dytqt: verify %s = %s -> confirmed (raw %u)\n",
-                         L ? L->name : "?", w, (unsigned)raw);
+                         L ? L->name : "?", w, (unsigned)last[t]);
         } else {
             std::fprintf(stderr,
                          "dytqt: verify %s = %s -> MISMATCH (device %u)\n",
-                         L ? L->name : "?", w, (unsigned)raw);
+                         L ? L->name : "?", w, (unsigned)last[t]);
             out.bad++;
         }
     }
@@ -2929,11 +2965,11 @@ static int run_gui(const opts &o, QApplication &app)
             done = true;
             loop.quit();
         });
-        /* 3 s, not 1: the teardown now waits for the device to be ready to
-         * answer a slot read (up to 2 s, see verify_writes) before it closes
-         * the handle, and a budget that no longer matches the work would
-         * report a normal close as "device did not stop".  It is only paid
-         * when this session actually wrote something. */
+        /* 3 s, not 1: the teardown now polls the written slots for up to
+         * 2.25 s (see verify_writes) before it closes the handle, and a budget
+         * that no longer matches the work would report a normal close as
+         * "device did not stop".  It is only paid when this session actually
+         * wrote something. */
         QTimer::singleShot(3000, &loop, &QEventLoop::quit);
         loop.exec();
         if (!done) {

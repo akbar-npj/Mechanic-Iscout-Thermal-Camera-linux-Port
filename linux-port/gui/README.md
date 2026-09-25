@@ -253,19 +253,30 @@ delay tried; stop the stream and all four answer. So the read-back is deferred
 to the teardown, which is the first moment the device is idle again and the last
 one before the handle closes.
 
-Two measured quirks shape the code, both worth stating because each would
+Three measured behaviours shape the code, each worth stating because it would
 otherwise look like a bug in the app:
 
 * **The read is not ready the instant the stream stops.** It answered anywhere
   from immediately to about 2 s later across runs. A guessed settle would
-  therefore sometimes report a failure that is only impatience, so
-  `verify_writes()` waits *until the device answers* instead: up to eight
-  250 ms attempts, each a single errored transfer. In the common case the first
-  attempt succeeds and a verified close costs ~0.3 s.
+  therefore sometimes report a failure that is only impatience.
 * **A read taken too early returns the pre-write value.** Measured `127` at
-  +100 ms where the write landed at +200 ms. That is a false `MISMATCH`, the
-  one outcome worse than a slow answer, and it is the other reason not to guess
-  a settle.
+  +500 ms after the stop where the written `128` appeared at +1000 ms, in one
+  run out of five; the other four were fresh at +500 ms. A single successful
+  read is therefore not proof, and a lone `MISMATCH` could be that lag rather
+  than a lost order.
+* **While the device still holds an unapplied order it answers nothing at
+  all.** Every slot read fails at the transfer level (`rc -1`) for ~8-9 s
+  (measured through the app, whose stream stopped with the write still pending).
+  A budget shorter than that reports `read-back failed` rather than `MISMATCH`
+  for a lost order.
+
+So `verify_writes()` cannot simply wait for an answer and then compare. What
+makes a verdict possible is the asymmetry in the middle bullet: reading the
+*written* value back cannot be faked, whereas reading anything else may still be
+the lag. It therefore polls until every armed slot has shown its written value,
+or until its 2.25 s budget runs out, and then judges the last value seen. A
+confirmed write costs one pass (~0.3 s); a lost one costs the budget, which
+stays short so a normal quit is not held hostage to the ~9 s worst case.
 
 The verdict is `param_raw_matches()`'s, and it compares in the **encoded**
 domain. `sendOrder` quantises — emissivity and distance to 1/128, ambient and
@@ -274,19 +285,25 @@ write a mismatch: `0.80` encodes to `102`, which decodes to `0.796875` and never
 reads back as `0.80`. That function is pure, so `--selftest` pins it with no
 device (assertion 36); the read itself is the hardware-only half.
 
-Each written slot reports `confirmed`, `MISMATCH`, or `read-back failed` on
-stderr, and a reconnect also puts a one-line verdict on the status strip
+Each written slot reports `confirmed`, `MISMATCH`, or `read-back failed (rc N)`
+on stderr, and a reconnect also puts a one-line verdict on the status strip
 (`write confirmed by read-back` / `write NOT confirmed (n of m)`) for anyone not
 watching the transcript. The exit path's teardown budget went from 1 s to 3 s to
 cover the wait, though it is only paid when the session actually wrote
 something.
 
-One device quirk the harness surfaced, since it is exactly the silent failure
-the read-back exists to catch: **a single `sendOrder` is not always applied.** A
-standalone harness that wrote emissivity `1.00` once read `127` back every time,
-while two orders 250 ms apart read `128`. Writes from the app have persisted on
-every measured run, so this looks like a device quirk rather than a port bug —
-but it is the reason the `*` says "written" and not "verified".
+The device quirk the harness surfaced is now explained, and it was a measurement
+artefact rather than a silent failure: **a runtime order is deferred until the
+stream has run ~6.7 s.** Written at 1 s with the stream left running, it lands by
+~6.7 s; written at 4.7 s it lands just the same. Written at 1 s and the stream
+stopped at 4 s, it is discarded — and the slot still reads `127`, which is what
+made it look like "a single `sendOrder` is not always applied". The app's writes
+come after the user has been watching, so they always landed; the harness stopped
+the stream first. The pair of runs that separates the two: `--wait 1 --post 8`
+reads `128`, `--wait 1 --post 2` reads `127`. Nothing in the port fires at that
+boundary, and the transfers succeed (`rc 0`) in both cases, so the gate is the
+device's and not the port's — and a write made before it still lands later, so
+normal use is unaffected.
 
 Two behaviours are inherited from the viewer. The panel is visible by default.
 And the write changes the device's *stored* value, not just the host's
@@ -643,8 +660,8 @@ to finish (it would call back into Qt after the application is gone), so the
 only safe move is to leave immediately — flushing stdio by hand, skipping
 static teardown, leaking the session the wedged thread may still be writing
 into. Otherwise a final teardown job runs and the exit waits up to 3 s for it —
-1 s of it being the slot read-back's wait for the device to answer, paid only
-when the session wrote a parameter — then abandons it the same way.
+2.25 s of it being the slot read-back's budget for the device to answer, paid
+only when the session wrote a parameter — then abandons it the same way.
 
 ## What is *not* established
 
@@ -670,6 +687,13 @@ when the session wrote a parameter — then abandons it the same way.
   write the user never follows with `r` shows `*` in the panel for the rest of
   the session. That is a device limitation, not a choice: see "Verifying the
   write" for the measurements behind it.
+* **Why the device defers an order for ~6.7 s is not known.** The boundary is
+  measured and sharp — with the write at 1 s, a stream stopped at 6.5 s reads
+  `127` and one stopped at 6.75 s reads `128` — but nothing in the port fires
+  there, and the two OUT transfers return `rc 0` on both sides of it, so the gate
+  is inside the device. Whether it is a fixed delay, a warm-up, or an internal
+  calibration is not established; only the ~6.7 s figure and its consequence
+  (a stream that stops sooner discards the pending order) are.
 * **The ladder has no rung for the device's own defaults.** Emissivity is
   `127/128` on the reference unit and the ladder steps `1.00, 0.95, …`, so a
   write cannot restore the stored value through the UI. The live check put
