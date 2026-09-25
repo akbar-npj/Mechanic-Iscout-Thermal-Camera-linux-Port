@@ -1801,6 +1801,134 @@ public:
                           viewing() ? viewing_label_ : state_line(st, snap, fps));
     }
 
+    /* The single key dispatch.  Every key the app understands is interpreted
+     * here and nowhere else, so the keyboard and the on-screen controls cannot
+     * disagree: a menu item or a toolbar button is just a call to this with the
+     * character its key would produce.  That is also why no QAction carries a
+     * shortcut — Qt's shortcut map runs *before* keyPressEvent, so a shortcut
+     * would fire while a runtime-parameter candidate is armed and break the
+     * ladder's swallow contract (assertion 30).  The key's name belongs in the
+     * item's text, not in its shortcut.
+     *
+     * `raw` is the *unfolded* character.  Returns 1 when the key was consumed;
+     * 0 lets the caller fall through to the base class.
+     *
+     * Order matters.  The runtime-parameter ladder goes first, because while a
+     * candidate is armed the view model consumes every key except 'q', so a
+     * stray palette or tool key cannot slip past a pending confirmation. */
+    int handle_key(int raw)
+    {
+        if (view_ && view_->param_key(raw))
+            return 1;
+
+        /* Quit.  'q' is deliberately never swallowed, armed or not. */
+        if (raw == 'q') {
+            if (on_quit_)
+                on_quit_();
+            else
+                close();
+            return 1;
+        }
+
+        /* Retry: lowercase only, because uppercase 'R' arms reflected. */
+        if (raw == 'r' && on_retry_) {
+            on_retry_();
+            return 1;
+        }
+
+        /* The device panel. */
+        if (raw == 'd' && view_) {
+            view_->toggle_info();
+            return 1;
+        }
+
+        /* About / the key list.  A callback rather than the dialog inline so
+         * --selftest can observe the key without a modal window. */
+        if ((raw == '?' || raw == Qt::Key_F1) && on_about_) {
+            on_about_();
+            return 1;
+        }
+
+        /* The gallery.  'g' toggles the list; while it is open the arrows (and
+         * j/k) move the highlight, 'o' or Enter opens the entry and 'x' exports
+         * it, and Esc closes.  While the list is open it swallows the other
+         * bindings, because a key that moved the highlight must not also change
+         * the tool or arm a parameter. */
+        if (raw == 'g' && view_) {
+            gal_.open = !gal_.open;
+            if (gal_.open && on_gallery_refresh_)
+                on_gallery_refresh_();
+            else if (!gal_.open)
+                clear_viewing();        /* closing the gallery returns to live */
+            view_->update();
+            return 1;
+        }
+        if (gal_.open) {
+            if (raw == Qt::Key_Up || raw == 'k') {
+                dyt_vm_gallery_move(&gal_, -1);
+                view_->update();
+                return 1;
+            }
+            if (raw == Qt::Key_Down || raw == 'j') {
+                dyt_vm_gallery_move(&gal_, +1);
+                view_->update();
+                return 1;
+            }
+            /* Return arrives as 13 when the event carries text and as
+             * Qt::Key_Return when it does not (a synthesized event), so both
+             * are matched. */
+            if ((raw == 13 || raw == Qt::Key_Return || raw == Qt::Key_Enter ||
+                 raw == 'o') && on_gallery_open_) {
+                on_gallery_open_(dyt_vm_gallery_sel(&gal_));
+                return 1;
+            }
+            if (raw == 'x' && on_gallery_export_) {
+                on_gallery_export_(dyt_vm_gallery_sel(&gal_));
+                return 1;
+            }
+            if (raw == 27) {                    /* Esc closes, back to live */
+                gal_.open = false;
+                clear_viewing();
+                view_->update();
+                return 1;
+            }
+            /* Anything else is swallowed rather than acted on: the list has
+             * the keyboard while it is up. */
+            return 1;
+        }
+
+        /* Capture: 's' saves a still, 'v' toggles a clip.  Both are free of
+         * the device keys (r/d), the measurement keys (p/l/b/n/a/i) and the
+         * parameter ladder (e/A/R/D/y), and both are lowercase. */
+        if (raw == 's' && on_still_) {
+            on_still_();
+            return 1;
+        }
+        if (raw == 'v' && on_record_) {
+            on_record_();
+            return 1;
+        }
+
+        /* How the picture is shown: palette, unit, range, flip, zoom, fusion.
+         * Routed with the unfolded character, because two of the bindings are
+         * Shift forms ('H' flips vertically where 'h' flips horizontally) and
+         * the fold below would erase the difference. */
+        if (view_ && view_->view_key(raw))
+            return 1;
+
+        /* Everything else is the measurement bindings, which are lowercase —
+         * so fold the unfolded character back down before consulting them.
+         * The return value decides, rather than a list of letters here, so
+         * --selftest and the window cannot disagree about what is bound. */
+        int k = raw;
+        if (k >= 'A' && k <= 'Z')
+            k += 'a' - 'A';
+        if (view_ && view_->measure_key(k))
+            return 1;
+
+        return 0;
+    }
+
 protected:
     void closeEvent(QCloseEvent *e) override
     {
@@ -1830,117 +1958,8 @@ protected:
                 raw += 'a' - 'A';
         }
 
-        /* The runtime-parameter ladder first.  While a candidate is armed the
-         * view model consumes every key except 'q', so a stray palette or tool
-         * key cannot slip past a pending confirmation. */
-        if (view_ && view_->param_key(raw))
-            return;
-
-        /* Quit.  'q' is deliberately never swallowed, armed or not. */
-        if (raw == 'q') {
-            if (on_quit_)
-                on_quit_();
-            else
-                close();
-            return;
-        }
-
-        /* Retry: lowercase only, because uppercase 'R' arms reflected. */
-        if (raw == 'r' && on_retry_) {
-            on_retry_();
-            return;
-        }
-
-        /* The device panel. */
-        if (raw == 'd' && view_) {
-            view_->toggle_info();
-            return;
-        }
-
-        /* About / the key list.  A callback rather than the dialog inline so
-         * --selftest can observe the key without a modal window. */
-        if ((raw == '?' || raw == Qt::Key_F1) && on_about_) {
-            on_about_();
-            return;
-        }
-
-        /* The gallery.  'g' toggles the list; while it is open the arrows (and
-         * j/k) move the highlight, 'o' or Enter opens the entry and 'x' exports
-         * it, and Esc closes.  While the list is open it swallows the other
-         * bindings, because a key that moved the highlight must not also change
-         * the tool or arm a parameter. */
-        if (raw == 'g' && view_) {
-            gal_.open = !gal_.open;
-            if (gal_.open && on_gallery_refresh_)
-                on_gallery_refresh_();
-            else if (!gal_.open)
-                clear_viewing();        /* closing the gallery returns to live */
-            view_->update();
-            return;
-        }
-        if (gal_.open) {
-            if (raw == Qt::Key_Up || raw == 'k') {
-                dyt_vm_gallery_move(&gal_, -1);
-                view_->update();
-                return;
-            }
-            if (raw == Qt::Key_Down || raw == 'j') {
-                dyt_vm_gallery_move(&gal_, +1);
-                view_->update();
-                return;
-            }
-            /* Return arrives as 13 when the event carries text and as
-             * Qt::Key_Return when it does not (a synthesized event), so both
-             * are matched. */
-            if ((raw == 13 || raw == Qt::Key_Return || raw == Qt::Key_Enter ||
-                 raw == 'o') && on_gallery_open_) {
-                on_gallery_open_(dyt_vm_gallery_sel(&gal_));
-                return;
-            }
-            if (raw == 'x' && on_gallery_export_) {
-                on_gallery_export_(dyt_vm_gallery_sel(&gal_));
-                return;
-            }
-            if (raw == 27) {                    /* Esc closes, back to live */
-                gal_.open = false;
-                clear_viewing();
-                view_->update();
-                return;
-            }
-            /* Anything else is swallowed rather than acted on: the list has
-             * the keyboard while it is up. */
-            return;
-        }
-
-        /* Capture: 's' saves a still, 'v' toggles a clip.  Both are free of
-         * the device keys (r/d), the measurement keys (p/l/b/n/a/i) and the
-         * parameter ladder (e/A/R/D/y), and both are lowercase. */
-        if (raw == 's' && on_still_) {
-            on_still_();
-            return;
-        }
-        if (raw == 'v' && on_record_) {
-            on_record_();
-            return;
-        }
-
-        /* How the picture is shown: palette, unit, range, flip, zoom, fusion.
-         * Routed with the unfolded character, because two of the bindings are
-         * Shift forms ('H' flips vertically where 'h' flips horizontally) and
-         * the fold below would erase the difference. */
-        if (view_ && view_->view_key(raw))
-            return;
-
-        /* Everything else is the measurement bindings, which are lowercase —
-         * so fold the unfolded character back down before consulting them.
-         * The return value decides, rather than a list of letters here, so
-         * --selftest and the window cannot disagree about what is bound. */
-        int k = raw;
-        if (k >= 'A' && k <= 'Z')
-            k += 'a' - 'A';
-        if (view_ && view_->measure_key(k))
-            return;
-        QWidget::keyPressEvent(e);
+        if (!handle_key(raw))
+            QWidget::keyPressEvent(e);
     }
 
 private:
