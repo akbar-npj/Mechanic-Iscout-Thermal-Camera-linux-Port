@@ -170,6 +170,26 @@ $(shell mkdir -p $(BUILD); \
             printf '%s\n' '$(FLAG_STAMP_VAL)' > $(FLAG_STAMP); \
         fi)
 
+# ---------------------------------------------------------------------------
+# Header dependencies.
+#
+# The generic object rule below names only the .c, so make has no idea that an
+# object depends on the headers it includes.  Editing a header therefore left
+# stale objects behind, and because the test binaries are compiled *from
+# source* on every run they picked up the new header while libdyt.a kept the
+# old one.  That is not a build error but a silent ABI mismatch: adding one
+# field to dyt_snapshot_t made view_model.o read every later field at the old
+# offset, so view_model_test failed with nonsense like "got 0.0 C want 273.1 K"
+# and the same class of staleness could just as easily have made it *pass* for
+# the wrong reason.  `make check` is the project's gate, so it has to mean
+# something after a header edit.
+#
+# Coarse on purpose: every object depends on every header.  The tree has ~20 of
+# them and a full rebuild is seconds, so per-header tracking would buy nothing
+# but a dependency file to maintain.
+# ---------------------------------------------------------------------------
+HDRS := $(wildcard src/*.h) $(wildcard tools/*.h) $(wildcard gui/*.h)
+
 LIB      := $(BUILD)/libdyt.a
 LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/control.o $(BUILD)/serial.o $(BUILD)/calib.o \
@@ -243,7 +263,7 @@ all: $(LIB) $(TESTS) $(TOOLS)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/%.o: src/%.c $(FLAG_STAMP) | $(BUILD)
+$(BUILD)/%.o: src/%.c $(HDRS) $(FLAG_STAMP) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/libuvc/%.o: $(UVC_DIR)/src/%.c $(FLAG_STAMP) | $(BUILD)
@@ -254,7 +274,7 @@ $(BUILD)/libuvc/%.o: $(UVC_DIR)/src/%.c $(FLAG_STAMP) | $(BUILD)
 # before nothing in particular — it simply overrides the generic src/%.c rule,
 # which would otherwise compile it with the port's strict CFLAGS and without
 # the stb include path.
-$(BUILD)/stb_impl.o: src/stb_impl.c $(FLAG_STAMP) | $(BUILD)
+$(BUILD)/stb_impl.o: src/stb_impl.c $(HDRS) $(FLAG_STAMP) | $(BUILD)
 	$(CC) $(STB_CFLAGS) -c $< -o $@
 
 # The 'D' is not optional: without it ar embeds each member's mtime and
@@ -374,13 +394,13 @@ $(BUILD)/imgwrite_test: src/imgwrite_test.c $(LIB) | $(BUILD)
 # The test itself is C, but the runtime half is C++, so the link goes through
 # $(CXX) whenever MNN is present.
 ifdef HAVE_MNN
-$(BUILD)/mnn_runtime.o: src/mnn_runtime.cpp | $(BUILD)
+$(BUILD)/mnn_runtime.o: src/mnn_runtime.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(MNN_CFLAGS) -c $< -o $@
 
 MNN_OBJ := $(BUILD)/mnn_runtime.o
 endif
 
-$(BUILD)/mnn_test.o: src/mnn_test.c $(LIB) | $(BUILD)
+$(BUILD)/mnn_test.o: src/mnn_test.c $(HDRS) $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) $(MNN_OBJ) | $(BUILD)
@@ -404,7 +424,7 @@ $(BUILD)/dytview: tools/dytview.cpp $(LIB) $(UVC_LIB) | $(BUILD)
 # object rather than being fed to the C++ compiler — it allocates with malloc
 # and relies on C's implicit void* conversions.  Its header lives in tools/, so
 # the generic src/%.c rule does not cover it.
-$(BUILD)/frame_source.o: tools/frame_source.c tools/frame_source.h $(FLAG_STAMP) | $(BUILD)
+$(BUILD)/frame_source.o: tools/frame_source.c tools/frame_source.h $(HDRS) $(FLAG_STAMP) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # The live hand-off, end to end: session_capture.c's adapter on the producer
