@@ -1189,6 +1189,51 @@ public:
         return QSize(kPad + w + kBarGap + kBarW + kLabelW + kPad, h + 2 * kPad);
     }
 
+    /* ---- the display layer ------------------------------------------------
+     *
+     * The canvas has a *natural* size — the picture, the colour bar and the
+     * labels, with the padding around them (sizeHint) — and it is drawn at
+     * that size whenever the widget is no bigger.  When the widget is bigger,
+     * which is what a full screen window or a hand-resized one is, the whole
+     * canvas is scaled up and centred in it.
+     *
+     * This is deliberately *not* the engine's zoom.  That magnifies the
+     * source, so the frame arrives here already zoom*sr times the sensor and
+     * every measurement, marker and pointer mapping is done in those
+     * coordinates.  Scaling here is a display transform applied after all of
+     * that, so the mapping never sees it and a click stays exact — which is
+     * why pointer() is its inverse and nothing else in this file knows about
+     * it.
+     *
+     * Scaling by a real factor rather than an integer is the point: the sensor
+     * is 256x384, so the engine's largest integer zoom still leaves most of a
+     * 1080p screen empty.  Aspect ratio is preserved (one factor for both axes,
+     * the smaller of the two ratios), so the picture cannot be stretched. */
+    double display_scale() const
+    {
+        const QSize nat = sizeHint();
+        if (nat.width() <= 0 || nat.height() <= 0)
+            return 1.0;
+        const double s = std::min((double)width()  / (double)nat.width(),
+                                  (double)height() / (double)nat.height());
+        /* 1.0 exactly at the natural size — not 0.99 from a rounding, which
+         * would resample every pixel of the common case for nothing. */
+        return s > 1.0 ? s : 1.0;
+    }
+
+    /* Where canvas-local (0,0) lands in the widget.  Floored to whole pixels:
+     * at scale 1 a half-pixel offset would blur the picture and move the
+     * overlay samples by one, and the canvas is centred often enough that the
+     * odd width is not a corner case.  pointer() uses this same origin, so the
+     * flooring cancels. */
+    QPointF display_origin() const
+    {
+        const QSize  nat = sizeHint();
+        const double s   = display_scale();
+        return QPointF(std::floor((width()  - nat.width()  * s) / 2.0),
+                       std::floor((height() - nat.height() * s) / 2.0));
+    }
+
 protected:
     void mousePressEvent(QMouseEvent *e) override
     {
@@ -1230,6 +1275,23 @@ protected:
             draw_confirm(p);
             return;
         }
+
+        /* Everything below draws in *canvas* coordinates — the ones this
+         * widget used before the display layer existed, with the padding at
+         * (kPad, kPad) — and the painter's transform is what puts them on the
+         * screen.  At the natural size the origin is (0,0) and the scale is 1,
+         * so this is pixel-for-pixel the drawing it always was; the fill above
+         * and the placeholder above that stay in widget space, which is why
+         * they are before this point.
+         *
+         * Nearest-neighbour, like the engine's own zoom: a thermal picture
+         * magnified smoothly invents gradients that are not in the data, and a
+         * measurement is read off the pixel it names. */
+        const double s = display_scale();
+        p.translate(display_origin());
+        if (s != 1.0)
+            p.scale(s, s);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
 
         const int x0 = kPad, y0 = kPad;
         p.drawImage(QPoint(x0, y0), img_);
@@ -1416,11 +1478,16 @@ private:
         if (!gal_ || !gal_->open)
             return;
 
-        const int row_h  = 18;
-        const int head_h = 20;
-        const int avail  = std::max(1, (height() - 2 * kPad - head_h) / row_h);
-        const int rows   = std::min(gal_->n, avail);
-        const int panel_w = std::min(width() - 2 * kPad, 560);
+        /* Sized from the canvas's *natural* size, not the widget's: this
+         * rectangle is drawn in canvas coordinates, under the display
+         * transform, so widget dimensions would be the wrong space as soon as
+         * the two differ.  At the natural size they are the same numbers. */
+        const QSize nat    = sizeHint();
+        const int   row_h  = 18;
+        const int   head_h = 20;
+        const int   avail  = std::max(1, (nat.height() - 2 * kPad - head_h) / row_h);
+        const int   rows   = std::min(gal_->n, avail);
+        const int   panel_w = std::min(nat.width() - 2 * kPad, 560);
         const int panel_h = head_h + rows * row_h + 6;
         const QRect r(kPad, kPad, panel_w, panel_h);
 
@@ -1534,13 +1601,20 @@ private:
 
     /* The one widget -> image mapping, so a click and the marker it places
      * cannot disagree.  floor(), not a cast: (int)(-0.5) is 0, which would
-     * place a point one pixel outside the image. */
+     * place a point one pixel outside the image.
+     *
+     * The first two lines are the exact inverse of the transform paintEvent
+     * applies — the same origin, the same scale — so the display layer is
+     * invisible to everything downstream.  At the natural size they reduce to
+     * the bare `pos - kPad` they have always been. */
     void pointer(dyt_vm_mouse_ev_t ev, const QPointF &pos)
     {
         if (!sess_ || img_.isNull())
             return;
-        const int lx = (int)std::floor(pos.x() - kPad);
-        const int ly = (int)std::floor(pos.y() - kPad);
+        const double  s   = display_scale();
+        const QPointF org = display_origin();
+        const int lx = (int)std::floor((pos.x() - org.x()) / s - kPad);
+        const int ly = (int)std::floor((pos.y() - org.y()) / s - kPad);
         dyt_vm_tool_mouse(sess_, &ptr_, ev, snap_.tool, &snap_.xform,
                           snap_.width, snap_.height,
                           img_.width(), img_.height(), lx, ly);
@@ -1707,7 +1781,8 @@ public:
         lay->setContentsMargins(0, 0, 0, 0);
         lay->setSpacing(0);
         lay->addWidget(build_menus(), 0);
-        lay->addWidget(build_toolbar(), 0);
+        lay->addWidget(toolbar_row(true), 0);
+        lay->addWidget(toolbar_row(false), 0);
         lay->addWidget(view_, 1);
         lay->addWidget(strip_, 0);
 
@@ -2129,6 +2204,7 @@ private:
          * before keyPressEvent sees them, which would silently break every
          * binding in the app the moment someone clicked a button. */
         bar->setFocusPolicy(Qt::NoFocus);
+        bar->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
         /* ---- File ---- */
         QMenu *file = bar->addMenu(QStringLiteral("&File"));
@@ -2274,36 +2350,46 @@ private:
         return bar;
     }
 
-    QToolBar *build_toolbar()
+    /* Two rows, not one.
+     *
+     * The package ships no icons, so a button is its text, and one row of these
+     * labels is wider than the picture it sits above — which would leave the
+     * window sized to the toolbar with the picture stranded in the middle of a
+     * lot of black.  Split in two, both rows fit inside the canvas's own width,
+     * so the window stays sized to the picture.  The width policy is Ignored
+     * for the same reason: the bars must never *widen* the window, and if a row
+     * ever does outgrow it, Qt shows its own overflow arrow rather than
+     * clipping silently.  Assertion 56 pins that neither row overflows at the
+     * default size — nothing may be hidden behind that arrow. */
+    QToolBar *toolbar_row(bool view_row)
     {
         auto *tb = new QToolBar(this);
         tb->setFocusPolicy(Qt::NoFocus);
-        /* The package ships no icons, so the buttons are their text.  The
-         * labels are the menu's, which is why the width is whatever the text
-         * needs — the window is sized to fit it, and the canvas scales the
-         * picture into whatever room is left. */
+        tb->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
         tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
 
-        tb->addAction(act_fullscreen_);
-        tb->addAction(act_info_);
-        tb->addSeparator();
-        tb->addAction(act_range_);
-        tb->addAction(act_flip_h_);
-        tb->addAction(act_flip_v_);
-        tb->addSeparator();
-        tb->addAction(act_tool_[DYT_TOOL_POINT]);
-        tb->addAction(act_tool_[DYT_TOOL_LINE]);
-        tb->addAction(act_tool_[DYT_TOOL_BOX]);
-        tb->addAction(act_tool_[DYT_TOOL_NONE]);
-        tb->addSeparator();
-        tb->addAction(act_alarm_);
-        tb->addAction(act_iso_);
-        tb->addSeparator();
-        tb->addAction(key_action(QStringLiteral("Still"), 's', "s"));
-        tb->addAction(act_record_);
-        tb->addAction(act_gallery_);
-        tb->addSeparator();
-        tb->addAction(act_help_);
+        if (view_row) {
+            tb->addAction(act_fullscreen_);
+            tb->addAction(act_info_);
+            tb->addSeparator();
+            tb->addAction(act_range_);
+            tb->addAction(act_flip_h_);
+            tb->addAction(act_flip_v_);
+            tb->addSeparator();
+            tb->addAction(act_help_);
+        } else {
+            tb->addAction(act_tool_[DYT_TOOL_POINT]);
+            tb->addAction(act_tool_[DYT_TOOL_LINE]);
+            tb->addAction(act_tool_[DYT_TOOL_BOX]);
+            tb->addAction(act_tool_[DYT_TOOL_NONE]);
+            tb->addSeparator();
+            tb->addAction(act_alarm_);
+            tb->addAction(act_iso_);
+            tb->addSeparator();
+            tb->addAction(key_action(QStringLiteral("Still"), 's', "s"));
+            tb->addAction(act_record_);
+            tb->addAction(act_gallery_);
+        }
         return tb;
     }
 
@@ -2780,8 +2866,11 @@ static int selftest(const opts &o)
         if (!ok)
             fails++;
 
-        if (!o.png.empty() && !img.isNull()) {
-            if (img.save(QString::fromUtf8(o.png.c_str()))) {
+        /* The canvas is written, not the window the check above grabs: --png
+         * is documented as "write the canvas here", and the window has had a
+         * menu bar and a toolbar in it since they were added. */
+        if (!o.png.empty() && win.view()->has_frame()) {
+            if (win.view()->grab().save(QString::fromUtf8(o.png.c_str()))) {
                 std::printf("  ok   canvas written to %s\n", o.png.c_str());
             } else {
                 std::printf("  FAIL could not write %s\n", o.png.c_str());
@@ -3137,10 +3226,18 @@ static int selftest(const opts &o)
      * expected source pixel comes from the view model's own map(), so this
      * pins the wiring — that the widget's coordinates reach tool_mouse at all,
      * with the right dst size — rather than the transform (assertion 16). */
+    /* (lx, ly) are image pixels, as the assertions below reason in.  The
+     * widget position that names one is the *display transform's*, not kPad's:
+     * the canvas is centred and scaled whenever the window is bigger than it
+     * needs to be.  The centre of the pixel is sent rather than its corner, so
+     * the floor() in pointer() lands on the same pixel at any scale. */
     auto send_mouse = [&](QEvent::Type t, Qt::MouseButton b,
                           Qt::MouseButtons bs, int lx, int ly) {
-        QMouseEvent e(t, QPointF(kPad + lx, kPad + ly),
-                      QPointF(kPad + lx, kPad + ly), b, bs, Qt::NoModifier);
+        const double  s   = win.view()->display_scale();
+        const QPointF org = win.view()->display_origin();
+        const QPointF p(org.x() + s * (kPad + lx + 0.5),
+                        org.y() + s * (kPad + ly + 0.5));
+        QMouseEvent e(t, p, p, b, bs, Qt::NoModifier);
         QApplication::sendEvent(win.view(), &e);
     };
     {
@@ -3437,22 +3534,37 @@ static int selftest(const opts &o)
 
     /* 33. The device panel is painted.  Its background is opaque and sits at a
      * fixed spot, so an interior pixel must be the fill colour while it is up;
-     * that is what pins the overlay reaching the canvas, not just the rows. */
+     * that is what pins the overlay reaching the canvas, not just the rows.
+     *
+     * The probe is placed through the display transform, because the canvas is
+     * centred whenever the window is wider than it needs — and the check is
+     * that the pixels *change* when the panel is hidden, because the letterbox
+     * is the same colour as the panel's fill and would otherwise pass this on
+     * its own. */
     {
-        const QImage on = fv->grab().toImage();
-        const bool fill = fv->info_shown() &&
-                          on.pixelColor(15, 15) == QColor(16, 16, 16) &&
-                          on.pixelColor(16, 15) == QColor(16, 16, 16) &&
-                          on.pixelColor(15, 16) == QColor(16, 16, 16);
+        const QPointF org = fv->display_origin();
+        const int     ox  = (int)org.x(), oy = (int)org.y();
+
+        auto fill_at = [&](const QImage &im) {
+            return im.pixelColor(ox + 15, oy + 15) == QColor(16, 16, 16) &&
+                   im.pixelColor(ox + 16, oy + 15) == QColor(16, 16, 16) &&
+                   im.pixelColor(ox + 15, oy + 16) == QColor(16, 16, 16);
+        };
+
+        const QImage on   = fv->grab().toImage();
+        const bool   fill = fv->info_shown() && fill_at(on);
 
         fv->toggle_info();              /* hide */
-        const bool hidden = !fv->info_shown();
+        const bool   hidden  = !fv->info_shown();
+        const QImage off     = fv->grab().toImage();
+        const bool   covered = !fill_at(off);   /* the picture is under it */
         fv->toggle_info();              /* show again */
 
-        const bool ok = fill && hidden && fv->info_shown();
+        const bool ok = fill && hidden && covered && fv->info_shown();
         std::printf("  %-4s the device panel is painted over the image "
-                    "(fill %s, toggle %s)\n", ok ? "ok" : "FAIL",
-                    fill ? "yes" : "NO", hidden ? "yes" : "NO");
+                    "(fill %s, toggle %s, covers %s)\n", ok ? "ok" : "FAIL",
+                    fill ? "yes" : "NO", hidden ? "yes" : "NO",
+                    covered ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -4293,20 +4405,132 @@ static int selftest(const opts &o)
      * something.  The bar's own focus policy is what stops it. */
     {
         QMenuBar *mb = win.findChild<QMenuBar *>();
-        QToolBar *tb = win.findChild<QToolBar *>();
-        const bool ok = mb && tb &&
-                        mb->focusPolicy() == Qt::NoFocus &&
-                        tb->focusPolicy() == Qt::NoFocus;
-        std::printf("  %-4s neither bar can take the keyboard "
-                    "(menubar %s, toolbar %s)\n", ok ? "ok" : "FAIL",
+        const QList<QToolBar *> bars = win.findChildren<QToolBar *>();
+
+        bool ok = mb && mb->focusPolicy() == Qt::NoFocus && bars.size() == 2;
+        int  bad = 0;
+        for (QToolBar *tb : bars)
+            if (tb->focusPolicy() != Qt::NoFocus) {
+                ok = false;
+                bad++;
+            }
+
+        std::printf("  %-4s neither bar can take the keyboard (menubar %s, "
+                    "%d toolbar row(s), %d that would)\n", ok ? "ok" : "FAIL",
                     mb ? (mb->focusPolicy() == Qt::NoFocus ? "no focus"
                                                            : "TAKES FOCUS")
                        : "MISSING",
-                    tb ? (tb->focusPolicy() == Qt::NoFocus ? "no focus"
-                                                           : "TAKES FOCUS")
-                       : "MISSING");
+                    (int)bars.size(), bad);
         if (!ok)
             fails++;
+    }
+
+    /* 56. No toolbar row is overflowing.  Qt hides the buttons that do not fit
+     * behind an extension arrow, which would put the on-screen controls the
+     * toolbar exists to provide back out of sight — the very thing the split
+     * into two rows is here to avoid.  Checked rather than assumed, because the
+     * rows' widths are whatever the platform's font metrics make them. */
+    {
+        const QList<QToolBar *> bars = win.findChildren<QToolBar *>();
+        int  hidden = 0, checked = 0;
+
+        for (QToolBar *tb : bars) {
+            checked++;
+            QWidget *ext = tb->findChild<QWidget *>(
+                QStringLiteral("qt_toolbar_ext_button"));
+            if (ext && ext->isVisible())
+                hidden++;
+        }
+
+        const bool ok = checked == 2 && hidden == 0;
+        std::printf("  %-4s no toolbar row hides its buttons behind the "
+                    "overflow arrow (%d row(s) checked, %d overflowing)\n",
+                    ok ? "ok" : "FAIL", checked, hidden);
+        if (!ok)
+            fails++;
+    }
+
+    /* 54. The canvas is drawn at its natural size until the window is bigger
+     * than it needs, and scales to fit after that.  Both halves matter: the
+     * first is what keeps the pixel assertions above honest (at the natural
+     * size the scale is exactly 1 and the origin exactly (0,0)), and the second
+     * is what makes full screen actually fill the screen — the sensor is
+     * 256x384, so no integer zoom could. */
+    {
+        const QSize before     = win.size();
+        const bool  at_natural = fv->display_scale() == 1.0;
+
+        win.resize(before + QSize(360, 240));
+        QApplication::processEvents();
+        const double  grown = fv->display_scale();
+        const QPointF org   = fv->display_origin();
+
+        /* Centred in whichever axis has room to spare; on the binding axis the
+         * scaled canvas is exactly the widget, so there is nothing to centre. */
+        const QSize nat = fv->sizeHint();
+        const double slack_x = win.view()->width()  - nat.width()  * grown;
+        const double slack_y = win.view()->height() - nat.height() * grown;
+        const bool centred =
+            (slack_x < 2.0 || std::fabs(org.x() - slack_x / 2.0) < 1.5) &&
+            (slack_y < 2.0 || std::fabs(org.y() - slack_y / 2.0) < 1.5);
+
+        win.resize(before);
+        QApplication::processEvents();
+        const bool back = fv->display_scale() == 1.0;
+
+        const bool ok = at_natural && grown > 1.0 && centred && back;
+        std::printf("  %-4s the canvas fits the window when there is room "
+                    "(1:1 %s, grown %.2fx %s, centred %s, back %s)\n",
+                    ok ? "ok" : "FAIL", at_natural ? "yes" : "NO", grown,
+                    grown > 1.0 ? "yes" : "NO", centred ? "yes" : "NO",
+                    back ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 55. A click at a scaled position names the pixel it looks like it names.
+     * The display transform is invisible to the mapping — pointer() is its
+     * exact inverse — and this is the assertion that catches a scale applied
+     * to the paint but not to the pointer.  That failure would place every
+     * marker somewhere else on the picture while looking entirely plausible,
+     * which is exactly the kind of bug the pointer/marker agreement rule
+     * exists to prevent. */
+    {
+        const QSize before = win.size();
+        win.resize(before + QSize(360, 240));
+        QApplication::processEvents();
+        const double s = fv->display_scale();
+
+        dyt_snapshot_t s0{};
+        dyt_session_snapshot(sess, &s0, nullptr, 0);
+        const QSize is = fv->imageSize();
+
+        /* A source pixel well inside the frame, so neither the projection nor
+         * the click can land on an edge. */
+        const int  sx = s0.width / 3, sy = s0.height / 3;
+        int        dx = -1, dy = -1;
+        const bool proj = dyt_view_transform_project(&s0.xform, s0.width,
+                                                     s0.height, is.width(),
+                                                     is.height(), sx, sy,
+                                                     &dx, &dy) == 0;
+
+        send_key(Qt::Key_P);                    /* the point tool */
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   dx, dy);
+
+        dyt_snapshot_t s1{};
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        const bool ok = s > 1.0 && proj && s1.tool == DYT_TOOL_POINT &&
+                        s1.p0.x == sx && s1.p0.y == sy;
+        std::printf("  %-4s a click at a scaled position names the right pixel "
+                    "(%.2fx, (%d,%d) -> (%d,%d), wanted (%d,%d))\n",
+                    ok ? "ok" : "FAIL", s, dx, dy, s1.p0.x, s1.p0.y, sx, sy);
+        if (!ok)
+            fails++;
+
+        send_key(Qt::Key_N);                    /* clear, and no tool */
+        win.resize(before);
+        QApplication::processEvents();
     }
 
     /* Leave the view model's state as the rest of the run found it. */
@@ -5180,7 +5404,10 @@ static int run_gui(const opts &o_in, QApplication &app)
         if (pm.frames == 0) {
             std::fprintf(stderr, "dytqt: no frame painted; nothing written\n");
         } else {
-            const QPixmap grab = win.grab();
+            /* The canvas, not the window: --help calls this "write the canvas
+             * here", and since the menu bar and toolbar arrived a window grab
+             * would put the chrome in the file too. */
+            const QPixmap grab = win.view()->grab();
             if (grab.save(QString::fromUtf8(o.png.c_str())))
                 std::printf("dytqt: canvas written to %s\n", o.png.c_str());
             else
