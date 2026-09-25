@@ -1433,6 +1433,31 @@ public:
                        std::floor((height() - nat.height() * s) / 2.0));
     }
 
+    /* The canvas drawn at its own size, in canvas coordinates — the same
+     * content paintEvent draws, minus the widget-space fill, the placeholder
+     * and the display transform.  --selftest samples the overlays through this
+     * rather than through grab(), so an assertion is about what the canvas
+     * paints and not about how big the window happens to be: once the icon rail
+     * and the control panel take their columns, the window can be narrower than
+     * the canvas on a small screen, and a grab would crop the very pixels the
+     * assertions look at.  The transform itself is pinned separately (the
+     * scaled-click assertion). */
+    QImage render_canvas()
+    {
+        QImage im(sizeHint(), QImage::Format_RGB888);
+        im.fill(QColor(16, 16, 16));
+        QPainter p(&im);
+        p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        if (img_.isNull() && override_.isNull()) {
+            p.setPen(QColor(200, 200, 200));
+            p.drawText(im.rect(), Qt::AlignCenter, placeholder_);
+            draw_confirm(p);
+            return im;
+        }
+        draw_content(p);
+        return im;
+    }
+
 protected:
     void mousePressEvent(QMouseEvent *e) override
     {
@@ -1495,6 +1520,17 @@ protected:
             p.scale(s, s);
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
 
+        draw_content(p);
+    }
+
+    /* Everything the canvas draws in *canvas* coordinates — the image, the
+     * colour bar, the overlays.  Split out of paintEvent so --selftest can ask
+     * for the same drawing in canvas space (render_canvas()), where an overlay
+     * can be sampled at its canvas pixel no matter how the window is sized or
+     * cropped.  The widget-space fill, the placeholder and the display
+     * transform stay in paintEvent: they are about the widget, not the canvas. */
+    void draw_content(QPainter &p)
+    {
         const int x0 = kPad, y0 = kPad;
 
         /* A saved still or a playing clip takes the canvas.  It is drawn at
@@ -4317,21 +4353,23 @@ static int selftest(const opts &o)
      * is the same colour as the panel's fill and would otherwise pass this on
      * its own. */
     {
-        const QPointF org = fv->display_origin();
-        const int     ox  = (int)org.x(), oy = (int)org.y();
-
+        /* Sampled through render_canvas(), in canvas coordinates: the overlay's
+         * box starts at canvas (kPad+6, kPad+6), so (kPad+7, kPad+7) is just
+         * inside its top-left corner and clear of the text.  Being in canvas
+         * space keeps this honest when the rail and panel leave the window
+         * narrower than the canvas. */
         auto fill_at = [&](const QImage &im) {
-            return im.pixelColor(ox + 15, oy + 15) == QColor(16, 16, 16) &&
-                   im.pixelColor(ox + 16, oy + 15) == QColor(16, 16, 16) &&
-                   im.pixelColor(ox + 15, oy + 16) == QColor(16, 16, 16);
+            return im.pixelColor(kPad + 7, kPad + 7) == QColor(16, 16, 16) &&
+                   im.pixelColor(kPad + 8, kPad + 7) == QColor(16, 16, 16) &&
+                   im.pixelColor(kPad + 7, kPad + 8) == QColor(16, 16, 16);
         };
 
-        const QImage on   = fv->grab().toImage();
+        const QImage on   = fv->render_canvas();
         const bool   fill = fv->info_shown() && fill_at(on);
 
         fv->toggle_info();              /* hide */
         const bool   hidden  = !fv->info_shown();
-        const QImage off     = fv->grab().toImage();
+        const QImage off     = fv->render_canvas();
         const bool   covered = !fill_at(off);   /* the picture is under it */
         fv->toggle_info();              /* show again */
 
@@ -4358,12 +4396,12 @@ static int selftest(const opts &o)
         };
 
         send_esc();                     /* nothing armed */
-        const int before = count_fill(fv->grab().toImage());
+        const int before = count_fill(fv->render_canvas());
 
         send_char('e');                 /* armed */
-        const int after = count_fill(fv->grab().toImage());
+        const int after = count_fill(fv->render_canvas());
         send_esc();
-        const int gone = count_fill(fv->grab().toImage());
+        const int gone = count_fill(fv->render_canvas());
 
         const bool ok = after > before && after > gone;
         std::printf("  %-4s the confirmation is painted only while armed "
