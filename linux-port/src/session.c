@@ -936,6 +936,19 @@ dyt_sr_t dyt_session_get_sr(dyt_session_t *s)
     return m;
 }
 
+int dyt_session_sr_capable(dyt_session_t *s)
+{
+    int cap;
+
+    if (!s)
+        return 0;
+
+    pthread_mutex_lock(&s->m);
+    cap = s->sr_fn != NULL;
+    pthread_mutex_unlock(&s->m);
+    return cap;
+}
+
 /* ----------------------------------------------------------------- fusion */
 void dyt_session_set_fusion(dyt_session_t *s, dyt_fusion_t f)
 {

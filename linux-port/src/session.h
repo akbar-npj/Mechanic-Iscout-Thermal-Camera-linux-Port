@@ -257,6 +257,13 @@ void dyt_session_set_sr(dyt_session_t *s, dyt_sr_t m);
 /* The mode the session is holding (OFF when it cannot run one). */
 dyt_sr_t dyt_session_get_sr(dyt_session_t *s);
 
+/* Whether an upscaler is installed, i.e. whether a mode could be selected at
+ * all.  This is the same fact the snapshot reports as `sr_cap`, but it is
+ * readable with no frame in hand — which is what a control panel needs, since
+ * it draws its "model loaded / no model" line before the first frame arrives
+ * and the snapshot cannot be taken yet. */
+int dyt_session_sr_capable(dyt_session_t *s);
+
 /* ------------------------------------------------------------------ state */
 
 /* Load every palette in `dir`; if `dir` is NULL or yields none, fall back to

@@ -968,11 +968,15 @@ static void test_super_resolution(void)
     intcheck("native height", h, H);
     intcheck("snapshot: no capability",
              dyt_session_snapshot(s, &snap, NULL, 0) == 0 && snap.sr_cap == 0, 1);
+    /* The panel asks this before the first frame, when the snapshot cannot be
+     * taken, so it must answer with no frame in hand. */
+    intcheck("capable: none installed", dyt_session_sr_capable(s), 0);
     intcheck("snapshot: not active", snap.sr_active, 0);
     intcheck("snapshot: factor 1", snap.xform.sr, 1);
 
     /* ---- hand the session a 2x upscaler ---------------------------------- */
     dyt_session_set_sr_upscaler(s, fake_upscale);
+    intcheck("capable: installed", dyt_session_sr_capable(s), 1);
 
     dyt_session_set_sr(s, DYT_SR_THERMAL);
     intcheck("thermal mode accepted", dyt_session_get_sr(s), DYT_SR_THERMAL);
@@ -1072,6 +1076,8 @@ static void test_super_resolution(void)
     dyt_session_set_sr_upscaler(s, NULL);
     intcheck("withdrawing the upscaler clears the mode",
              dyt_session_get_sr(s), DYT_SR_OFF);
+    intcheck("withdrawing the upscaler clears capability",
+             dyt_session_sr_capable(s), 0);
 
 out:
     free(img); free(grey); free(one); free(two); free(want);

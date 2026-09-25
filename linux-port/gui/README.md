@@ -38,8 +38,9 @@ MainWindow : QWidget
     │   │   └── GalleryPanel          the saved-items list, an overlay child widget
     │   └── StatusStrip (stretch 0)   three left-aligned lines
     └── ControlPanel (stretch 0)  right panel: QTabWidget
-        └── "Troubleshoot"        Temperature Measurement / High Temperature /
-                                  Image Enhancement / Capture
+        ├── "Troubleshoot"        Temperature Measurement / High Temperature /
+        │                         Image Enhancement / Capture
+        └── "Super Resolution"    Off / Visible plane (2x) / Thermal plane (2x)
 ```
 
 The menu bar and the two toolbar rows are still present while the rail and the
@@ -72,6 +73,48 @@ markers (`FrameView::toggle_hot()`), which the reference viewer always draws.
 The flag is a canvas one, not a session one — it changes what is painted, not
 what is measured. Assertion 50c pins that the key reaches it and that the
 drawing actually changes.
+
+**Super Resolution** is the tab the Windows app does *not* have. It is an
+addition rather than a port: super-resolution is a recovered capability
+(`src/sr.h`, the 2× model `models/zoom2.mnn`), not one of the vendor's controls
+— a search of the manual and the installer's resources finds no super-resolution
+feature, only the sensor's own "Resolution 256x192". So it gets its own tab
+rather than being wedged into the Troubleshoot groups the manual lays out.
+
+Its three rows are `Off`, `Visible plane (2x)` and `Thermal plane (2x)`, routed
+through the same dispatch as `z` and `Z`. `Off` is the one row whose key is not
+fixed: `z` and `Z` each *toggle their own plane*, so from thermal `z` would
+select visible rather than clear. `ControlPanel::sr_off_key()` therefore presses
+the key of the mode the session is actually holding, exactly as the menu's Off
+item does, and `row()` grew an optional `act` callback for controls whose key
+cannot express them.
+
+The page reads the **session**, not the snapshot: `MainWindow::sr_model_loaded()`
+asks `dyt_session_sr_capable()`, and the mode comes from `dyt_session_get_sr()`.
+That is what lets it be correct before the first frame arrives, when there is no
+snapshot to read and the canvas is still the placeholder — which is precisely
+when a user wondering why the radios are dead needs the status line to say
+`No model loaded`. The session grew that accessor for this: the snapshot already
+reports the same fact as `sr_cap`, but it cannot be taken without a frame.
+With no model the three radios are disabled rather than left clickable and
+silently ineffective. Assertion 53c pins the radios, the status line and the
+`Off` row, on both a model-present and a model-absent run.
+
+A `QTabWidget` whose tabs do not fit hides the overflow behind scroll arrows —
+the same "control the user cannot reach" failure assertion 56 guards against for
+the toolbar, and a live risk here because the panel is a fixed 224 px while the
+tab count only grows. The tab style therefore carries `font-size: 9px` (matching
+the rail and the panel rows), which brings the two tabs to 179 px of the 222
+available; without it they overflowed. Assertion 53d measures that fit — and is
+the one assertion here that runs **themed**, because the fit is a property of the
+stylesheet's padding and font size and the selftest is unthemed on purpose. The
+stylesheet is restored immediately so the geometry assertions after it still see
+the unthemed metrics they were calibrated against.
+
+> The vendor's panel is much wider than our 224 px — roughly 400 px, enough for
+> its four horizontal tabs (`Troubleshoot | 3D Analysis | Comparison | Circuit
+> Design`). Widening the column is the change that has to happen before the
+> remaining tabs land; at 224 px even a third tab would overflow.
 
 `FrameView::render_canvas()` draws the canvas's content at the canvas's own
 size, in canvas coordinates, and is what the overlay assertions sample. A
@@ -286,6 +329,10 @@ wrong geometry. Mode `z` additionally needs a visible half *and* a fusion
 pattern that shows it — with the default infrared pattern there is nothing on
 screen for it to upscale, so it is inactive there rather than doing invisible
 work.
+
+The **Super Resolution tab** is the on-screen route to both keys, and the third
+place the state is reported — see "The control panel" above for why it reads the
+session rather than the snapshot and why `Off` needs a key of its own.
 
 The **factor is carried in the view transform**, not by the window: `sr` joins
 `zoom` (`display.h`), and `map`/`project`/`size` use `zoom * sr`. The window
@@ -868,7 +915,7 @@ $ ./build/dytqt --selftest
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 660x533 yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 956x533 yes)
   ok   a menu action reaches the session like its key (palette 0 -> 2)
   ok   a panel button reaches the session like its key (line yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
@@ -876,6 +923,8 @@ $ ./build/dytqt --selftest
   ok   the Help item opens the guide (1)
   ok   neither bar can take the keyboard (menubar no focus, 2 toolbar row(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
+  ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
+  ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 222)
   ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))

@@ -123,7 +123,7 @@ static const char kDarkQss[] =
     "QGroupBox::title { subcontrol-origin: margin; left: 8px; "
         "color: #9aa0a6; }"
     "QTabBar::tab { background: #2b2b2b; color: #9aa0a6; "
-        "padding: 6px 14px; border: 1px solid #3a3a3a; "
+        "padding: 6px 10px; font-size: 9px; border: 1px solid #3a3a3a; "
         "border-bottom: none; border-top-left-radius: 2px; "
         "border-top-right-radius: 2px; }"
     "QTabBar::tab:selected { background: #1e1e1e; color: #e6e6e6; "
@@ -145,6 +145,8 @@ static const char kDarkQss[] =
     "QScrollBar:vertical { background: #1e1e1e; width: 10px; }"
     "QScrollBar::handle:vertical { background: #3a3a3a; border-radius: 4px; }"
     "QStatusBar { background: #2b2b2b; color: #9aa0a6; }"
+    "QLabel#srstatus { color: #00b4d8; font-size: 9px; }"
+    "QLabel#srhint { color: #7a8085; font-size: 8px; }"
     "QFrame[frameShape=\"6\"] { border: 1px solid #00b4d8; }"  /* canvas border */
     ;
 
@@ -2390,9 +2392,13 @@ private:
             paint_icon(p, i, QRect(0, 0, 24, 24)); }
         b->setIcon(QIcon(pm));
         b->setIconSize(QSize(24, 24));
-        /* A QPushButton shows the icon above the text by default when both are
-         * set; no setToolButtonStyle (that is a QToolButton API).  The label is
-         * kept short so the 64-px rail fits it on one line. */
+        /* A QPushButton lays its icon *beside* the text, not above it (that is
+         * a QToolButton style, and setToolButtonStyle is not a QPushButton
+         * API).  The label therefore shares the 72-px rail with a 24-px icon,
+         * which is why the labels are one short word each and the rail's QSS
+         * sets a 9-px font: "Compare" and "Contact" are the longest, and at the
+         * default font they would elide.  The glyph carries the meaning; the
+         * label disambiguates it. */
         /* Report the click; MainWindow decides what it means.  Every rail item
          * is wired this way from the start, so a button is never a silent
          * no-op — the handler is what grows, step by step. */
@@ -2434,6 +2440,7 @@ public:
         Tracking, Alarm, Highlight,
         FlipH, FlipV, FixedRange,
         Still, Record, Gallery,
+        SrOff, SrVisible, SrThermal,
         N_Ids
     };
 
@@ -2448,6 +2455,11 @@ public:
         tabs_->setFocusPolicy(Qt::NoFocus);
         outer->addWidget(tabs_);
         tabs_->addTab(build_troubleshoot(), QStringLiteral("Troubleshoot"));
+        /* The tab the Windows app does not have.  It is last so the order the
+         * vendor's panel established is preserved and the addition is visibly
+         * an addition. */
+        tabs_->addTab(build_super_resolution(),
+                      QStringLiteral("Super Resolution"));
     }
 
     /* A click on the control whose key is `key`.  Set by MainWindow, which owns
@@ -2487,6 +2499,60 @@ public:
         set(btn_[Gallery],   gallery_open);
     }
 
+    /* The Super Resolution page.  Both facts it shows are session state, not
+     * frame state, so it takes them directly rather than a snapshot: the
+     * capability comes from the session and is known before the first frame,
+     * and the mode is what the session is holding even if the render has not
+     * had a chance to apply it yet.  That is what lets the page be correct
+     * while the canvas still shows the placeholder. */
+    void sync_sr(bool model_loaded, dyt_sr_t mode)
+    {
+        sr_mode_ = mode;
+        auto set = [](QPushButton *b, bool on) {
+            if (!b)
+                return;
+            const QSignalBlocker block(b);
+            b->setChecked(on);
+        };
+        set(btn_[SrOff],     mode == DYT_SR_OFF);
+        set(btn_[SrVisible], mode == DYT_SR_VISIBLE);
+        set(btn_[SrThermal], mode == DYT_SR_THERMAL);
+
+        /* A mode with no model behind it cannot be held — the session refuses
+         * it — so the three radios are disabled rather than left clickable and
+         * silently ineffective. */
+        for (Id i : { SrOff, SrVisible, SrThermal })
+            if (btn_[i])
+                btn_[i]->setEnabled(model_loaded);
+
+        if (!sr_status_)
+            return;
+        if (!model_loaded) {
+            sr_status_->setText(
+                QStringLiteral("No model loaded — super-resolution is "
+                               "unavailable.\nInstall zoom2.mnn beside the app "
+                               "or pass --model PATH."));
+        } else {
+            sr_status_->setText(QStringLiteral("Model loaded · mode: %1%2")
+                .arg(QString::fromUtf8(dyt_sr_name(mode)),
+                     mode == DYT_SR_OFF ? QString()
+                                        : QStringLiteral(" (2x)")));
+        }
+    }
+
+    /* The page's live status line, for the selftest to read back. */
+    QLabel *sr_status() const { return sr_status_; }
+
+    /* The key that turns super-resolution off from the mode the session is
+     * holding.  Each of 'z' and 'Z' toggles *its own* plane, so neither alone
+     * means "off" from every mode — from thermal, 'z' would select visible
+     * rather than clear.  Off therefore presses the key of the mode it is
+     * leaving, exactly as the menu's Off item does. */
+    int sr_off_key() const
+    {
+        return sr_mode_ == DYT_SR_THERMAL ? 'Z' : 'z';
+    }
+
 private:
     QGroupBox *group(const QString &title)
     {
@@ -2497,8 +2563,14 @@ private:
         return g;
     }
 
+    /* A row on a panel page.  Normally the click runs the same dispatch as the
+     * key named in `key`, which is the rule that keeps the panel from becoming
+     * a second implementation.  `act` is for the rare control whose key cannot
+     * express it: 'z' and 'Z' each *toggle their own plane*, so neither alone
+     * means "off" from every mode, and the Off row has to ask the session
+     * which key means "off" from where it is. */
     QPushButton *row(QGroupBox *g, Id id, const QString &text, int key,
-                     bool checkable)
+                     bool checkable, std::function<void()> act = {})
     {
         auto *b = new QPushButton(text, g);
         b->setObjectName(QStringLiteral("row"));
@@ -2513,7 +2585,11 @@ private:
         b->setIcon(QIcon(pm));
         b->setToolTip(QStringLiteral("key: %1")
                           .arg(QChar((char)key).toUpper()));
-        connect(b, &QPushButton::clicked, [this, key]() {
+        connect(b, &QPushButton::clicked, [this, key, act]() {
+            if (act) {
+                act();
+                return;
+            }
             if (on_key)
                 on_key(key);
         });
@@ -2562,6 +2638,62 @@ private:
         /* Scrollable: the panel is taller than a short window, and a control
          * the user cannot reach is the failure the whole on-screen-controls
          * rule exists to prevent. */
+        auto *scroll = new QScrollArea(this);
+        scroll->setWidget(page);
+        scroll->setWidgetResizable(true);
+        scroll->setFocusPolicy(Qt::NoFocus);
+        scroll->setFrameShape(QFrame::NoFrame);
+        return scroll;
+    }
+
+    /* The Super Resolution tab.  Off / Visible plane (2x) / Thermal plane
+     * (2x), one at a time, each routed through the same dispatch as the 'z'
+     * and 'Z' keys.  The page is ours, not the vendor's: super-resolution is a
+     * recovered capability (src/sr.h), so it gets its own tab rather than
+     * being wedged into the Troubleshoot groups the manual lays out. */
+    QWidget *build_super_resolution()
+    {
+        auto *page = new QWidget;
+        auto *lay  = new QVBoxLayout(page);
+        lay->setContentsMargins(6, 6, 6, 6);
+        lay->setSpacing(8);
+
+        QGroupBox *mode = group(QStringLiteral("Upscale plane (2x)"));
+        auto *mgrp = new QButtonGroup(this);
+        mgrp->setExclusive(true);
+        /* Off presses whichever key means "off" from the mode the session
+         * holds; the other two are their own keys. */
+        QPushButton *off = row(mode, SrOff, QStringLiteral("Off"), 'z', true,
+                               [this]() {
+                                   if (on_key)
+                                       on_key(sr_off_key());
+                               });
+        off->setToolTip(QStringLiteral("key: z / Z"));
+        mgrp->addButton(off);
+        mgrp->addButton(row(mode, SrVisible,
+                            QStringLiteral("Visible plane (2x)"), 'z', true));
+        mgrp->addButton(row(mode, SrThermal,
+                            QStringLiteral("Thermal plane (2x)"), 'Z', true));
+        lay->addWidget(mode);
+
+        sr_status_ = new QLabel(this);
+        sr_status_->setObjectName(QStringLiteral("srstatus"));
+        sr_status_->setWordWrap(true);
+        sr_status_->setFocusPolicy(Qt::NoFocus);
+        lay->addWidget(sr_status_);
+
+        auto *hint = new QLabel(
+            QStringLiteral("The model is the recovered 256x192 → 512x384 2x "
+                           "upscaler (models/zoom2.mnn).  \"Visible\" upscales "
+                           "the vendor's grey plane; \"Thermal\" upscales the "
+                           "picture through the display range."), this);
+        hint->setObjectName(QStringLiteral("srhint"));
+        hint->setWordWrap(true);
+        hint->setFocusPolicy(Qt::NoFocus);
+        lay->addWidget(hint);
+
+        lay->addStretch(1);
+
         auto *scroll = new QScrollArea(this);
         scroll->setWidget(page);
         scroll->setWidgetResizable(true);
@@ -2685,6 +2817,29 @@ private:
             p.drawRect(cx - 7, cy - 5, 10, 8);
             p.drawRect(cx - 4, cy - 7, 10, 8);
             break;
+        case SrOff:
+            /* one pixel, struck through: native resolution */
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawRect(cx - 2, cy - 2, 4, 4);
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(white, 1.4));
+            p.drawLine(cx - 6, cy + 6, cx + 6, cy - 6);
+            break;
+        case SrVisible:
+        case SrThermal:
+            /* a pixel becoming four: the 2x upscale.  The thermal variant
+             * marks the centre, so the two are distinguishable at a glance. */
+            p.setPen(QPen(cyan, 1.2));
+            for (int gx = 0; gx < 2; gx++)
+                for (int gy = 0; gy < 2; gy++)
+                    p.drawRect(cx - 6 + gx * 7, cy - 6 + gy * 7, 5, 5);
+            if (id == SrThermal) {
+                p.setBrush(cyan);
+                p.setPen(Qt::NoPen);
+                p.drawEllipse(QPointF(cx, cy), 1.8, 1.8);
+            }
+            break;
         case N_Ids:
             break;
         }
@@ -2692,6 +2847,12 @@ private:
 
     QTabWidget  *tabs_ = nullptr;
     QPushButton *btn_[N_Ids] = {};
+    QLabel      *sr_status_ = nullptr;   /* the Super Resolution tab's readout */
+    /* The mode the last sync reported, so the Off row knows which key means
+     * "off" from where the session is.  Kept as the last *synced* mode rather
+     * than read live because the panel has no session handle — it reports, it
+     * does not act on the engine directly. */
+    dyt_sr_t     sr_mode_ = DYT_SR_OFF;
 };
 
 /* --------------------------------------------------------------- the window */
@@ -2765,6 +2926,15 @@ public:
 
     IconRail *rail() const { return rail_; }
     ControlPanel *panel() const { return panel_; }
+
+    /* Whether the session has a super-resolution model behind it.  Asked of
+     * the session, not read from snap_: the control panel shows this before
+     * the first frame arrives, when there is no snapshot to read it from, and
+     * the panel must not claim "no model" for a session that has one. */
+    bool sr_model_loaded() const
+    {
+        return sess_ && dyt_session_sr_capable(sess_) != 0;
+    }
 
     FrameView   *view()  const { return view_; }
     StatusStrip *strip() const { return strip_; }
@@ -3059,6 +3229,10 @@ public:
     {
         strip_->set_lines(strip_->line(0), strip_->line(1),
                           viewing() ? viewing_label_ : state_line(st, snap, fps));
+        /* The panel's Super Resolution page is session state, not frame state,
+         * so it stays right while the canvas is still a placeholder — which is
+         * exactly when a user wondering why the radios are dead needs it. */
+        sync_sr_panel();
     }
 
     /* The single key dispatch.  Every key the app understands is interpreted
@@ -3552,6 +3726,18 @@ private:
             panel_->sync(snap_, view_ && view_->hot_shown(),
                          strip_ && !strip_->recording_label().isEmpty(),
                          gal_.open != 0);
+
+        /* The Super Resolution page reads the session rather than the
+         * snapshot, so it is synced from here too — it is correct even for the
+         * states the snapshot zeroes. */
+        sync_sr_panel();
+    }
+
+    void sync_sr_panel()
+    {
+        if (panel_)
+            panel_->sync_sr(sr_model_loaded(),
+                            sess_ ? dyt_session_get_sr(sess_) : DYT_SR_OFF);
     }
 
     FrameView   *view_  = nullptr;
@@ -5986,6 +6172,128 @@ static int selftest(const opts &o)
         std::printf("  %-4s the icon rail cannot take the keyboard "
                     "(%d button(s), %d that would)\n",
                     ok ? "ok" : "FAIL", (int)btns.size(), bad);
+        if (!ok)
+            fails++;
+    }
+
+    /* 53c. The Super Resolution tab.  Three things have to hold, and each
+     * fails differently: the radios must show the mode the *session* holds
+     * (not the last click), the status line must tell the truth about whether
+     * a model is behind the feature, and a click must reach the session
+     * through the same dispatch as 'z'/'Z' — including the Off row, whose key
+     * is not fixed, because 'z' and 'Z' each toggle their own plane and
+     * neither alone means "off" from every mode. */
+    {
+        ControlPanel *panel = win.panel();
+        auto checked = [&](ControlPanel::Id i) {
+            QPushButton *b = panel ? panel->button(i) : nullptr;
+            return b && b->isChecked();
+        };
+
+        /* Sync the panel with the session as it stands, so the read-back below
+         * is against the current state rather than whatever the previous
+         * assertion last painted. */
+        pm.step();
+        QApplication::processEvents();
+
+        dyt_snapshot_t s0{};
+        dyt_session_snapshot(sess, &s0, nullptr, 0);
+        const dyt_sr_t before = s0.sr;
+        const bool     cap    = win.sr_model_loaded();
+
+        const bool reflect =
+            checked(ControlPanel::SrOff)     == (before == DYT_SR_OFF) &&
+            checked(ControlPanel::SrVisible) == (before == DYT_SR_VISIBLE) &&
+            checked(ControlPanel::SrThermal) == (before == DYT_SR_THERMAL);
+
+        QLabel *st = panel ? panel->sr_status() : nullptr;
+        const QString text = st ? st->text() : QString();
+        const bool status = cap ? text.contains(QStringLiteral("Model loaded"))
+                                : text.contains(QStringLiteral("No model"));
+
+        /* Click a plane, then Off, and require the session and the radios to
+         * agree after each.  With no model the radios are disabled instead, and
+         * a disabled radio that still reported a mode would be a lie. */
+        bool moved = true, followed = true, off_ok = true, disabled = true;
+        if (cap) {
+            const dyt_sr_t want = before == DYT_SR_VISIBLE ? DYT_SR_THERMAL
+                                                           : DYT_SR_VISIBLE;
+            QPushButton *b = panel->button(want == DYT_SR_VISIBLE
+                                           ? ControlPanel::SrVisible
+                                           : ControlPanel::SrThermal);
+            if (b)
+                b->click();
+            pm.step();
+            QApplication::processEvents();
+            dyt_snapshot_t s1{};
+            dyt_session_snapshot(sess, &s1, nullptr, 0);
+            moved    = s1.sr == want;
+            followed = checked(ControlPanel::SrVisible) ==
+                           (s1.sr == DYT_SR_VISIBLE) &&
+                       checked(ControlPanel::SrThermal) ==
+                           (s1.sr == DYT_SR_THERMAL) &&
+                       checked(ControlPanel::SrOff) == (s1.sr == DYT_SR_OFF);
+
+            /* The Off row, from a mode that is not off — which is where its
+             * key has to be chosen rather than assumed. */
+            QPushButton *off = panel->button(ControlPanel::SrOff);
+            if (off)
+                off->click();
+            pm.step();
+            QApplication::processEvents();
+            dyt_snapshot_t s2{};
+            dyt_session_snapshot(sess, &s2, nullptr, 0);
+            off_ok = s2.sr == DYT_SR_OFF && checked(ControlPanel::SrOff);
+        } else {
+            QPushButton *v = panel->button(ControlPanel::SrVisible);
+            disabled = v && !v->isEnabled() && !checked(ControlPanel::SrVisible);
+        }
+
+        /* Leave the mode as the run found it. */
+        dyt_session_set_sr(sess, before);
+        pm.step();
+        QApplication::processEvents();
+
+        const bool ok = panel && st && reflect && status && moved && followed
+                        && off_ok && disabled;
+        std::printf("  %-4s the Super Resolution tab reflects the session "
+                    "(mode %s, model %s, plane %s, off %s)\n",
+                    ok ? "ok" : "FAIL", dyt_sr_name(before),
+                    cap ? "loaded" : "none", moved ? "yes" : "NO",
+                    off_ok ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 53d. Every tab of the control panel is reachable.  A QTabWidget whose
+     * tabs do not fit hides the overflow behind scroll arrows, which is the
+     * same "control the user cannot reach" failure assertion 56 guards against
+     * for the toolbar — and it is a live risk here, because the panel is a
+     * fixed 224 px and the tab count only grows (the Windows panel's four tabs
+     * need a much wider column than the two we have so far).
+     *
+     * Measured *themed*, unlike every other assertion here.  The tabs' fit is a
+     * property of the stylesheet's padding and font size, and the selftest runs
+     * unthemed on purpose (see run_gui); measuring the default style would
+     * answer a question nobody asks.  The stylesheet is put back immediately so
+     * the geometry assertions after this one still see the unthemed metrics
+     * they were calibrated against. */
+    {
+        ControlPanel *panel = win.panel();
+        QTabWidget *tabs = panel ? panel->tabs() : nullptr;
+        const int   n    = tabs ? tabs->count() : 0;
+
+        qApp->setStyleSheet(QString::fromUtf8(kDarkQss));
+        QApplication::processEvents();
+        const int want = tabs ? tabs->tabBar()->sizeHint().width() : -1;
+        const int have = tabs ? tabs->width() - 2 : -1;  /* less the pane border */
+        qApp->setStyleSheet(QString());
+        QApplication::processEvents();
+
+        const bool ok = n >= 2 && want > 0 && want <= have;
+        std::printf("  %-4s every control-panel tab fits, with no scroll arrow "
+                    "(%d tab(s), %d px of %d)\n",
+                    ok ? "ok" : "FAIL", n, want, have);
         if (!ok)
             fails++;
     }
