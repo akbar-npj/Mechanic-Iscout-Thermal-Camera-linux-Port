@@ -315,11 +315,17 @@ otherwise. The poll model stated in `session.h` already covers the hand-off.
 timer; it is an optimisation, not a correctness requirement, and is not wired in
 yet.
 
+Device *control* is the other thread story: bring-up and teardown run on a
+worker and marshal their one result back with `invokeMethod` — not a signal, but
+the same idea, and only once per operation rather than per frame. That is about
+the device; the frame hand-off above is still the poll model, unchanged.
+
 ## Bring-up and teardown
 
-The live path is a single bring-up function that either succeeds completely or
-leaves the state machine in `NO DEVICE`. The ordering is load-bearing, from the
-canonical sequence in `session_capture.h:21-27`:
+The live path is a single bring-up function, `bring_up_live()`, that either
+succeeds completely or leaves the state machine in `NO DEVICE`. It runs on a
+worker thread, not on the GUI thread (below). The ordering is load-bearing,
+from the canonical sequence in `session_capture.h:21-27`:
 
 1. `dyt_capture_open()` — finds and claims the device.
 2. `dyt_session_capture_set_capture()` — **before** `start()`, because the
@@ -342,17 +348,72 @@ The window is painted before bring-up: `dyt_capture_open()` and the first
 `dyt_capture_start()` can each take seconds — and in AD mode `start()` blocks
 ~3 s + 200 ms by design (`capture.c:600-615`) — so an unpainted window for that
 long looks like a hang. The forced paint covers the ordinary slow-open case;
-the wedged-device case is the known limit below.
+the wedged-device case is the worker's business below.
+
+### Off the GUI thread
+
+Both `dyt_capture_open()` and `dyt_capture_stop()` can block without bound —
+open because every libuvc control transfer in it passes timeout `0` (the bullet
+under "What is *not* established"), stop because it joins libuvc's callback
+thread. On the GUI thread either one freezes the window with no way out: the
+GUI thread is the one blocked, so no `QTimer` can rescue it. Both therefore run
+on `DeviceWorker`.
+
+A worker runs one job at a time — a second `open()` while the first is still
+inside it would fight for the device. A job is a `std::shared_ptr<Job>` that
+carries its own *copy* of the capture options, because a wedged job is
+abandoned at exit and by then `run_gui`'s `opts` may be gone. `Job::in` and
+`Job::out` are the device handles, moved in and out so exactly one side owns
+them at a time. The result comes back with
+`QMetaObject::invokeMethod(qApp, …, Qt::QueuedConnection)`, which needs no
+`Q_OBJECT` and no moc.
+
+It is a detached `std::thread` rather than a `QThread` for one reason: a wedged
+worker must be *abandoned*, never joined. A `QThread` member aborts in its
+destructor while still running; a detached `std::thread` simply dies with the
+process.
+
+### Reconnect
+
+`seq` freezing is not only a label; it drives a reconnect. The first tick that
+`step()` sees `NO SIGNAL` it sets `pm.reconnect` — a flag, so the pump stays a
+plain function of the session — and the timer callback turns that into a
+teardown job and then a bring-up. The frame source is nulled on the GUI thread
+*before* the worker is asked to close it, so the pump can never pull from a
+source that is being freed.
+
+If bring-up fails, or a running stream dies, the app retries on its own with
+the backoff in `retry_delay_s()`: 0.5, 1, 2, 4, 8, 16, 30, 30 s, then it gives
+up and says so. `R` retries at once (it skips the wait, not the teardown); the
+window takes `StrongFocus` so the key is delivered at all.
+
+### Closing
+
+`closeEvent` calls `on_close_`, which only marks `quitting` and stops the
+timers — the device is handed back *after* `app.exec()` returns, so teardown
+never runs re-entrantly inside a close event. (Qt calls `closeEvent` on
+`app.quit()` as well as on a user close — verified, not assumed — which is why
+nothing downstream distinguishes the two.)
+
+At exit, if the worker is still busy it is wedged inside a libuvc call with no
+timeout. It cannot be joined (that would hang the exit) and it cannot be left
+to finish (it would call back into Qt after the application is gone), so the
+only safe move is to leave immediately — flushing stdio by hand, skipping
+static teardown, leaking the session the wedged thread may still be writing
+into. Otherwise a final teardown job runs and the exit waits up to 1 s for it,
+then abandons it the same way.
 
 ## What is *not* established
 
 * **`dyt_capture_open()` has no timeout.** Every libuvc control transfer in it
   passes timeout `0`, which libusb reads as *wait indefinitely*, so a wedged
-  device can hang the GUI thread with no way out — the window would freeze and a
-  `QTimer` could not rescue it, because the GUI thread is the one blocked. This
-  is the strongest argument for the worker thread task #87 will add. For this
-  milestone it is accepted and documented; the forced paint before bring-up
-  covers the ordinary slow-open case, which is tens of milliseconds.
+  device hangs the call without bound. It no longer hangs the *window* —
+  bring-up runs on `DeviceWorker`, and so does `dyt_capture_stop()`, which
+  joins libuvc's callback thread and can block the same way. What is not fixed
+  is the call itself: a worker that never returns is abandoned at exit, taking
+  its device handle and the leaked session with it, because there is no way to
+  cancel it without a timeout in vendored libuvc. Adding one there was the
+  alternative weighed and not taken.
 * **Interaction.** `src/view_model.c` already provides the pointer→tool mapping
   (`dyt_vm_tool_mouse`) and the parameter arm/confirm machine
   (`dyt_vm_param_key`), and both are pinned by `view_model_test`. The window does

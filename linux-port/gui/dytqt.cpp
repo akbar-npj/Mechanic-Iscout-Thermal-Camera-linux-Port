@@ -20,12 +20,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <QApplication>
+#include <QCloseEvent>
 #include <QColor>
+#include <QEventLoop>
 #include <QImage>
+#include <QKeyEvent>
 #include <QPainter>
 #include <QPixmap>
 #include <QSize>
@@ -113,7 +119,9 @@ static void usage(const char *prog)
         "  --t-amb C        LUT ambient for the live path (default 25.0)\n"
         "  --ad-output      send setTinyCOutputADValue and read the flat\n"
         "                   256x192 raw-AD frame; default is the device's own\n"
-        "                   256x384 dual-half frame, which needs no order\n",
+        "                   256x384 dual-half frame, which needs no order\n"
+        "\n"
+        "with --live the window reconnects on its own; press R to retry now\n",
         prog, opts{}.fixture.c_str());
 }
 
@@ -565,10 +573,19 @@ public:
         lay->addWidget(strip_, 0);
 
         setWindowTitle("dytqt — DYT thermal camera");
+        /* So 'R' reaches keyPressEvent rather than being dropped. */
+        setFocusPolicy(Qt::StrongFocus);
     }
 
     FrameView   *view()  const { return view_; }
     StatusStrip *strip() const { return strip_; }
+
+    /* The front end owns the device lifecycle, so the window only reports the
+     * two events it cannot act on itself.  `on_close_` runs before the close is
+     * accepted, which is what lets run_gui stop the timers and hand the device
+     * back while the event loop is still alive. */
+    std::function<void()> on_close_;
+    std::function<void()> on_retry_;
 
     /* Size the window to the canvas it has to show.  Called once before the
      * window is shown, and again whenever the canvas changes size.
@@ -620,6 +637,23 @@ public:
                           state_line(st, snap, fps));
     }
 
+protected:
+    void closeEvent(QCloseEvent *e) override
+    {
+        if (on_close_)
+            on_close_();
+        e->accept();
+    }
+
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        if (e->key() == Qt::Key_R && on_retry_) {
+            on_retry_();
+            return;
+        }
+        QWidget::keyPressEvent(e);
+    }
+
 private:
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
@@ -653,6 +687,11 @@ struct pump {
     bool live         = false;
     bool bringup_done = false;
     int  bringup_rc   = 0;
+
+    /* Set by step() the first tick it sees NO SIGNAL, and cleared by run_gui
+     * once it has started the teardown that leads to a retry.  A flag rather
+     * than a callback so the pump stays a plain function of the session. */
+    bool reconnect    = false;
 
     long long ticks  = 0;   /* timer callbacks */
     long long frames = 0;   /* frames actually painted */
@@ -714,6 +753,9 @@ struct pump {
 
         const DevState ds = device_state(live, bringup_done, bringup_rc,
                                         true, ready, stalled);
+
+        if (ds == DevState::Stalled)
+            reconnect = true;         /* run_gui tears down and retries */
 
         if (!snap.ready) {
             /* The start-up filler decodes to a legitimate-looking 238.85 C
@@ -1253,13 +1295,14 @@ struct live {
  * Every failure prints its own reason to stderr — the capture layer has no
  * message string to retrieve — so the window only has to show NO DEVICE.
  *
- * Known limit: dyt_capture_open() has no timeout (every libuvc control
- * transfer in it passes timeout 0, which libusb reads as "wait forever"), so a
- * wedged device hangs this call and with it the GUI thread.  The worker thread
- * that fixes it is task #87; see gui/README.md. */
-static int bring_up_live(const opts &o, dyt_session_t *sess, live &L)
+ * dyt_capture_open() has no timeout (every libuvc control transfer in it passes
+ * timeout 0, which libusb reads as "wait forever"), so a wedged device hangs
+ * this call indefinitely.  That is why it runs on the worker thread and not on
+ * the GUI thread — see DeviceWorker below.  It is still unbounded: a call that
+ * never returns leaves a thread that is abandoned rather than joined. */
+static int bring_up_live(const dyt_capture_opts &cap, dyt_session_t *sess, live &L)
 {
-    if (dyt_capture_open(&L.cap, &o.cap) != 0)
+    if (dyt_capture_open(&L.cap, &cap) != 0)
         return -1;
 
     L.mode = dyt_capture_mode(L.cap);
@@ -1300,6 +1343,74 @@ static void tear_down_live(live &L)
     L = live{};
 }
 
+/* ------------------------------------------------------- the device worker */
+
+/* One device operation, handed to the worker and handed back with its result.
+ *
+ * The capture options are *copied* rather than pointed at: a wedged job is
+ * abandoned at exit, and by then run_gui's `opts` may be gone.  Nothing else is
+ * owned — `sess` is borrowed (the session outlives every job), and `in`/`out`
+ * are handles the GUI moves in and out so exactly one side owns them at a time. */
+struct Job {
+    enum Kind { BringUp, TearDown } kind = BringUp;
+    dyt_capture_opts cap{};
+    dyt_session_t   *sess = nullptr;
+    live             in{};    /* TearDown: the handles to unwind */
+    live             out{};   /* BringUp: what was created; empty on failure */
+    int              rc = -1;
+};
+
+/* Runs bring-up and teardown off the GUI thread.
+ *
+ * Both touch the device and both can block without bound — dyt_capture_open()
+ * on a wedged camera, dyt_capture_stop() on a stream whose transfers never
+ * complete.  On the GUI thread either one freezes the window with no way out,
+ * and no QTimer can rescue it because the GUI thread is the one blocked.
+ *
+ * A std::thread, detached, rather than a QThread: this file has no Q_OBJECT and
+ * the build runs no moc, so a queued signal is not available either way — and
+ * more to the point, a wedged worker must be *abandoned*, never joined.  A
+ * QThread member aborts in its destructor while still running; a detached
+ * std::thread simply dies with the process.
+ *
+ * One job at a time, enforced by busy(): a second bring-up while the first is
+ * still inside dyt_capture_open() would fight it for the device. */
+class DeviceWorker {
+public:
+    using Done = std::function<void(const std::shared_ptr<Job> &)>;
+
+    bool busy() const { return busy_; }
+
+    void post(const std::shared_ptr<Job> &job, Done done)
+    {
+        busy_ = true;
+        std::thread([this, job, done]() {
+            if (job->kind == Job::BringUp) {
+                job->rc = bring_up_live(job->cap, job->sess, job->out) == 0
+                              ? 0 : -1;
+                /* A half-built device is unwound here, so a failed bring-up
+                 * hands back an empty `live` and a retry starts from clean. */
+                if (job->rc != 0)
+                    tear_down_live(job->out);
+            } else {
+                tear_down_live(job->in);
+            }
+            /* Back to the GUI thread.  invokeMethod with a functor needs no
+             * Q_OBJECT and no moc.  If the application is already gone this is
+             * never delivered — which is why nothing is dereferenced until it
+             * runs, and why an abandoned worker must never get here at all
+             * (run_gui exits immediately instead; see the end of run_gui). */
+            QMetaObject::invokeMethod(qApp, [this, job, done]() {
+                busy_ = false;
+                done(job);
+            }, Qt::QueuedConnection);
+        }).detach();
+    }
+
+private:
+    bool busy_ = false;   /* written only on the GUI thread */
+};
+
 static int run_gui(const opts &o, QApplication &app)
 {
     dyt_session_t *sess = setup_session(o);
@@ -1316,15 +1427,114 @@ static int run_gui(const opts &o, QApplication &app)
         return 1;
     }
 
-    /* Paint before bring-up.  dyt_capture_open() and the first
-     * dyt_capture_start() can each take seconds — and in AD mode start() blocks
-     * ~3 s + 200 ms by design (capture.c:600-615) — so an unpainted window for
-     * that long looks like a hang.  Same reasoning as dytview.cpp:977-979. */
+    /* Paint before bring-up.  Bring-up now runs on a worker, so the window is
+     * responsive throughout it, but it still has nothing to show until then:
+     * this paints CONNECTING rather than an uninitialised window. */
     win.fit_to_view();
     win.show();
     QApplication::processEvents();
 
-    live L;
+    live         L;
+    DeviceWorker worker;
+    bool         quitting = false;
+    int          attempt  = 0;    /* retries made since the last success */
+
+    QTimer timer;
+    QTimer retry_timer;
+    retry_timer.setSingleShot(true);
+
+    /* Declared as std::functions so the retry timer, the stall handler and the
+     * R key share one definition each without a Q_OBJECT (there is no moc in
+     * this build). */
+    std::function<void()>       post_bringup;
+    std::function<void()>       schedule_retry;
+    std::function<void(bool)>   reconnect;
+
+    schedule_retry = [&]() {
+        const double d = retry_delay_s(attempt);
+        if (d < 0.0) {
+            std::fprintf(stderr, "dytqt: giving up after %d attempt(s)\n",
+                         attempt);
+            return;
+        }
+        attempt++;
+        std::fprintf(stderr, "dytqt: retrying in %.1f s\n", d);
+        retry_timer.start((int)(d * 1000.0));
+    };
+
+    /* Bring the device up on the worker and act on the result.  CONNECTING
+     * while the attempt runs; LIVE or NO DEVICE once it answers. */
+    post_bringup = [&]() {
+        if (quitting || worker.busy())
+            return;
+        pm.bringup_done = false;      /* CONNECTING for the duration */
+        auto job  = std::make_shared<Job>();
+        job->kind = Job::BringUp;
+        job->cap  = o.cap;
+        job->sess = sess;
+        worker.post(job, [&](const std::shared_ptr<Job> &j) {
+            if (quitting)
+                return;
+            L               = j->out;
+            pm.fs           = L.fs;   /* NULL when bring-up failed */
+            pm.mode         = L.mode;
+            pm.bringup_rc   = j->rc;
+            pm.bringup_done = true;
+            if (j->rc == 0) {
+                attempt = 0;
+                retry_timer.stop();
+                pm.stall.reset();
+            } else {
+                schedule_retry();
+            }
+        });
+    };
+
+    /* The stream died: unwind what we hold, then start retrying.  The source is
+     * nulled on *this* thread before the worker is asked to close it, so the
+     * pump can never pull from a frame source being freed. */
+    reconnect = [&](bool now) {
+        if (quitting || worker.busy())
+            return;
+        pm.fs           = nullptr;
+        pm.bringup_done = false;      /* CONNECTING, not LIVE over a dead stream */
+        pm.stall.reset();
+        attempt = 0;
+
+        auto afterwards = [&, now]() {
+            if (quitting)
+                return;
+            if (now) post_bringup();
+            else     schedule_retry();
+        };
+
+        if (!L.cap && !L.fs && !L.sc) {
+            afterwards();
+            return;
+        }
+        auto job  = std::make_shared<Job>();
+        job->kind = Job::TearDown;
+        job->in   = L;                /* the worker owns them from here */
+        L = live{};
+        worker.post(job, [&, afterwards](const std::shared_ptr<Job> &) {
+            afterwards();
+        });
+    };
+
+    win.on_retry_ = [&]() { reconnect(true); };
+    win.on_close_ = [&]() {
+        /* Only mark it: the device is handed back after app.exec() returns, so
+         * teardown never runs re-entrantly inside a close event.
+         *
+         * Qt calls this on app.quit() as well as on a user close — verified,
+         * not assumed — which is why nothing downstream distinguishes the two:
+         * this is simply "the window is going away". */
+        quitting = true;
+        timer.stop();
+        retry_timer.stop();
+        pm.fs = nullptr;
+    };
+
     if (!o.live) {
         pm.fs = dyt_frame_source_open_fixture(
             sess, o.fixture.c_str(), o.width, DYT_MODE_1000,
@@ -1334,17 +1544,13 @@ static int run_gui(const opts &o, QApplication &app)
             dyt_session_free(sess);
             return 1;
         }
+        pm.bringup_done = true;
     } else {
-        L.rc = bring_up_live(o, sess, L) == 0 ? 0 : -1;
-        pm.bringup_rc   = L.rc;
-        pm.fs           = L.fs;      /* NULL when bring-up failed */
-        pm.mode         = L.mode;
-        if (L.rc != 0)
-            std::fprintf(stderr, "dytqt: no camera; the window will say so\n");
+        post_bringup();               /* CONNECTING until the worker answers */
     }
-    pm.bringup_done = true;
 
-    QTimer timer;
+    QObject::connect(&retry_timer, &QTimer::timeout, [&]() { post_bringup(); });
+
     QObject::connect(&timer, &QTimer::timeout, [&]() {
         if (!pm.step()) {
             timer.stop();
@@ -1352,6 +1558,10 @@ static int run_gui(const opts &o, QApplication &app)
                         pm.frames);
             app.quit();
             return;
+        }
+        if (pm.reconnect) {
+            pm.reconnect = false;
+            reconnect(false);
         }
         if (o.frames > 0 && pm.frames >= o.frames) {
             timer.stop();
@@ -1380,7 +1590,44 @@ static int run_gui(const opts &o, QApplication &app)
         }
     }
 
-    tear_down_live(L);
+    /* Hand the device back, if it can be handed back.
+     *
+     * A worker still running is wedged inside a libuvc call that has no timeout.
+     * It cannot be joined (that would hang the exit) and it cannot be left to
+     * finish (it would call back into Qt after the application is gone), so the
+     * only safe thing is to leave *now*, flushing stdio by hand and skipping
+     * static teardown.  The session is leaked with it, because the wedged thread
+     * may still be writing into it.  This is the documented cost of not putting
+     * a timeout in vendored libuvc. */
+    if (worker.busy()) {
+        std::fprintf(stderr,
+                     "dytqt: a device operation is still running; "
+                     "exiting without it\n");
+        std::fflush(nullptr);
+        std::_Exit(rc);
+    }
+
+    if (L.cap || L.fs || L.sc) {
+        auto job  = std::make_shared<Job>();
+        job->kind = Job::TearDown;
+        job->in   = L;
+        L = live{};
+        QEventLoop loop;
+        bool done = false;
+        worker.post(job, [&](const std::shared_ptr<Job> &) {
+            done = true;
+            loop.quit();
+        });
+        QTimer::singleShot(1000, &loop, &QEventLoop::quit);
+        loop.exec();
+        if (!done) {
+            std::fprintf(stderr,
+                         "dytqt: device did not stop; exiting without it\n");
+            std::fflush(nullptr);
+            std::_Exit(rc);
+        }
+    }
+
     dyt_session_free(sess);
     return rc;
 }
