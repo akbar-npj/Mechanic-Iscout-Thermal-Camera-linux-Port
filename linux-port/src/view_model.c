@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -642,6 +643,87 @@ done:
     free(jpg);
     return rc;
 #undef FAIL
+}
+
+/* ------------------------------------------------- capture and recording */
+
+int dyt_vm_capture_name(char *out, size_t n, const char *dir, const char *ts,
+                        const char *ext)
+{
+    int need;
+
+    if (!out || n == 0 || !ts || !ts[0] || !ext || !ext[0])
+        return -1;
+
+    if (dir && dir[0])
+        need = snprintf(out, n, "%s/dyt_%s.%s", dir, ts, ext);
+    else
+        need = snprintf(out, n, "dyt_%s.%s", ts, ext);
+
+    return (need > 0 && (size_t)need < n) ? 0 : -1;
+}
+
+long long dyt_vm_free_bytes(const char *path)
+{
+    struct statvfs vfs;
+
+    if (!path || !path[0])
+        return -1;
+    if (statvfs(path, &vfs) != 0)
+        return -1;
+
+    /* f_bavail, not f_bfree: the difference is the root reserve, which an
+     * unprivileged writer cannot use, so counting it would report room that is
+     * not there and turn the guard into a lie. */
+    return (long long)vfs.f_bavail * (long long)vfs.f_frsize;
+}
+
+int dyt_vm_disk_room(const char *path, long long need_bytes,
+                     long long *free_out)
+{
+    const long long free_b = dyt_vm_free_bytes(path);
+
+    if (free_out)
+        *free_out = free_b;
+    if (free_b < 0)
+        return -1;
+    return free_b >= need_bytes ? 1 : 0;
+}
+
+int dyt_vm_elapsed(double seconds, char *out, size_t n)
+{
+    long long s;
+
+    if (!out || n == 0)
+        return -1;
+
+    /* A clock that has not started yet — or one fed a NaN — must not print a
+     * negative time. */
+    if (!(seconds > 0.0))
+        s = 0;
+    else if (seconds > 359999.0)
+        s = 359999;                 /* 99:59:59, so the field cannot grow */
+    else
+        s = (long long)seconds;
+
+    if (s < 3600)
+        snprintf(out, n, "%lld:%02lld", s / 60, s % 60);
+    else
+        snprintf(out, n, "%lld:%02lld:%02lld", s / 3600, (s / 60) % 60, s % 60);
+    return 0;
+}
+
+int dyt_vm_rec_label(double seconds, long long frames, char *out, size_t n)
+{
+    char t[16];
+
+    if (!out || n == 0)
+        return -1;
+    if (dyt_vm_elapsed(seconds, t, sizeof t) != 0)
+        return -1;
+
+    return snprintf(out, n, "REC %s  %lld frame%s", t, frames,
+                    frames == 1 ? "" : "s");
 }
 
 /* -------------------------------------------------------------- utilities */

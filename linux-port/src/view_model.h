@@ -272,6 +272,51 @@ long dyt_vm_apply_isotherm(uint8_t *bgr, int w, int h,
  * writes why into it. */
 int dyt_vm_write_still(dyt_session_t *s, const char *path, char *msg, size_t n);
 
+/* ------------------------------------------------- capture and recording
+ *
+ * What a front end needs to put material on disk: where it goes, whether there
+ * is room for it, and what the recording indicator says.  All of it is a pure
+ * function of its arguments (plus statvfs), so it is pinned in `make check`
+ * with no device and no window — which is the point, because the alternative
+ * is a filename rule and a disk guard written once in the Qt app and again in
+ * the reference viewer.
+ */
+
+/* `<dir>/dyt_<ts>.<ext>`, or `dyt_<ts>.<ext>` when `dir` is NULL or empty.
+ *
+ * `ts` is the `YYYYmmdd-HHMMSS` dyt_vm_timestamp() produces, passed in rather
+ * than read here so the result is testable; `ext` is the extension without its
+ * dot ("png", "dyt.jpg", "mp4").
+ *
+ * Returns 0, or -1 on a bad argument or a name that does not fit `n`. */
+int dyt_vm_capture_name(char *out, size_t n, const char *dir, const char *ts,
+                        const char *ext);
+
+/* Bytes an unprivileged writer may still use on the filesystem holding `path`
+ * (statvfs's f_bavail, not f_bfree — the root reserve is not available to us).
+ * Returns -1 on a bad argument or when `path` cannot be examined. */
+long long dyt_vm_free_bytes(const char *path);
+
+/* The disk guard.  Returns 1 when `need_bytes` still fit, 0 when they do not,
+ * -1 when the filesystem cannot be examined; *free_out, when non-NULL, always
+ * receives the free-byte count (or -1).
+ *
+ * Deliberately reports rather than acts: refusing to start a clip and stopping
+ * one that is already running are different decisions, and they belong to the
+ * front end. */
+int dyt_vm_disk_room(const char *path, long long need_bytes,
+                     long long *free_out);
+
+/* "0:07", or "1:02:03" past an hour.  A negative or non-finite `seconds`
+ * reads "0:00", so a clock that has not started cannot print a negative time.
+ * Returns 0, or -1 on a bad argument. */
+int dyt_vm_elapsed(double seconds, char *out, size_t n);
+
+/* The recording indicator: "REC 0:07  175 frames".  Returns the number of
+ * characters that would have been written, so a caller can detect truncation,
+ * or -1 on a bad argument. */
+int dyt_vm_rec_label(double seconds, long long frames, char *out, size_t n);
+
 /* -------------------------------------------------------------- utilities */
 
 /* The directory the running executable lives in, or "" when it cannot be

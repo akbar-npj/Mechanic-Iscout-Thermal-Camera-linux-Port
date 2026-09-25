@@ -677,6 +677,101 @@ static void test_utilities(void)
         fail("util: an unreadable palette directory falls through", b);
 }
 
+/* ------------------------------------------------- capture and recording */
+
+static void test_capture(void)
+{
+    char      b[256];
+    long long free_b = -1;
+
+    printf("\n-- capture names, disk guard, recording label --\n");
+
+    intcheck("cap: a name is dir/dyt_<ts>.<ext>",
+             dyt_vm_capture_name(b, sizeof b, "out", "20260925-120000",
+                                 "png"), 0);
+    strcheck("cap: and it reads as written", b, "out/dyt_20260925-120000.png");
+
+    intcheck("cap: an empty directory drops the slash",
+             dyt_vm_capture_name(b, sizeof b, "", "20260925-120000", "mp4"), 0);
+    strcheck("cap: and the name is bare", b, "dyt_20260925-120000.mp4");
+
+    intcheck("cap: a NULL directory is the same",
+             dyt_vm_capture_name(b, sizeof b, NULL, "20260925-120000",
+                                 "dyt.jpg"), 0);
+    strcheck("cap: and the container keeps its double extension", b,
+             "dyt_20260925-120000.dyt.jpg");
+
+    intcheck("cap: a bad argument is refused",
+             dyt_vm_capture_name(b, sizeof b, "out", "", "png"), -1);
+    intcheck("cap: an empty extension is refused",
+             dyt_vm_capture_name(b, sizeof b, "out", "20260925-120000", ""),
+             -1);
+    /* The rule is the same one snprintf uses, so a name that does not fit is a
+     * refusal rather than a silently truncated file. */
+    intcheck("cap: a name that does not fit is refused",
+             dyt_vm_capture_name(b, 8, "out", "20260925-120000", "png"), -1);
+
+    if (dyt_vm_free_bytes(".") > 0)
+        ok("cap: the free space of a real directory is reported");
+    else
+        fail("cap: the free space of a real directory is reported", ".");
+
+    intcheck("cap: an unexaminable path reports -1",
+             (int)dyt_vm_free_bytes("/nonexistent-dir-xyz/sub"), -1);
+    intcheck("cap: a NULL path reports -1", (int)dyt_vm_free_bytes(NULL), -1);
+
+    intcheck("cap: a byte of room is available here",
+             dyt_vm_disk_room(".", 1, &free_b), 1);
+    if (free_b > 0)
+        ok("cap: and the free count comes back with it");
+    else
+        fail("cap: and the free count comes back with it", ".");
+
+    /* 8 EiB is more than any filesystem here, so the guard must say no — and
+     * still report the count, because the caller wants to say how much is
+     * left rather than only that it is not enough. */
+    intcheck("cap: an impossible request is refused",
+             dyt_vm_disk_room(".", 1LL << 62, &free_b), 0);
+    if (free_b > 0)
+        ok("cap: and the free count still comes back");
+    else
+        fail("cap: and the free count still comes back", ".");
+
+    intcheck("cap: an unexaminable path reports -1",
+             dyt_vm_disk_room("/nonexistent-dir-xyz/sub", 1, &free_b), -1);
+    intcheck("cap: and passes -1 out as the free count", (int)free_b, -1);
+
+    intcheck("cap: elapsed 0 s", dyt_vm_elapsed(0.0, b, sizeof b), 0);
+    strcheck("cap: reads 0:00", b, "0:00");
+
+    dyt_vm_elapsed(7.9, b, sizeof b);
+    strcheck("cap: 7.9 s truncates to 0:07", b, "0:07");
+
+    dyt_vm_elapsed(67.0, b, sizeof b);
+    strcheck("cap: 67 s is 1:07", b, "1:07");
+
+    dyt_vm_elapsed(3600.0, b, sizeof b);
+    strcheck("cap: an hour grows the field", b, "1:00:00");
+
+    dyt_vm_elapsed(3661.0, b, sizeof b);
+    strcheck("cap: 1:01:01 past an hour", b, "1:01:01");
+
+    /* A clock that has not started must not print a negative time, and a NaN
+     * must not print anything stranger. */
+    dyt_vm_elapsed(-5.0, b, sizeof b);
+    strcheck("cap: a negative clock reads 0:00", b, "0:00");
+
+    dyt_vm_elapsed(NAN, b, sizeof b);
+    strcheck("cap: a NaN clock reads 0:00", b, "0:00");
+
+    intcheck("cap: the label is written",
+             dyt_vm_rec_label(7.0, 175, b, sizeof b) > 0, 1);
+    strcheck("cap: and reads REC with the count", b, "REC 0:07  175 frames");
+
+    dyt_vm_rec_label(0.0, 1, b, sizeof b);
+    strcheck("cap: one frame is singular", b, "REC 0:00  1 frame");
+}
+
 int main(void)
 {
     printf("=== view_model_test ===\n");
@@ -693,6 +788,7 @@ int main(void)
     test_tool_mouse();
     test_alarm_band();
     test_utilities();
+    test_capture();
     printf("=== %s ===\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
 }
