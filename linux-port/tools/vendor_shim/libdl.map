@@ -1,0 +1,12 @@
+/*
+ * Version script for the libdl.so shim — see libdl.c.
+ * Keep in sync with: nm -D --undefined-only libDYTJpegAes.so
+ */
+
+LIBC {
+  global:
+    dl_iterate_phdr;
+
+  local:
+    *;
+};

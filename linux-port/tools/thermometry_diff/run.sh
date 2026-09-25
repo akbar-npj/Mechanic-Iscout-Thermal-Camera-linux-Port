@@ -38,37 +38,34 @@ WIDTH=${2:-256}
 HEIGHT=${3:-196}
 RECBASE=${4:-0x200}
 
-mkdir -p build shim "$OUTDIR"
+mkdir -p build "$OUTDIR"
 
 # ---------------------------------------------------------------------------
 # 1. Shim libraries.
 #
 # The vendor .so has DT_NEEDED entries for liblog/libm/libc/libdl/libstdc++,
 # and references libc symbols through bionic's `LIBC` version node.  glibc has
-# no such node, so we supply one.  The same source is compiled twice to produce
-# both libc.so and libm.so, because the vendor library has two verneed records
-# both naming LIBC — one from each of those two DSOs.
+# no such node, so we supply one.  The shim sources live in tools/vendor_shim/,
+# shared with the DYT container differential — one copy, so the two harnesses
+# cannot drift apart.
 # ---------------------------------------------------------------------------
 echo "== building shims =="
-$CC $CFLAGS -shared -fPIC -o shim/libc.so shim/libc.c \
-    -Wl,--version-script,shim/libc.map -Wl,-soname,libc.so -ldl
-$CC $CFLAGS -shared -fPIC -o shim/libm.so shim/libc.c \
-    -Wl,--version-script,shim/libc.map -Wl,-soname,libm.so -ldl
-$CC $CFLAGS -shared -fPIC -o shim/liblog.so shim/liblog.c
-[ -e shim/libdl.so ]     || ln -sf "$(ldconfig -p | awk '/libdl\.so\.2/{print $NF; exit}')" shim/libdl.so
-[ -e shim/libstdc++.so ] || ln -sf "$(ldconfig -p | awk '/libstdc\+\+\.so\.6/{print $NF; exit}')" shim/libstdc++.so
+../vendor_shim/build_shims.sh "$here/build/shim" >/dev/null
 
 # ---------------------------------------------------------------------------
 # 2. Vendor library copy.
 #
-# The only modification is clearing DT_INIT_ARRAYSZ / DT_FINI_ARRAYSZ, whose
-# arrays hold nothing but NULLs.  bionic skips NULL slots; glibc jumps to
-# address 0.  See prep_vendor_so.py for the full argument.
+# Fixes: the NULL .init_array entries, PT_LOAD alignment for 4/16/64 KiB pages,
+# and segment protections on pages two PT_LOADs share.  All three are
+# loader-compatibility changes only; see tools/vendor_shim/prep_vendor_so.py.
+# For libthermometry.so the last two are no-ops (it was linked 64 KiB-aligned
+# with page-disjoint segments), so the copy stays byte-identical to the vendor
+# artifact apart from the init array sizes.
 # ---------------------------------------------------------------------------
 echo "== preparing vendor .so =="
 echo "   source: $VENDOR"
 echo "   sha256: $(sha256sum "$VENDOR" | cut -d' ' -f1)"
-python3 prep_vendor_so.py "$VENDOR" build/libthermometry.so
+python3 ../vendor_shim/prep_vendor_so.py "$VENDOR" build/libthermometry.so
 echo "   patched sha256: $(sha256sum build/libthermometry.so | cut -d' ' -f1)"
 
 # ---------------------------------------------------------------------------
@@ -82,7 +79,7 @@ $CC $CFLAGS -o build/probe   probe.c   -ldl
 # 4. Run.
 # ---------------------------------------------------------------------------
 echo "== running =="
-LD_LIBRARY_PATH="shim:build" \
+LD_LIBRARY_PATH="build/shim:build" \
 DYT_LOG_FILE="$OUTDIR/vendor.log" \
     ./build/harness "$OUTDIR" "$WIDTH" "$HEIGHT" "$RECBASE"
 

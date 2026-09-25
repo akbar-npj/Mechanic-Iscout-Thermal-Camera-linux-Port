@@ -1,0 +1,286 @@
+/*
+ * Version script for the libc.so shim.
+ *
+ * Defines the two bionic version nodes the vendor libraries reference and
+ * exports exactly the symbols they declare as undefined.  Everything else is
+ * hidden, so the shim cannot accidentally interpose on unrelated lookups.
+ *
+ * LIBC_N is declared first: it is bionic's node for the FORTIFY variants, and
+ * naming those symbols here before LIBC's `local: *` wildcard keeps them on
+ * the right node.
+ *
+ * Keep this list in sync with:
+ *   nm -D --undefined-only libthermometry.so
+ *   nm -D --undefined-only libDYTJpegAes.so
+ */
+
+LIBC_N {
+  global:
+    __fread_chk;
+    __fwrite_chk;
+};
+
+LIBC {
+  global:
+    /* bionic-specific entry points this shim implements directly */
+    __cxa_atexit;
+    __cxa_finalize;
+    __errno;
+    __register_atfork;
+    __stack_chk_fail;
+    __stack_chk_guard;
+    android_set_abort_message;
+    basename;
+    gettid;
+    _ctype_;
+    __sF;
+
+    /* FORTIFY variants that live on LIBC in this NDK */
+    __memcpy_chk;
+    __memmove_chk;
+    __memset_chk;
+    __strcat_chk;
+    __strcpy_chk;
+    __strlen_chk;
+    __vsnprintf_chk;
+
+    /* forwarded to glibc */
+    abort;
+    atoi;
+    calloc;
+    closelog;
+    exp;
+    fclose;
+    fflush;
+    fopen;
+    fprintf;
+    fputc;
+    fputs;
+    fread;
+    free;
+    fseek;
+    ftell;
+    fwrite;
+    malloc;
+    memchr;
+    memcmp;
+    memcpy;
+    memmove;
+    memset;
+    openlog;
+    posix_memalign;
+    pow;
+    pthread_getspecific;
+    pthread_key_create;
+    pthread_key_delete;
+    pthread_mutex_lock;
+    pthread_mutex_unlock;
+    pthread_once;
+    pthread_rwlock_rdlock;
+    pthread_rwlock_unlock;
+    pthread_rwlock_wrlock;
+    pthread_setspecific;
+    puts;
+    realloc;
+    snprintf;
+    sqrt;
+    sqrtf;
+    strcat;
+    strcmp;
+    strcpy;
+    strlen;
+    strtod;
+    strtof;
+    strtol;
+    strtold;
+    strtoll;
+    strtoul;
+    strtoull;
+    swprintf;
+    syslog;
+    vasprintf;
+    vfprintf;
+    wcslen;
+    wcstod;
+    wcstof;
+    wcstol;
+    wcstold;
+    wcstoll;
+    wcstoul;
+    wcstoull;
+    wmemchr;
+    wmemcmp;
+    wmemcpy;
+    wmemmove;
+    wmemset;
+
+    /* ---- added for the MNN stack --------------------------------------
+     * libMNN.so / libMNN_Express.so / libmnnmodel.so / libc++_shared.so
+     * together name ~137 more libc symbols than the two libraries this shim
+     * was first written for.  These are the ones the inference path actually
+     * reaches (plus the bionic-only entry points, which have no glibc
+     * equivalent).  The rest stay undefined on purpose: prep_vendor_so.py
+     * clears BIND_NOW, so an imported-but-never-called symbol need not
+     * resolve.  Keep in sync with the MNN additions in libc.c. */
+
+    /* threads -- MNN's CPU backend runs a worker pool */
+    pthread_create;
+    pthread_join;
+    pthread_detach;
+    pthread_equal;
+    pthread_self;
+    pthread_mutex_init;
+    pthread_mutex_destroy;
+    pthread_mutex_trylock;
+    pthread_mutexattr_init;
+    pthread_mutexattr_destroy;
+    pthread_mutexattr_settype;
+    pthread_cond_init;
+    pthread_cond_destroy;
+    pthread_cond_wait;
+    pthread_cond_timedwait;
+    pthread_cond_signal;
+    pthread_cond_broadcast;
+    sched_yield;
+
+    /* time */
+    clock_gettime;
+    gettimeofday;
+    nanosleep;
+
+    /* assorted */
+    getauxval;
+    sysconf;
+    getenv;
+    exit;
+    strdup;
+    strncmp;
+    strnlen;
+    bsearch;
+    printf;
+    vprintf;
+    syscall;
+    read;
+    open;
+
+    /* float maths */
+    acosf;
+    acoshf;
+    asinf;
+    asinhf;
+    atanf;
+    atan2f;
+    atanhf;
+    cosf;
+    coshf;
+    erf;
+    erff;
+    erfcf;
+    expf;
+    fmodf;
+    frexp;
+    log;
+    logf;
+    log1pf;
+    powf;
+    sinf;
+    sinhf;
+    tanf;
+    tanhf;
+
+    /* bionic-only */
+    __ctype_get_mb_cur_max;
+    __system_property_get;
+    __read_chk;
+    __open_2;
+    __vsprintf_chk;
+
+    /* files, directories, metadata */
+    close;
+    chdir;
+    getcwd;
+    fstat;
+    stat;
+    lstat;
+    mkdir;
+    remove;
+    rename;
+    link;
+    symlink;
+    readlink;
+    realpath;
+    truncate;
+    ftruncate;
+    fchmod;
+    fchmodat;
+    utimensat;
+    sendfile;
+    pathconf;
+    statvfs;
+    opendir;
+    readdir;
+    closedir;
+    /* dlopen / dlsym are intentionally absent -- see the note in libc.c. */
+
+    /* stdio the runtime still touches */
+    feof;
+    ferror;
+    fgets;
+    getc;
+    ungetc;
+    putchar;
+    strerror_r;
+    sscanf;
+    fscanf;
+    vsscanf;
+    vfscanf;
+
+    /* locale */
+    newlocale;
+    uselocale;
+    freelocale;
+    setlocale;
+    localeconv;
+    strcoll_l;
+    strxfrm_l;
+    wcscoll_l;
+    wcsxfrm_l;
+    strftime_l;
+    isdigit_l;
+    islower_l;
+    isupper_l;
+    isxdigit_l;
+    tolower_l;
+    toupper_l;
+    strtoll_l;
+    strtoull_l;
+    strtold_l;
+
+    /* wide-character conversion and classification */
+    btowc;
+    wctob;
+    mbtowc;
+    mbrtowc;
+    mbrlen;
+    wcrtomb;
+    mbsrtowcs;
+    mbsnrtowcs;
+    wcsnrtombs;
+    iswalpha_l;
+    iswblank_l;
+    iswcntrl_l;
+    iswdigit_l;
+    iswlower_l;
+    iswprint_l;
+    iswpunct_l;
+    iswspace_l;
+    iswupper_l;
+    iswxdigit_l;
+    towlower_l;
+    towupper_l;
+
+    sincosf;
+
+  local:
+    *;
+};
