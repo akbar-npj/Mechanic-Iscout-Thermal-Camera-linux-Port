@@ -77,6 +77,40 @@ int dyt_measure_line(const float *temps, int w, int h,
                      int x0, int y0, int x1, int y1,
                      float *out, int cap);
 
+/* ------------------------------------------------------------- polygon ROI */
+
+/* The most vertices a polygon measurement accepts.  A bound rather than an
+ * allocation: measure.c owns no memory, so the scanline's crossing list is a
+ * fixed stack array.  A front end is told the limit (the add is refused)
+ * instead of having its outline silently truncated — dropping a vertex moves
+ * the boundary the user drew. */
+#define DYT_POLYGON_MAX_VTX 32
+
+/* Statistics over the pixels inside the polygon through `verts` (nvtx >= 3, in
+ * source pixels; the outline is closed automatically).
+ *
+ * A pixel is covered when its own coordinate lies inside the outline by the
+ * even-odd rule.  So a concave polygon fills correctly, a self-intersecting one
+ * fills its inner lobes, and the winding direction does not matter — and the
+ * fill agrees with the outline a front end draws through the same vertices,
+ * which is what the user is looking at.  For a rectangle this is the same
+ * convention the box tool uses: the outline (x0,y0) (x1+1,y0) (x1+1,y1+1)
+ * (x0,y1+1) covers exactly the pixels dyt_measure_roi(x0,y0,x1,y1) does.
+ *
+ * The polygon is clipped to the image; one entirely outside is a valid empty
+ * selection, not an error.
+ *
+ * Same scratch contract as dyt_measure_roi(), with one difference: the covered
+ * count is not known before the fill, so -2 is reported *after* it — nothing
+ * was written past scratch_cap, and *out->n carries the requirement so the
+ * caller can grow and retry.
+ *
+ * Returns 0 on success, -1 on a bad argument, -2 if scratch is too small. */
+int dyt_measure_polygon(const float *temps, int w, int h,
+                        const dyt_point_t *verts, int nvtx,
+                        float *scratch, int scratch_cap,
+                        dyt_roi_stats_t *out);
+
 /* --------------------------------------------------------- isotherm / area */
 
 typedef struct {

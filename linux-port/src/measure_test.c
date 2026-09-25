@@ -254,6 +254,146 @@ static void test_line(void)
              dyt_measure_line(t, W, H, 0, 0, 1, 1, NULL, 64), -1);
 }
 
+/* --- polygon ROI -------------------------------------------------------- */
+
+static void test_polygon(void)
+{
+    float t[NPIX], scratch[NPIX];
+    dyt_roi_stats_t s;
+    dyt_point_t tri[3], rect[4], ell[6], rev[3], far[3];
+
+    build_ramp(t);
+
+    /* Right triangle (0,0) (4,0) (0,4): rows 0..3 cover 4,3,2,1 pixels, so
+     * 10 in all — 10,11,12,13 / 18,19,20 / 26,27 / 34. */
+    tri[0].x = 0; tri[0].y = 0;
+    tri[1].x = 4; tri[1].y = 0;
+    tri[2].x = 0; tri[2].y = 4;
+
+    intcheck("poly: triangle",
+             dyt_measure_polygon(t, W, H, tri, 3, scratch, NPIX, &s), 0);
+    intcheck("poly: triangle n == 10", s.n, 10);
+    floatcheck("poly: triangle min == 10", s.min, 10.0f, 1e-6f);
+    floatcheck("poly: triangle max == 34", s.max, 34.0f, 1e-6f);
+    floatcheck("poly: triangle mean == 19", s.mean, 19.0f, 1e-6f);
+    floatcheck("poly: triangle median == 18.5", s.median, 18.5f, 1e-6f);
+    intcheck("poly: triangle min at (0,0)", s.min_x, 0);
+    intcheck("poly: triangle min at (0,0) y", s.min_y, 0);
+    intcheck("poly: triangle max at (0,3)", s.max_x, 0);
+    intcheck("poly: triangle max at (0,3) y", s.max_y, 3);
+
+    /* Winding must not matter: even-odd is orientation-independent. */
+    rev[0] = tri[2]; rev[1] = tri[1]; rev[2] = tri[0];
+    intcheck("poly: reversed winding",
+             dyt_measure_polygon(t, W, H, rev, 3, scratch, NPIX, &s), 0);
+    intcheck("poly: reversed n == 10", s.n, 10);
+    floatcheck("poly: reversed mean == 19", s.mean, 19.0f, 1e-6f);
+    floatcheck("poly: reversed median == 18.5", s.median, 18.5f, 1e-6f);
+
+    /* A rectangle outline covers the same pixels as the box tool does for the
+     * box it encloses: (2,1) (4,1) (4,3) (2,3) is the box (2,1)-(3,2), i.e.
+     * 20,21 / 28,29.  This is the convention stated in measure.h. */
+    rect[0].x = 2; rect[0].y = 1;
+    rect[1].x = 4; rect[1].y = 1;
+    rect[2].x = 4; rect[2].y = 3;
+    rect[3].x = 2; rect[3].y = 3;
+
+    intcheck("poly: rectangle == box",
+             dyt_measure_polygon(t, W, H, rect, 4, scratch, NPIX, &s), 0);
+    intcheck("poly: rectangle n == 4", s.n, 4);
+    floatcheck("poly: rectangle min == 20", s.min, 20.0f, 1e-6f);
+    floatcheck("poly: rectangle max == 29", s.max, 29.0f, 1e-6f);
+    floatcheck("poly: rectangle mean == 24.5", s.mean, 24.5f, 1e-6f);
+    floatcheck("poly: rectangle median == 24.5", s.median, 24.5f, 1e-6f);
+
+    /* A concave L: a 3-wide top bar (row 0) over a 1-wide left column (rows
+     * 1 and 2) — 10,11,12 / 18 / 26.  A convex-only fill would have swept in
+     * (1,1) and (2,1) and reported a different count. */
+    ell[0].x = 0; ell[0].y = 0;
+    ell[1].x = 3; ell[1].y = 0;
+    ell[2].x = 3; ell[2].y = 1;
+    ell[3].x = 1; ell[3].y = 1;
+    ell[4].x = 1; ell[4].y = 3;
+    ell[5].x = 0; ell[5].y = 3;
+
+    intcheck("poly: concave L",
+             dyt_measure_polygon(t, W, H, ell, 6, scratch, NPIX, &s), 0);
+    intcheck("poly: concave n == 5", s.n, 5);
+    floatcheck("poly: concave min == 10", s.min, 10.0f, 1e-6f);
+    floatcheck("poly: concave max == 26", s.max, 26.0f, 1e-6f);
+    floatcheck("poly: concave mean == 15.4", s.mean, 15.4f, 1e-6f);
+    floatcheck("poly: concave median == 12", s.median, 12.0f, 1e-6f);
+
+    /* Hanging off the left edge: only the part inside the image is counted,
+     * and the fractional crossing at row 1 (x = 2/3) must round inward. */
+    far[0].x = -4; far[0].y = 0;
+    far[1].x = 3;  far[1].y = 0;
+    far[2].x = -4; far[2].y = 3;
+
+    intcheck("poly: clipped",
+             dyt_measure_polygon(t, W, H, far, 3, scratch, NPIX, &s), 0);
+    intcheck("poly: clipped n == 4", s.n, 4);
+    floatcheck("poly: clipped min == 10", s.min, 10.0f, 1e-6f);
+    floatcheck("poly: clipped max == 18", s.max, 18.0f, 1e-6f);
+    floatcheck("poly: clipped mean == 12.75", s.mean, 12.75f, 1e-6f);
+
+    /* Entirely outside: a valid empty selection, not an error. */
+    far[0].x = -20; far[0].y = -20;
+    far[1].x = -10; far[1].y = -20;
+    far[2].x = -20; far[2].y = -10;
+    intcheck("poly: fully outside is not an error",
+             dyt_measure_polygon(t, W, H, far, 3, scratch, NPIX, &s), 0);
+    intcheck("poly: fully outside n == 0", s.n, 0);
+    nancheck("poly: fully outside min is NaN", s.min);
+    nancheck("poly: fully outside mean is NaN", s.mean);
+    intcheck("poly: fully outside has no extreme", s.min_x, -1);
+
+    /* A NaN pixel inside the outline is skipped, not counted. */
+    build_ramp(t);
+    t[0] = NAN;                       /* would have been the minimum */
+    intcheck("poly: NaN skipped",
+             dyt_measure_polygon(t, W, H, tri, 3, scratch, NPIX, &s), 0);
+    intcheck("poly: NaN not counted", s.n, 9);
+    floatcheck("poly: NaN cannot be the min", s.min, 11.0f, 1e-6f);
+    intcheck("poly: new min is at (1,0)", s.min_x, 1);
+    build_ramp(t);
+
+    /* No scratch: everything but the median. */
+    intcheck("poly: NULL scratch ok",
+             dyt_measure_polygon(t, W, H, tri, 3, NULL, 0, &s), 0);
+    floatcheck("poly: NULL scratch still means", s.mean, 19.0f, 1e-6f);
+    nancheck("poly: NULL scratch median is NaN", s.median);
+
+    /* Too little scratch: the requirement comes back after the fill, and the
+     * statistics are not handed over with it. */
+    intcheck("poly: small scratch -> -2",
+             dyt_measure_polygon(t, W, H, tri, 3, scratch, 4, &s), -2);
+    intcheck("poly: small scratch reports need", s.n, 10);
+
+    intcheck("poly: two vertices rejected",
+             dyt_measure_polygon(t, W, H, tri, 2, scratch, NPIX, &s), -1);
+    intcheck("poly: NULL verts rejected",
+             dyt_measure_polygon(t, W, H, NULL, 3, scratch, NPIX, &s), -1);
+    intcheck("poly: NULL plane rejected",
+             dyt_measure_polygon(NULL, W, H, tri, 3, scratch, NPIX, &s), -1);
+    intcheck("poly: NULL out rejected",
+             dyt_measure_polygon(t, W, H, tri, 3, scratch, NPIX, NULL), -1);
+
+    /* Too many vertices is refused rather than truncated — silently dropping
+     * one would move the boundary the user drew. */
+    {
+        dyt_point_t many[DYT_POLYGON_MAX_VTX + 1];
+        int i;
+        for (i = 0; i <= DYT_POLYGON_MAX_VTX; i++) {
+            many[i].x = i % W;
+            many[i].y = i % H;
+        }
+        intcheck("poly: too many vertices rejected",
+                 dyt_measure_polygon(t, W, H, many, DYT_POLYGON_MAX_VTX + 1,
+                                     scratch, NPIX, &s), -1);
+    }
+}
+
 /* --- isotherm / area check ---------------------------------------------- */
 
 static void test_isotherm(void)
@@ -303,11 +443,12 @@ static void test_isotherm(void)
 
 int main(void)
 {
-    printf("=== measure_test (point / ROI / line / isotherm) ===\n");
+    printf("=== measure_test (point / ROI / line / polygon / isotherm) ===\n");
 
     test_point();
     test_roi();
     test_line();
+    test_polygon();
     test_isotherm();
 
     if (fails) {
