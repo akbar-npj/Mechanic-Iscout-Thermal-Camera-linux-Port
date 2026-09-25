@@ -2,27 +2,109 @@
  * serial_test.c — unit tests for the DecryptSNE port (serial.c).
  *
  * No hardware and no vendor library are needed: DecryptSNE is a pure
- * byte transform, so a hand-computed known-answer vector is enough to
- * pin it.  The vector below was derived by applying the steps of
- * RE Docs 04 §4.9 to in[i] = i by hand.
+ * byte transform, so known-answer vectors are enough to pin it.  The
+ * reference vector is the live-measured one from RE Docs 04 §4.9.3.
  *
- * build:  via the Makefile (make serial-test)
+ * build:  via the Makefile (make check)
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "serial.h"
 
-/* DecryptSNE applied to in[i] = i, worked through step by step:
- *   b[0] ^= 0x12            -> b[0] = 0x12
- *   b[i] ^= 0x1d (all i)    -> b = 0f 1c 1f 1e 19 18 1b 1a 15 14 17 16 11 10 13
- *   swap (0,7)(2,9)(4,11)   -> b = 1a 1c 14 1e 16 18 1b 0f 15 1f 17 19 11 10 13
- *   mix tail                -> b = 0b 0c 07 1e 06 09 04 18 0c 1f 17 19 11 10 13
- */
-static const uint8_t expect[15] = {
-    0x0b, 0x0c, 0x07, 0x1e, 0x06, 0x09, 0x04, 0x18,
-    0x0c, 0x1f, 0x17, 0x19, 0x11, 0x10, 0x13
+/* Live reference unit: module serial "202605575259" -> key 52, and the
+ * raw user serial returned by getTinyCUserSn (order id 0x14). */
+static const uint8_t ref_module_sn[16] = {
+    '2','0','2','6','0','5','5','7','5','2','5','9', 0, 0, 0, 0
 };
+static const uint8_t ref_raw[15] = {
+    0x06, 0x7d, 0x5a, 0x48, 0x2c, 0x66, 0x6a, 0x79, 0x79,
+    0x58, 0x2d, 0x44, 0x2f, 0x24, 0x2f
+};
+static const uint8_t ref_expect[15] = {
+    0x44, 0x59, 0x43, 0x53, 0x54, 0x49, 0x30, 0x39, 0x47,
+    0x47, 0x30, 0x31, 0x32, 0x39, 0x32          /* "DYCSTI09GG01292" */
+};
+
+/* DecryptSNE applied to in[i] = i with key 52, worked through by hand:
+ *   pre-XORs           -> 12 01 02 37 04 05 06 15 1a 3d 0a 3f 0c 0d 0e
+ *   b[i] ^= 0x1d (all) -> 0f 1c 1f 2a 19 18 1b 08 07 20 17 22 11 10 13
+ *   swap (0,7)(2,9)(4,11) -> 08 1c 20 2a 22 18 1b 0f 07 1f 17 19 11 10 13
+ *   mix tail           -> 19 0c 33 39 32 09 04 18 1e 1f 17 19 11 10 13
+ */
+static const uint8_t seq_expect[15] = {
+    0x19, 0x0c, 0x33, 0x39, 0x32, 0x09, 0x04, 0x18,
+    0x1e, 0x1f, 0x17, 0x19, 0x11, 0x10, 0x13
+};
+
+static int test_key(void)
+{
+    int fails = 0;
+
+    /* The reference unit: atoi("5259") % 127. */
+    if (dyt_sn_key(ref_module_sn, 16) != 52) {
+        printf("test_key: reference serial -> %u, expected 52\n",
+               dyt_sn_key(ref_module_sn, 16));
+        fails++;
+    }
+    /* No digit suffix / too short -> 0. */
+    {
+        static const uint8_t nonnum[16] = { 'X','X','X','X','X','X','X','X',
+                                            'X','X','X','X', 0,0,0,0 };
+        if (dyt_sn_key(nonnum, 16) != 0) {
+            printf("test_key: non-numeric serial -> %u, expected 0\n",
+                   dyt_sn_key(nonnum, 16));
+            fails++;
+        }
+        if (dyt_sn_key(ref_module_sn, 8) != 0) {
+            printf("test_key: short serial -> %u, expected 0\n",
+                   dyt_sn_key(ref_module_sn, 8));
+            fails++;
+        }
+    }
+    /* Boundary: 127 wraps to 0, 128 wraps to 1. */
+    {
+        static const uint8_t s127[16] = { '0','0','0','0','0','0','0','0',
+                                          '0','1','2','7', 0,0,0,0 };
+        static const uint8_t s128[16] = { '0','0','0','0','0','0','0','0',
+                                          '0','1','2','8', 0,0,0,0 };
+        if (dyt_sn_key(s127, 16) != 0 || dyt_sn_key(s128, 16) != 1) {
+            printf("test_key: %%127 wrap wrong (%u, %u)\n",
+                   dyt_sn_key(s127, 16), dyt_sn_key(s128, 16));
+            fails++;
+        }
+    }
+
+    if (fails) { printf("  FAIL\n"); return 1; }
+    printf("test_key: 5259->52, non-numeric->0, 127->0, 128->1\n");
+    printf("  PASS\n");
+    return 0;
+}
+
+static int test_reference_vector(void)
+{
+    uint8_t out[15];
+    char s[16];
+    int i;
+
+    dyt_decrypt_sne(out, ref_raw, dyt_sn_key(ref_module_sn, 16));
+    dyt_serial_str(s, out);
+
+    printf("test_reference_vector: \"%s\"\n", s);
+    if (memcmp(out, ref_expect, 15) != 0 || strcmp(s, "DYCSTI09GG01292") != 0) {
+        printf("  FAIL: expected ");
+        for (i = 0; i < 15; i++) printf("%02x", ref_expect[i]);
+        printf("\n");
+        return 1;
+    }
+    /* The cross-check the docs rely on: setMachineSetting tests SN[2]=='C'. */
+    if (!dyt_serial_variant(out)) {
+        printf("  FAIL: decoded serial not flagged variant C\n");
+        return 1;
+    }
+    printf("  PASS\n");
+    return 0;
+}
 
 static int test_known_answer(void)
 {
@@ -32,15 +114,15 @@ static int test_known_answer(void)
     for (i = 0; i < 15; i++) in[i] = (uint8_t)i;
     memset(out, 0, sizeof out);
 
-    dyt_decrypt_sne(out, in);
+    dyt_decrypt_sne(out, in, 52);
 
     printf("test_known_answer: ");
     for (i = 0; i < 15; i++) printf("%02x", out[i]);
     printf("\n");
 
-    if (memcmp(out, expect, 15) != 0) {
+    if (memcmp(out, seq_expect, 15) != 0) {
         printf("  FAIL: expected ");
-        for (i = 0; i < 15; i++) printf("%02x", expect[i]);
+        for (i = 0; i < 15; i++) printf("%02x", seq_expect[i]);
         printf("\n");
         return 1;
     }
@@ -57,8 +139,8 @@ static int test_in_place(void)
     for (i = 0; i < 15; i++) src[i] = (uint8_t)(0xa0 + i);
     memcpy(buf, src, 15);
 
-    dyt_decrypt_sne(ref, src);        /* separate buffers */
-    dyt_decrypt_sne(buf, buf);        /* aliased */
+    dyt_decrypt_sne(ref, src, 52);        /* separate buffers */
+    dyt_decrypt_sne(buf, buf, 52);        /* aliased */
 
     printf("test_in_place: %s\n",
            memcmp(buf, ref, 15) == 0 ? "identical" : "MISMATCH");
@@ -106,6 +188,8 @@ int main(void)
 {
     int fails = 0;
     printf("=== serial_test ===\n");
+    fails += test_key();
+    fails += test_reference_vector();
     fails += test_known_answer();
     fails += test_in_place();
     fails += test_variant();

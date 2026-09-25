@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include "frame.h"
+#include "params.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,9 +120,81 @@ void dyt_capture_geometry(const dyt_capture_t *c, int *width, int *active_height
  * dyt_capture_geometry() for the thermal height. */
 const uint16_t *dyt_capture_last_raw(const dyt_capture_t *c, int *n_samples);
 
+/* Where the thermal plane sits inside that payload: the payload's total row
+ * count and the thermal plane's first row and height.  Read-only, and all
+ * zero before the first frame.
+ *
+ * In DYT_OUTPUT_DEFAULT the rows *above* plane_y are the visible half, so
+ * this plus dyt_capture_last_raw() is everything needed to extract it (see
+ * src/visible.h).  In DYT_OUTPUT_AD plane_y is 0 and plane_h == total.
+ * Any output pointer may be NULL. */
+void dyt_capture_plane_geometry(const dyt_capture_t *c, int *total,
+                                int *plane_y, int *plane_h);
+
 /* Dump every format/frame/fps libuvc parsed — the on-arrival answer to
  * "which bFormatIndex is the thermal stream?". */
 void dyt_capture_print_diag(dyt_capture_t *c);
+
+/* ---------------------------------------------------------- device info
+ *
+ * The read-only identity and stored-parameter dump (RE Docs 04 §4.8,
+ * verified live 2026-09-25).  All three reads are safe: none of them
+ * writes device state.
+ */
+typedef struct {
+    int      have_sn;              /* module serial read succeeded */
+    uint8_t  sn[16];               /* raw 16-byte record */
+    char     sn_str[17];           /* printable prefix, NUL-terminated */
+    int      sn_len;               /* strlen(sn_str), -1 if not read */
+
+    int      have_usn;             /* raw user serial read succeeded */
+    uint8_t  usn_raw[15];          /* raw 15-byte user serial */
+    uint8_t  usn_key;              /* key byte derived from the module serial */
+    char     usn_str[16];          /* DecryptSNE output, printable */
+    int      usn_len;              /* strlen(usn_str), -1 if not decoded */
+    int      usn_variant;          /* decoded serial's variant flag (SN[2]=='C') */
+
+    dyt_params_t     params;
+    dyt_radiometry_t radio;
+    int      params_read;          /* slots read, -1 if the read did not run */
+} dyt_device_info_t;
+
+/* Fill *out with the device's serial and stored parameters.
+ *
+ * Needs the device open (dyt_capture_open) but must be called *before*
+ * dyt_capture_start: measured 2026-09-25 the identity reads only answer
+ * cleanly while the device is idle — with the isochronous stream running
+ * the same reads return a partial block and a failed serial.  This also
+ * matches the vendor, which reads the parameter block at connect.
+ *
+ * It is a handful of control transfers, so do not call it per frame.
+ *
+ * Returns 0 if the transfers were issued (individual reads may still have
+ * failed — check the have_* flags and params_read), -1 if the handle is not
+ * usable. */
+int dyt_capture_read_info(dyt_capture_t *c, dyt_device_info_t *out);
+
+/* --------------------------------------------------- runtime parameter write
+ *
+ * Send one vendor `sendOrder(type, value)` — the *only* device write the port
+ * implements (RE Docs 04 §4.2).  This sets a runtime parameter
+ * (emissivity / ambient / reflected / distance); it is NOT calibration and
+ * cannot touch factory data.
+ *
+ * `type` is a dyt_order_type_t (params.h); `value` is in that type's natural
+ * unit.  Call it from the owning thread — never from a frame callback.
+ *
+ * The call blocks for DYT_ORDER_SETTLE_US after a successful order.  Measured
+ * 2026-09-25: two orders sent back-to-back lose the first, so consecutive
+ * calls must be spaced.  Setting several parameters is therefore a few
+ * hundred ms of work, not instantaneous — do it off the render path.
+ *
+ * Returns 0, or a negative dyt_write_param / range error.  Verify a write by
+ * reading the same index back with dyt_read_param(). */
+int dyt_capture_set_param(dyt_capture_t *c, int type, float value);
+
+/* Settle gap enforced after each successful write order (µs). */
+#define DYT_ORDER_SETTLE_US 250000
 
 #ifdef __cplusplus
 }

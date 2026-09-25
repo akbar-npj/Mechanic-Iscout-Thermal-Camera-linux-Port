@@ -107,6 +107,60 @@ static void test_vendor_palettes(const char *dir)
     }
 }
 
+/* ------------------------------------------------ whole-directory loading */
+
+/* The front-end no longer hard-codes a palette list; it loads the directory
+ * (dyt_palette_load_dir).  These checks pin the shipped count so a deletion
+ * or an unreadable file shows up here rather than as a missing palette at
+ * runtime, and pin the name order the viewer's palette keys depend on. */
+static void test_load_dir(const char *dir)
+{
+    static dyt_palette_t pal[DYT_PALETTE_MAX];
+    static dyt_palette_t few[3];
+    int n;
+
+    printf("\n-- directory loading (%s) --\n", dir);
+
+    n = dyt_palette_load_dir(pal, DYT_PALETTE_MAX, dir);
+    if (n < 0) {
+        printf("  FAIL dyt_palette_load_dir returned %d\n", n);
+        fails++;
+        return;
+    }
+
+    /* The Android app's 6 ramps plus the 22 Windows-only ones = 28 distinct.
+     * See palettes/README.md — the Windows set has 27, but 5 duplicate an
+     * Android ramp and one Android ramp is not in the Windows set. */
+    check_int("loads the shipped 28 palettes", n, 28);
+
+    check_int("first entry is iron-red",
+              strcmp(pal[0].name, "01-iron-red.dat") == 0, 1);
+    check_int("sixth entry is cool-blue",
+              strcmp(pal[5].name, "06-cool-blue.dat") == 0, 1);
+
+    /* Every loaded palette must carry a name (a skipped/truncated file would
+     * have been dropped, which the count check above would already catch). */
+    {
+        int i, unnamed = 0;
+        for (i = 0; i < n; i++)
+            if (pal[i].name[0] == '\0')
+                unnamed = 1;
+        check_int("every loaded palette is named", unnamed, 0);
+    }
+
+    /* The storage bound is honoured, not ignored. */
+    check_int("honours the max bound",
+              dyt_palette_load_dir(few, 3, dir), 3);
+
+    /* Bad arguments are reported, not crashed on. */
+    check_int("NULL dir rejected",
+              dyt_palette_load_dir(pal, DYT_PALETTE_MAX, NULL), -1);
+    check_int("missing dir rejected",
+              dyt_palette_load_dir(pal, DYT_PALETTE_MAX, "/nonexistent-dir"), -1);
+    check_int("zero max rejected",
+              dyt_palette_load_dir(pal, 0, dir), -1);
+}
+
 /* --------------------------------------------------- reject malformed input */
 
 static void test_reject(const char *dir)
@@ -349,6 +403,7 @@ int main(int argc, char **argv)
     printf("=== palette_test (palette + render core) ===\n");
 
     test_vendor_palettes(pdir);
+    test_load_dir(pdir);
     test_reject(pdir);
     test_index();
     test_render();

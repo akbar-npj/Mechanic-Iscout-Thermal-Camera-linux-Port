@@ -36,6 +36,7 @@
 
 #include "capture.h"
 #include "control.h"
+#include "serial.h"
 
 #ifdef DYT_HAVE_LIBUSB
 #include <libusb.h>
@@ -677,10 +678,113 @@ const uint16_t *dyt_capture_last_raw(const dyt_capture_t *c, int *n_samples)
     return c->staging;
 }
 
+void dyt_capture_plane_geometry(const dyt_capture_t *c, int *total,
+                                int *plane_y, int *plane_h)
+{
+    int ok = c->pipe.ready;
+
+    if (total)   *total   = ok ? c->pipe.total   : 0;
+    if (plane_y) *plane_y = ok ? c->pipe.plane_y : 0;
+    if (plane_h) *plane_h = ok ? c->pipe.plane_h : 0;
+}
+
 void dyt_capture_print_diag(dyt_capture_t *c)
 {
     if (c && c->devh)
         uvc_print_diag(c->devh, stderr);
+}
+
+int dyt_capture_read_info(dyt_capture_t *c, dyt_device_info_t *out)
+{
+    dyt_transfer_fn xfer;
+
+    if (!c || !out)
+        return -1;
+
+    memset(out, 0, sizeof *out);
+    out->sn_len = -1;
+    out->usn_len = -1;
+    out->params_read = -1;
+    dyt_params_init(&out->params);
+
+    xfer = dyt_libusb_transfer(NULL);
+    if (!xfer || !c->usb)
+        return -1;
+
+    /* No interface claim here: uvc_open() already claimed the VideoControl
+     * interface on this same libusb handle, and control transfers do not
+     * need anything beyond that (send_ad_order relies on the same thing).
+     * Claiming again would return LIBUSB_ERROR_BUSY.
+     *
+     * Call this while the device is idle.  Measured 2026-09-25: with the
+     * isochronous stream running, the module-serial read fails outright and
+     * only 4 of the 16 parameter slots come back; run before
+     * dyt_capture_start() the same code reads the serial and all 16 slots
+     * every time. */
+
+    if (dyt_read_module_sn(xfer, c->usb, out->sn) == DYT_READ_OK) {
+        out->sn_len = dyt_sn_str(out->sn_str, out->sn, 16);
+        out->have_sn = 1;
+    }
+
+    /* The raw user serial is the DecryptSNE *input*; the key comes from the
+     * module serial's last four digits (RE Docs 04 §4.9), so only decode when
+     * the module-serial read succeeded. */
+    if (dyt_read_user_sn(xfer, c->usb, out->usn_raw) == DYT_READ_OK) {
+        out->have_usn = 1;
+        out->usn_key = dyt_sn_key(out->sn, 16);
+        if (out->have_sn) {
+            uint8_t decoded[15];
+            dyt_decrypt_sne(decoded, out->usn_raw, out->usn_key);
+            out->usn_len = dyt_serial_str(out->usn_str, decoded);
+            out->usn_variant = dyt_serial_variant(decoded);
+        }
+    }
+
+    out->params_read = dyt_read_all_params(xfer, c->usb, &out->params);
+    dyt_params_radiometry(&out->params, &out->radio);
+
+    return 0;
+}
+
+int dyt_capture_set_param(dyt_capture_t *c, int type, float value)
+{
+    dyt_transfer_fn xfer;
+    int rc;
+
+    if (!c)
+        return DYT_READ_RANGE;
+
+    xfer = dyt_libusb_transfer(NULL);
+    if (!xfer || !c->usb)
+        return DYT_READ_IO;
+
+    /* The device write.  Same reasoning as dyt_capture_read_info: the
+     * VideoControl interface is already claimed by uvc_open(), so no claim
+     * here.
+     *
+     * The hard rule is "never from the frame callback" — libuvc forbids
+     * calling into the stack from its callback thread.  This runs on the
+     * *caller's* thread (dytview's event loop), which is not the callback
+     * thread, so it is legal.  It deliberately does not go through
+     * ctrl_thread(): that exists only for uvc_* calls (the shutter's
+     * uvc_set_zoom_abs), whereas this is a raw libusb control transfer,
+     * which libusb serialises internally against the isochronous stream.
+     * Keeping it synchronous is what lets the caller report success. */
+    rc = dyt_write_param(xfer, c->usb, type, value);
+
+    /* Space consecutive orders.  Measured 2026-09-25: sending two orders
+     * back-to-back loses the first one — with a 0 ms gap the device applied
+     * only the second, while 100 ms and above applied both.  250 ms gives
+     * margin.  The vendor app never hits this because its orders are driven
+     * by user interaction; this port may batch them, so it waits here.
+     *
+     * (This is deliberately *not* a status poll: the vendor's sendOrder is
+     * two OUT transfers with no poll, and it is unverified whether 0x0200
+     * signals write completion at all.  A fixed gap is faithful and safe.) */
+    if (rc == DYT_READ_OK)
+        usleep(DYT_ORDER_SETTLE_US);
+    return rc;
 }
 
 #else /* !DYT_HAVE_LIBUSB — no live UVC stack, so every entry point declines. */
@@ -738,10 +842,33 @@ const uint16_t *dyt_capture_last_raw(const dyt_capture_t *c, int *n_samples)
     return NULL;
 }
 
+void dyt_capture_plane_geometry(const dyt_capture_t *c, int *total,
+                                int *plane_y, int *plane_h)
+{
+    (void)c;
+    if (total)   *total   = 0;
+    if (plane_y) *plane_y = 0;
+    if (plane_h) *plane_h = 0;
+}
+
 void dyt_capture_print_diag(dyt_capture_t *c)
 {
     (void)c;
     fprintf(stderr, "capture: built without libusb — live capture unavailable\n");
+}
+
+int dyt_capture_read_info(dyt_capture_t *c, dyt_device_info_t *out)
+{
+    (void)c; (void)out;
+    fprintf(stderr, "capture: built without libusb — device info unavailable\n");
+    return -1;
+}
+
+int dyt_capture_set_param(dyt_capture_t *c, int type, float value)
+{
+    (void)c; (void)type; (void)value;
+    fprintf(stderr, "capture: built without libusb — parameter write unavailable\n");
+    return -1;
 }
 
 #endif /* DYT_HAVE_LIBUSB */

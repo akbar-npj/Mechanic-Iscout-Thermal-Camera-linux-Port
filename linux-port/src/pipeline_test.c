@@ -24,6 +24,10 @@
  *      used to build the calibration LUT from the very first frame, which on
  *      a real 0x44c unit is the flat 0x8000 placeholder.  A filler frame must
  *      leave the LUT unbuilt; the first valid frame must build it.
+ *   5. what the *other* half of the dual-half payload is — the visible
+ *      picture the fusion work fuses (visible.h).  The slice is only correct
+ *      because the two halves are different kinds of data; that is asserted
+ *      rather than assumed.
  *
  * usage:  ./pipeline_test <mode1000.raw> <0x44c-in_frame.bin> <dual-half.raw>
  * build:  via the Makefile (make pipeline-test)
@@ -33,6 +37,7 @@
 #include <string.h>
 
 #include "frame.h"
+#include "visible.h"
 
 #define PLACEHOLDER 0x8000   /* the device's start-up filler sample */
 
@@ -266,6 +271,73 @@ out:
 
 /* ------------------------------------- mode 1000, dual-half (default mode) */
 
+/* What the two halves of the dual-half payload actually are.
+ *
+ * test_mode1000_dual_half() proves the *slice* is right (the thermal plane is
+ * the bottom half).  This proves the slice is *necessary*: the top half is
+ * not more thermal data, it is the device's grayscale visible picture, and it
+ * is recognisable as one — YUYV with neutral chroma, so the luma is the first
+ * byte of each pair (visible.h, RE Docs 04 §4.10).
+ *
+ * The decisive check is a single predicate with opposite answers: the same
+ * dyt_visible_is_grey() call says yes for the top half and no for the bottom
+ * half.  A regression that read the wrong half would flip both. */
+static void test_dual_half_halves(const char *path)
+{
+    size_t n = 0;
+    uint16_t *raw = load(path, &n);
+    const uint16_t *top, *bottom;
+    uint8_t *grey = NULL;
+    dyt_visible_stats_t st;
+    int i, diff = 0;
+
+    printf("\n-- dual-half payload: what each half is (%s) --\n", path);
+    if (!raw) { printf("  FAIL cannot load fixture\n"); fails++; return; }
+    if (n != 256u * 384u) {
+        printf("  FAIL fixture is %zu samples, expected %u\n", n, 256u * 384u);
+        fails++;
+        goto out;
+    }
+
+    top    = raw;
+    bottom = raw + 256u * 192u;
+
+    check_int("top half is a grey visible plane",
+              dyt_visible_is_grey(top, 256, 192), 1);
+    check_int("bottom half is not (it is thermal)",
+              dyt_visible_is_grey(bottom, 256, 192), 0);
+
+    grey = malloc(256u * 192u);
+    if (!grey) { printf("  FAIL out of memory\n"); fails++; goto out; }
+
+    check_int("extract the visible plane",
+              dyt_visible_extract(top, 256, 192, grey), 0);
+    check_int("visible stats", dyt_visible_stats(grey, 256 * 192, &st), 0);
+    printf("       visible plane: %u..%u, mean %.2f\n",
+           (unsigned)st.min, (unsigned)st.max, st.mean);
+
+    /* A real 8-bit picture: mid-range, with structure rather than a flat or
+     * saturated buffer. */
+    check_true("visible plane is mid-range",
+               st.min > 20 && st.max < 235 && st.min < st.max);
+
+    /* And it is not just the thermal plane's bytes re-read: most pixels
+     * differ from the bottom half's low byte. */
+    {
+        const uint8_t *blow = (const uint8_t *)bottom;
+        for (i = 0; i < 256 * 192; i++)
+            if (grey[i] != blow[2 * i])
+                diff++;
+        printf("       differs from the thermal low byte at %d/%d pixels\n",
+               diff, 256 * 192);
+        check_true("visible plane is not the thermal plane", diff > 256 * 192 / 2);
+    }
+
+out:
+    free(grey);
+    free(raw);
+}
+
 /* The device's own 256x384 frame, whose bottom half is the thermal plane and
  * whose top half is its grayscale visible image.  This is the port's default
  * output mode: it needs no vendor order, so the whole slice has to be right
@@ -397,6 +469,7 @@ int main(int argc, char **argv)
 
     test_mode1000_live(f1000);
     test_mode1000_dual_half(f384);
+    test_dual_half_halves(f384);
     test_mode1000_filler();
     test_mode44c_lut_policy(f44c);
     test_resolve_rejects();

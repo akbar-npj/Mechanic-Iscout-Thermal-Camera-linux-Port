@@ -4,10 +4,13 @@
  * This is the first thing to run when the device arrives.  It uses
  * libusb directly (no libuvc), so it works before the capture layer is
  * built, and it is strictly READ-ONLY: it refuses to emit any opcode
- * whose table entry is marked WRITE, because the write path
- * (setMachineSetting / sendTinyCParamsModification /
- * setTinySaveCameraParams) can destroy factory calibration
- * irreversibly (RE Docs 04 §4.8).
+ * whose table entry is marked WRITE.  Two of those writes are the
+ * persistent-calibration writers (setMachineSetting /
+ * setTinySaveCameraParams), which can destroy factory calibration
+ * irreversibly; the third, sendTinyCParamsModification, is only a
+ * volatile runtime-parameter write (RE Docs 04 §4.8) and the capture
+ * layer does implement it — but this tool stays read-only regardless.
+ * (RE Docs 04 §4.8).
  *
  *   probe                 enumerate USB devices, identify ours, show mode
  *   probe --descriptors   walk the UVC class descriptors and print every
@@ -15,12 +18,18 @@
  *                         frame sizes / fps).  This answers the one
  *                         outstanding frame-level unknown: which
  *                         bFormatIndex carries the thermal stream.
- *   probe --read          claim the interface and run the read-only
- *                         vendor transactions, printing the raw bytes
- *                         and the DecryptSNE-decoded serial.
+ *   probe --info          claim the interface and run every read-only
+ *                         vendor transaction: the module serial, the raw
+ *                         user serial (+ its DecryptSNE decode), and the
+ *                         full 16-slot stored-parameter block.
+ *                         `--read` is an alias.
+ *   probe --param N       read one parameter slot (0..15) and print its raw
+ *                         value plus whatever the port can decode.
  *   probe --op NAME       run one named opcode from the table (reads only)
  *
  * Options: --vid 0xXXXX --pid 0xXXXX --interface N
+ *
+ * Every mode here is strictly read-only.
  *
  * build:  via the Makefile (make), which defines DYT_HAVE_LIBUSB.
  */
@@ -34,6 +43,7 @@
 #include <libusb.h>
 
 #include "control.h"
+#include "params.h"
 #include "serial.h"
 
 /* ------------------------------------------------------------------ devices */
@@ -364,12 +374,90 @@ static void hexdump(const char *label, const uint8_t *b, int n)
     printf("\n");
 }
 
-/* Run one named opcode.  Refuses WRITE entries outright. */
+/* Print one slot of the parameter block, raw and decoded.  Slots with no
+ * known unit print the raw count alone — see params.h for which is which. */
+static void print_param_row(const dyt_params_t *p, int i)
+{
+    if (!dyt_params_ok(p, i)) {
+        printf("    slot %2d  %-11s  (read failed)\n", i, dyt_param_name(i));
+        return;
+    }
+    printf("    slot %2d  %-11s  %5u", i, dyt_param_name(i), p->raw[i]);
+    if (dyt_param_is_kelvin(i))
+        printf("   %7.2f C", dyt_params_value(p, i));
+    else if (dyt_param_is_ratio(i))
+        printf("   %.4f", dyt_params_value(p, i));
+    if (dyt_param_unit(i) && dyt_param_is_ratio(i))
+        printf(" %s", dyt_param_unit(i));
+    printf("\n");
+}
+
+static void print_params(const dyt_params_t *p)
+{
+    dyt_radiometry_t r;
+    int i;
+
+    printf("    idx  name           raw  decoded\n");
+    for (i = 0; i < DYT_PARAM_N; i++)
+        print_param_row(p, i);
+
+    dyt_params_radiometry(p, &r);
+    printf("    radiometry: ");
+    if (r.ok & DYT_RADIO_REFLECTED)
+        printf("reflected %.2f C  ", dyt_radiometry_reflected_c(&r));
+    if (r.ok & DYT_RADIO_AMBIENT)
+        printf("ambient %.2f C  ", dyt_radiometry_ambient_c(&r));
+    if (r.ok & DYT_RADIO_EMISSIVITY)
+        printf("emissivity %.4f  ", dyt_radiometry_emissivity(&r));
+    if (r.ok & DYT_RADIO_DISTANCE)
+        printf("distance %.4f m  ", dyt_radiometry_distance_m(&r));
+    printf("(ok mask 0x%x)\n", r.ok);
+}
+
+/* Read exactly one parameter slot.  Read-only. */
+static int cmd_param(libusb_device_handle *h, int iface, int slot)
+{
+    dyt_params_t p;
+    uint16_t v = 0;
+    int rc;
+
+    libusb_set_auto_detach_kernel_driver(h, 1);
+    if (libusb_claim_interface(h, iface) != 0)
+        fprintf(stderr, "probe: claim_interface %d failed — control transfers "
+                        "may still work\n", iface);
+
+    rc = dyt_read_param(dyt_libusb_transfer(NULL), h, (unsigned)slot, &v);
+    if (rc != DYT_READ_OK) {
+        fprintf(stderr, "probe: slot %d read failed (rc=%d)\n", slot, rc);
+        libusb_release_interface(h, iface);
+        return 1;
+    }
+
+    dyt_params_init(&p);
+    dyt_params_set(&p, slot, v);
+    print_params(&p);
+
+    libusb_release_interface(h, iface);
+    return 0;
+}
+
+/* Run one named opcode.  Refuses WRITE entries outright.
+ *
+ * The result geometry comes from the table entry (control.h), because
+ * reading the wrong register does not fail on this device — it returns
+ * whatever the shared buffer still holds, so three different commands
+ * "succeed" with identical bytes.  Measured 2026-09-25. */
+
+/* The module serial from the last getTinyCModuleSn read, kept so the
+ * user-serial decode can derive its key (RE Docs 04 §4.9).  read_set[] is
+ * ordered module-then-user, so it is populated by the time it is needed. */
+static uint8_t g_module_sn[16];
+
 static int run_op(libusb_device_handle *h, const char *name)
 {
     const dyt_opcode_t *op = find_op(name);
     uint8_t result[28];
-    int status = 0, rc, len;
+    int status = 0, rc;
 
     if (!op) {
         fprintf(stderr, "probe: no such opcode '%s'\n", name);
@@ -382,36 +470,73 @@ static int run_op(libusb_device_handle *h, const char *name)
         return 1;
     }
 
-    len = (strcmp(name, "getTinyCUserSnCoefficient") == 0) ? 28 : 15;
+    printf("  op '%s' -> wIndex 0x%04x, ", name, op->wIndex);
+    if (op->result_len)
+        printf("%u-byte result from 0x%04x\n", op->result_len, op->result_wIndex);
+    else
+        printf("no result read\n");
+
     memset(result, 0, sizeof result);
 
-    printf("  op '%s' -> wIndex 0x%04x, %d-byte result\n", name, op->wIndex, len);
-    rc = dyt_transaction_ex(dyt_libusb_transfer(NULL), h,
-                            op->cmd, op->wIndex, result, len, &status);
+    /* The parameter orders carry an extra pre-fill write and answer from
+     * 0x1d10, which is what dyt_read_param encapsulates. */
+    if (op->result_wIndex == 0x1d10) {
+        uint16_t v = 0;
+        rc = dyt_read_param(dyt_libusb_transfer(NULL), h, op->cmd[3], &v);
+        if (rc != DYT_READ_OK) {
+            printf("    read failed (rc=%d)\n", rc);
+            return 1;
+        }
+        printf("    slot %u = %u\n", op->cmd[3], v);
+        return 0;
+    }
+
+    if (op->result_len) {
+        rc = dyt_transaction_ex(dyt_libusb_transfer(NULL), h, op->cmd,
+                                op->wIndex, result, op->result_len, &status);
+    } else {
+        rc = dyt_transaction_cmd(dyt_libusb_transfer(NULL), h, op->cmd,
+                                 op->wIndex, &status);
+    }
+
     if (rc != 0) {
         printf("    transaction failed (rc=%d, last status 0x%02x)\n",
                rc, (unsigned)status);
         return 1;
     }
 
-    hexdump(name, result, len);
+    if (!op->result_len)
+        return 0;
 
-    if (strcmp(name, "getTinyCUserData") == 0) {
+    hexdump(name, result, op->result_len);
+
+    if (strcmp(name, "getTinyCModuleSn") == 0) {
+        char s[24];
+        int n = dyt_sn_str(s, result, 16);
+        memcpy(g_module_sn, result, 16);
+        printf("    ascii \"%s\" (%d chars)\n", s, n);
+        printf("    serial key byte (last 4 digits %% 127) = %u\n",
+               dyt_sn_key(result, 16));
+    } else if (strcmp(name, "getTinyCUserSn") == 0) {
         uint8_t sn[15];
         char s[16];
-        dyt_decrypt_sne(sn, result);
+        uint8_t key = dyt_sn_key(g_module_sn, 16);
+        dyt_decrypt_sne(sn, result, key);
         dyt_serial_str(s, sn);
-        printf("    DecryptSNE -> \"%s\"  (variant %s)\n",
-               s, dyt_serial_variant(sn) ? "C" : "T/other");
+        printf("    DecryptSNE (key %u) -> \"%s\" (variant %s) — RE Docs 04 §4.9\n",
+               key, s, dyt_serial_variant(sn) ? "C" : "T/other");
     }
     return 0;
 }
 
-/* The read-only set, in the order the vendor brings the device up. */
+/* The read-only identity records, in the order the vendor brings the device
+ * up.  getTinyCUserData is deliberately absent: RE Docs 04 §4.8 describes it
+ * as a 15-byte user-data read, but the device answers it with a single byte
+ * (measured 2026-09-25), so it is not an identity record.  It stays in the
+ * opcode table for inspection via --op. */
 static const char *read_set[] = {
-    "getTinyCUserData",
-    "getTinyCParams",
-    "setMachineSetting_read",
+    "getTinyCModuleSn",
+    "getTinyCUserSn",
 };
 #define READ_SET_N (int)(sizeof(read_set) / sizeof(read_set[0]))
 
@@ -425,8 +550,11 @@ static int cmd_selftest(void)
     printf("opcode safety classification (RE Docs 04 §4.8):\n");
     for (i = 0; i < dyt_opcodes_n; i++) {
         const dyt_opcode_t *op = &dyt_opcodes[i];
-        printf("  %-28s wIndex 0x%04x  %s\n", op->name, op->wIndex,
-               is_write_op(op) ? "WRITE  (blocked)" : "read/stream (allowed)");
+        const char *cls = "read/stream (allowed)";
+        if (is_write_op(op))
+            cls = (op->note && strstr(op->note, "RUNTIME"))
+                      ? "WRITE runtime (blocked)" : "WRITE persistent (blocked)";
+        printf("  %-28s wIndex 0x%04x  %s\n", op->name, op->wIndex, cls);
     }
 
     printf("\nread set contains no write opcodes: ");
@@ -446,7 +574,9 @@ static int cmd_selftest(void)
 
 static int cmd_read(libusb_device_handle *h, int iface)
 {
-    int i, fails = 0;
+    dyt_transfer_fn xfer = dyt_libusb_transfer(NULL);
+    dyt_params_t p;
+    int i, fails = 0, n;
 
     printf("claiming interface %d (auto-detaching kernel driver)...\n", iface);
     libusb_set_auto_detach_kernel_driver(h, 1);
@@ -458,8 +588,17 @@ static int cmd_read(libusb_device_handle *h, int iface)
     }
 
     printf("running read-only transactions (no writes are ever issued):\n");
+
+    /* The two identity records.  Both wire forms are verified against the
+     * reference unit and against MechaniscoutPcap/4.pcapng. */
     for (i = 0; i < READ_SET_N; i++)
         fails += run_op(h, read_set[i]);
+
+    /* The stored-parameter block. */
+    n = dyt_read_all_params(xfer, h, &p);
+    printf("  parameter block: %d/%d slots read\n", n, DYT_PARAM_N);
+    if (n > 0)
+        print_params(&p);
 
     libusb_release_interface(h, iface);
     return fails ? 1 : 0;
@@ -549,17 +688,23 @@ static uint16_t parse_u16(const char *s)
 
 int main(int argc, char **argv)
 {
-    enum { M_LIST, M_DESC, M_READ, M_OP, M_SELFTEST, M_UVC } mode = M_LIST;
+    enum { M_LIST, M_DESC, M_READ, M_OP, M_SELFTEST, M_UVC, M_PARAM } mode = M_LIST;
     const char *op_name = NULL;
     uint16_t want_vid = 0, want_pid = 0;
     int iface = 0, unit = 4, i;
+    int slot = -1;
 
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--descriptors")) mode = M_DESC;
         else if (!strcmp(argv[i], "--read"))   mode = M_READ;
+        else if (!strcmp(argv[i], "--info"))   mode = M_READ;
         else if (!strcmp(argv[i], "--list"))   mode = M_LIST;
         else if (!strcmp(argv[i], "--selftest")) mode = M_SELFTEST;
         else if (!strcmp(argv[i], "--uvc"))    mode = M_UVC;
+        else if (!strcmp(argv[i], "--param") && i + 1 < argc) {
+            mode = M_PARAM;
+            slot = atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "--unit") && i + 1 < argc)
             unit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--op") && i + 1 < argc) {
@@ -574,10 +719,17 @@ int main(int argc, char **argv)
             iface = atoi(argv[++i]);
         else {
             fprintf(stderr,
-                "usage: %s [--list|--descriptors|--read|--uvc|--op NAME|--selftest] "
-                "[--vid 0xXXXX] [--pid 0xXXXX] [--interface N] [--unit N]\n", argv[0]);
+                "usage: %s [--list|--descriptors|--info|--read|--uvc|--op NAME"
+                "|--param N|--selftest] "
+                "[--vid 0xXXXX] [--pid 0xXXXX] [--interface N] [--unit N]\n",
+                argv[0]);
             return 2;
         }
+    }
+
+    if (mode == M_PARAM && (slot < 0 || slot >= DYT_PARAM_N)) {
+        fprintf(stderr, "probe: --param takes a slot 0..%d\n", DYT_PARAM_N - 1);
+        return 2;
     }
 
     /* --selftest needs neither libusb nor a device. */
@@ -652,6 +804,8 @@ int main(int argc, char **argv)
         ret = cmd_uvc(h, unit, iface);
     } else if (mode == M_OP) {
         ret = run_op(h, op_name);
+    } else if (mode == M_PARAM) {
+        ret = cmd_param(h, iface, slot);
     } else {
         ret = cmd_read(h, iface);
     }

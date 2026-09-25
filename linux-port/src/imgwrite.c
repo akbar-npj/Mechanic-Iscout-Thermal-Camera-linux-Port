@@ -1,13 +1,17 @@
 /*
- * imgwrite.c — minimal PPM (P6) reader/writer.
+ * imgwrite.c — minimal PPM (P6) reader/writer, plus a PNG writer.
  *
- * build:  cc -O2 -g -Wall -Wextra -I. -c imgwrite.c -o imgwrite.o
+ * The PPM half has no dependencies at all.  The PNG half is a thin wrapper
+ * over the vendored stb_image_write (see imgwrite.h).
+ *
+ * build:  cc -O2 -g -Wall -Wextra -I. -Ithird_party/stb -c imgwrite.c
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "imgwrite.h"
+#include "stb_image_write.h"
 
 int dyt_write_ppm(const char *path, const uint8_t *rgb, int w, int h)
 {
@@ -100,4 +104,43 @@ int dyt_read_ppm(const char *path, uint8_t **rgb, int *w, int *h)
 fail:
     fclose(f);
     return -1;
+}
+
+/* ------------------------------------------------------------------- PNG --- */
+
+/* stb writes through a callback; send the bytes straight to the file. */
+typedef struct {
+    FILE *f;
+    int   err;
+} png_sink;
+
+static void png_write(void *ctx, void *data, int size)
+{
+    png_sink *s = ctx;
+
+    if (size <= 0 || s->err)
+        return;
+    if (fwrite(data, 1, (size_t)size, s->f) != (size_t)size)
+        s->err = 1;
+}
+
+int dyt_write_png(const char *path, const uint8_t *rgb, int w, int h)
+{
+    png_sink s;
+    int      ok;
+
+    if (!path || !rgb || w <= 0 || h <= 0)
+        return -1;
+
+    s.f = fopen(path, "wb");
+    if (!s.f)
+        return -1;
+    s.err = 0;
+
+    ok = stbi_write_png_to_func(png_write, &s, w, h, 3, rgb, w * 3);
+
+    if (fclose(s.f) != 0)
+        s.err = 1;
+
+    return (ok && !s.err) ? 0 : -1;
 }

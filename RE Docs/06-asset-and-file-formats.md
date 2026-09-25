@@ -207,6 +207,47 @@ JNI entry point found: `Java_com_dywcc_demojni_NativeUtils_JavaStaticCallD_1getD
 — note the Java package is **`com.dywcc.demojni`**, which does **not** exist in this APK's dex.
 This confirms the library is shared with other DYT products. **[V]**
 
+#### The two readers are dead code, and each has a latent `free()` bug
+
+**[V]** Both `D_getDytFileLength` and `D_jpegOpen` walk the APP2 run with a
+cursor that they advance by each segment's length, and then hand *that cursor*
+— not the buffer base — to `free()`:
+
+```
+D_getDytFileLength @ 0x12af48
+    0x2afe4   str x0, [sp,#104]      ; x0 = malloc(size); this is the base
+    0x2afec   str x8, [sp,#96]       ; a copy of the base, never read again
+    0x2b3d8   str x9, [sp,#104]      ; x9 = [sp,#104] + 1        <- cursor advances
+    0x2b3ec   str x9, [sp,#104]      ; ...and again
+    0x2b418   str x8, [sp,#104]      ; x8 = [sp,#104] + len - 2
+    0x2b440   ldr x0, [sp,#104]      ; <-- the *cursor*, not the base
+    0x2b444   bl  free
+
+D_jpegOpen @ 0x12b464
+    0x2b500   str x0, [sp,#112]      ; base
+    0x2b508   str x8, [sp,#104]      ; copy of the base, never read again
+    0x2b924   str x9, [sp,#112]      ; cursor advances
+    0x2ba10   ldr x0, [sp,#112]      ; <-- the *cursor*
+    0x2ba14   bl  free
+```
+
+So the pointer passed to `free()` sits a few hundred bytes into the allocation.
+bionic's allocator tolerates that; **glibc does not** — it reads a garbage chunk
+header, and either aborts with `free(): invalid pointer` or dereferences a bogus
+`heap_for_ptr()` and segfaults. On a host with glibc, both functions therefore
+die on the first call, before returning anything.
+
+That is consistent with them being dead code in this product: the only Java
+entry point that reaches either one names a package (`com.dywcc.demojni`) absent
+from the APK's dex. `D_updateData`, the writer, has no such defect — its three
+`free()` calls (`0x2a698`, `0x2a6a8`, `0x2a6b4`) all take base pointers it
+allocated at `0x29e20`, `0x2a280` and `0x2a2e0`.
+
+**Consequence for the port:** `src/dytjpeg.c`'s reader was written from the same
+decompilation and frees the base, which is what the code plainly intends. It is
+verified against the vendor by *round-tripping the vendor's own output*
+(§2.5), not by calling the vendor's reader.
+
 ### 2.4 Other strings in this library
 
 | string | VA | meaning |
@@ -217,6 +258,66 @@ This confirms the library is shared with other DYT products. **[V]**
 | `dyt1101c` | `0x1175ac` | version/date tag (2025-11-01?) |
 | `sn_length` | `0x1060d3` | serial-number length, next to `base64_decode` |
 | `getTableEntrySize` | — | unwinder symbol only, not app code |
+
+### 2.5 Container differential — the port's bytes vs the vendor's
+
+**[V]** `tools/dytjpeg_diff/run.sh` runs the *real* `libDYTJpegAes.so` on this
+host and diffs it against `src/dytjpeg.c`. The library is arm64-v8a and the
+host is aarch64, so it runs natively — no qemu.
+
+What it establishes, with a synthetic multi-chunk payload and with the frozen
+196608-byte device frame:
+
+| | result |
+|---|---|
+| The vendor's `D_updateData` writes a container from `[blob][raw]` | the port's `dyt_dyt_read` recovers blob, raw payload and original JPEG **byte-for-byte** |
+| The same inputs through `dyt_dyt_build` | the port's container is **byte-identical** to the vendor's — same insertion point, same chunking, same length fields |
+| `D_getDytFileLength` / `D_jpegOpen` reading the port's container | **skipped**: both die in `free()` (§2.3) |
+
+A live still written by `dytview`'s `s` key was also checked: 5 APP2 segments —
+a `0x067a` (1656-byte) header blob, three full chunks with the length field
+`0xffff`, and a final partial chunk of 9 bytes — and rebuilding the container
+from the parts the reader recovered reproduces the file on disk exactly.
+
+#### Making the vendor library loadable under glibc
+
+Three properties of the vendor build had to be handled before it could run at
+all. All three are **loader-compatibility only** — they change how the artifact
+is mapped, never what it computes — and they live in
+`tools/vendor_shim/prep_vendor_so.py`:
+
+1. **`DT_INIT_ARRAYSZ` / `DT_FINI_ARRAYSZ` cover NULL entries.** bionic skips
+   NULL slots in `.init_array`; glibc jumps to address 0. The arrays contain
+   nothing but NULLs, so clearing the sizes is behaviourally identical.
+2. **`p_align = 0x1000`.** glibc rejects the file outright on a 16 KiB or
+   64 KiB page host (*"ELF load command address/offset not page-aligned"*). The
+   fix re-lays out **file offsets** while leaving every `p_vaddr` alone, since
+   symbol values, relocations and `.dynamic` pointers are all virtual addresses.
+   The target is a fixed 64 KiB — a multiple of 4, 16 and 64 KiB — so one
+   artifact is valid on all three, and it matches what the vendor's own
+   `libthermometry.so` already uses.
+3. **Two `PT_LOAD`s share a page.** `p_vaddr` cannot be changed, and this
+   library's executable segment ends at `0x52a20` while its writable segment
+   starts at `0x53a20` — one 4 KiB page apart. On a 4 KiB host they never
+   collide; on 16 KiB or 64 KiB they do, and glibc maps the shared page with the
+   **later** segment's protection, so the page holding `.plt` becomes `rw-`
+   instead of `r-x` and the first PLT call dies with `SEGV_ACCERR`. Fix: widen a
+   segment's flags to the union of its own and any earlier segment it shares a
+   page with (here the writable segment becomes `R|W|X`). `PT_GNU_RELRO` must
+   also be emptied, because `_dl_protect_relro()` mprotects
+   `ALIGN_DOWN(relro_start, page)` onwards and this library's RELRO starts inside
+   the `.plt` page — it would re-apply `PROT_READ` and undo the widening.
+
+The cost of (3) is that the writable segment stays writable and becomes
+executable. That is acceptable for a prepared copy whose only job is to produce
+ground truth, and the differential itself is the check: if the re-layout or the
+widening corrupted anything, the vendor's output would stop matching the port's.
+For `libthermometry.so` all three are no-ops except the init-array sizes — it was
+linked 64 KiB-aligned with page-disjoint segments, and the prepared copy is
+byte-identical to the artifact committed alongside the frozen ground truth.
+
+Bionic's `LIBC` and `LIBC_N` version nodes are supplied by the shim libraries in
+`tools/vendor_shim/` (see `libc.c` there), not by patching the vendor binary.
 
 **[V]** `AES::AES()` (`_ZN3AESC2Ev` @ `0x126908`) copies two NUL-padded 17-byte strings into the
 object at `+0x478` and `+0x489`:

@@ -103,12 +103,20 @@ int uvc_diy_communicate(uvc_device_handle_t *devh,
 |----------|-----------|--------|------|
 | `0x1d00` | OUT | 8 | **command register** — write the 8-byte order |
 | `0x9d00` | OUT | 8 | alternate command register (used by stream start / param modification) |
-| `0x1d08` | IN | 15 (`0xf`) | **result read** after a command |
+| `0x1d08` | IN | 16 (`0x10`) | module serial (`getTinyCRobotSn`) — 12 ASCII bytes + 4 NULs |
+| `0x1d08` | IN | 15 (`0xf`) | **result read** — raw user serial (`getTinyCUserSn`) |
 | `0x1d08` | IN | 28 (`0x1c`) | extended result (`getTinyCUserSnCoefficient`) |
-| `0x1d08` | IN | 2 | short result |
-| `0x1d08` | OUT | 8 or 9 | parameter / stream-start write |
-| `0x1d10` | IN | 2 | secondary read (machine settings) |
+| `0x1d08` | IN | 1 | `getTinyCUserData` — **one** byte, not 15 (see §4.8) |
+| `0x1d08` | OUT | 8 or 9 | parameter / stream-start write (incl. the 2-byte result pre-fill, §4.8) |
+| `0x1d10` | IN | 2 | parameter value read-back (`getTinyCParams`) |
 | `0x0200` | IN | 1 | **status byte** |
+
+> **Reading the wrong register does not fail — it returns stale bytes.** All the IN rows above
+> share one device-side result buffer, so a read of the wrong length or from the wrong register
+> still returns *something* (`uvc_diy_communicate` only normalises an 8-byte success to `0`). This
+> is what once made three different commands appear to return identical data, and why the port's
+> opcode table now carries an explicit `result_wIndex` + `result_len` per command
+> (`linux-port/src/control.h`).
 
 ### Status byte semantics (`wIndex 0x0200`) **[V]**
 
@@ -226,6 +234,127 @@ Resulting table:
 | `00 00 00 00 00 00 00 02` | — | — | *(recv buffer)* | case 4, `setMachineSetting` | receive-buffer pre-fill, not a command |
 | *(9 bytes)* `00 00 01 00 01 80 19 00 02` | — | — | `0x1d08` | `tinyStartStream2` | **second stream-start step** |
 
+### The three verified read paths — live-measured **[V]**
+
+All three were confirmed byte-for-byte against the reference unit (`0bda:5840`) on 2026-09-25, and
+independently against `MechaniscoutPcap/4.pcapng`. **They only work while the isochronous stream is
+stopped** — with streaming running, the module-serial read fails and only 4 of 16 parameter slots
+answer (the vendor reads the parameter block at connect, before `tinyStartStream`). See §4.8.
+
+**1. Module serial** — `getTinyCRobotSn`, order id `0x15`:
+
+```
+OUT  0x1d00  <- 05 84 07 00 00 00 00 10
+poll 0x0200
+IN   0x1d08  16 bytes  ->  "202605575259" 00 00 00 00
+```
+
+**2. Raw user serial** — `getTinyCUserSn`, order id `0x14`:
+
+```
+OUT  0x1d00  <- 01 82 00 7f f0 00 00 0f
+poll 0x0200
+IN   0x1d08  15 bytes  ->  06 7d 5a 48 2c 66 6a 79 79 58 2d 44 2f 24 2f
+```
+
+Feed the result to `DecryptSNE` with the key from §4.9 to get the printable user serial
+`DYCSTI09GG01292`.
+
+**3. Parameter read-back** — `getTinyCParams`. This is **not** the canonical 3-step transaction:
+
+```
+OUT  0x9d00  <- 14 85 00 <index> 00 00 00 00     (index = 0..15)
+OUT  0x1d08  <- 00 00 00 00 00 00 00 02          (result-length pre-fill)
+poll 0x0200
+IN   0x1d10  2 bytes, big-endian
+```
+
+Every index `0..15` answers with 2 bytes. Live values from the reference unit:
+
+| idx | raw | interpreted |
+|----|------|-------------|
+| 0 | 32 | *count / unitless* |
+| 1 | 300 | reflected temperature = 26.85 °C (`raw − 273.15`) |
+| 2 | 300 | ambient temperature = 26.85 °C |
+| 3 | 127 | emissivity = 0.9921875 (`raw / 128`) |
+| 4 | 127 | distance = 0.9921875 m (`raw / 128`) |
+| 5 | 1 | machine setting |
+| 6 | 65535 | — |
+| 7 | 15878 | — |
+| 8 | 15877 | — |
+| 9 | 60402 | — |
+| 10 | 5300 | — |
+| 11 | 1856 | — |
+| 12 | 11747 | — |
+| 13 | 64062 | — |
+| 14 | 3 | — |
+| 15 | 0 | — |
+
+The encoders are `(uint16_t)(int)(celsius + 273.15f)` for the two temperatures and
+`(uint16_t)(int)(value * 128.0f)` for emissivity/distance (truncation toward zero, **not** floor —
+`−0.5 °C` encodes to `272`, not `271`). `linux-port/src/params.c` pins these literals in tests.
+
+### The runtime parameter write — `sendTinyCParamsModification` **[V]**
+
+`sendTinyCParamsModification` (`@ 0x167760`) is the *only* device write the port implements. It is
+**two OUT transfers with no status poll** — not the canonical 3-step transaction:
+
+```
+OUT  0x9d00  <- 14 c5 00 <type> 00 00 <hi> <lo>   (type 1..4; hi:lo = big-endian encoder)
+OUT  0x1d08  <- 00 00 00 00 00 00 00 02          (result-length pre-fill)
+```
+
+The 16-bit value uses the same encoders as the read-back: `(int)(v + 273.15)` for the two
+temperatures (types 1/2) and `(int)(v * 128.0)` for emissivity/distance (types 3/4). `type N` writes
+slot `N`. `linux-port/src/params.c` builds the command (`dyt_params_build_cmd`), `control.c` sends it
+(`dyt_write_param`), and `capture.c` spaces it (`dyt_capture_set_param`).
+
+**It changes the reading — measured 2026-09-25, live unit, mode 1000.** The frame mean (°C) after
+each single write, with the prior value restored between rows:
+
+| write | frame mean | delta vs baseline |
+|---|---|---|
+| *(baseline)* | 32.75 | — |
+| emissivity `0.1` | 73.86 | **+41.11** |
+| emissivity restored | 32.26 | −0.48 |
+| reflected `100 °C` | 31.14 | −1.61 |
+| reflected restored | 31.75 | −1.00 |
+| distance `0.05 m` | 100.86 | **+68.11** |
+| distance restored | 31.52 | −1.22 |
+
+Emissivity and distance dominate; reflected and ambient move the mean the other way but only by a
+couple of kelvin at these values. **The parameters are live in mode 1000, not metadata.**
+
+**Spacing.** Two orders sent back-to-back (0 ms gap) lose the **first** one — only the second is
+applied. A 100 ms gap applies both; the port uses **250 ms** (`DYT_ORDER_SETTLE_US`). This is a
+fixed gap, deliberately *not* a status poll: the vendor's own `sendOrder` never polls, and whether
+`0x0200` signals write completion is unverified. The vendor app never hits the constraint because
+its orders are driven by user interaction.
+
+**Volatility — the parameters do not survive a device reset.** Live-observed 2026-09-25: after a
+write session left slots 1/2 at `300` (26.85 °C), a later session — with no intervening write from
+this port — read them back at **`273`** (0 °C). Emissivity/distance stayed at their `127/128`
+default. So a device reset (replug / re-enumeration) reverts the runtime parameters, and the
+power-on default for the two temperatures appears to be 273 K, not the 300 K the reference unit
+shipped with. The port cannot rely on them persisting across runs; if a specific value matters it
+must be re-sent at connect.
+
+> **The capture path does not reset them.** Verified directly: writing reflected `300`, running a
+> full open→stream→capture→close cycle, then reading back still gives `300`. So the revert above is
+> the device's own reset behaviour, not something the port's bring-up does. (This is also why the
+> vendor reads the parameter block at connect, before `tinyStartStream` — §4.8.)
+>
+> **They are not perfectly stable either.** Across two runs on 2026-09-25 with no write in between,
+> emissivity and distance read back as `128/128` (1.0000) and then as `127/128` (0.9922) — a 1-LSB
+> move in both ratio slots. Small, but it means the read-back is a snapshot of volatile state, not a
+> constant to compare against.
+
+> **This is runtime state, not calibration.** `sendTinyCParamsModification` writes volatile
+> parameters; it does not persist and cannot reach factory data. The *persistent* writers —
+> `setTinySaveCameraParams` (§4.2) and `setMachineSetting` (§4.2, the calibration-coefficient write)
+> — remain **deliberately unimplemented** in the port, and the read-only tool still refuses them
+> (§4.8). See §4.8's write-classification table.
+
 ### The two parameterised orders **[V]**
 
 `UVCPreviewIR::doTinyCOrder` (`@ 0x166e54`) builds its command **at runtime** from
@@ -239,15 +368,23 @@ cmd[1] = 0x82
 cmd[2..5] = big-endian u32  = 0x007ff000     (this+0xc40-independent constant)
 cmd[6..7] = big-endian u16  = 0x000f
 ```
-then poll `0x0200`, then **IN 15 bytes** into `*(this+0xc40)`.
+then poll `0x0200`, then **IN 15 bytes** into `*(this+0xc40)`. This is `getTinyCUserSn` — the
+raw (obfuscated) user serial, decrypted by `DecryptSNE` (§4.9).
 
 **Order id `0x15`** — command `05 84 07 00 00 10 00 10` (hard-coded):
 ```
 cmd = 05 84 07 00 00 10 00 10
 ```
-then poll `0x0200`, then **IN 15 bytes** into `*(this+0xc40)`.
+then poll `0x0200`, then **IN 15 bytes** into `*(this+0xc40)` and a NUL at `[0xf]`. This is
+`getTinyCRobotSn` — the module serial.
 
-Both are read-style: 8-byte command out, 15-byte result in. The polling loop is the canonical
+> **Live measurement (2026-09-25).** The device's module-serial result is **16 bytes**, not 15:
+> ASCII `202605575259` followed by four `0x00`. The APK reads only 15 and supplies its own NUL at
+> `[0xf]`, so it never sees the difference. The port reads all 16. The two payload bytes that
+> differ between the APK's command (`05 84 07 00 00 10 00 10`) and the port's
+> (`05 84 07 00 00 00 00 10`) are inert — both return the same 16 bytes.
+
+Both are read-style: 8-byte command out, 15/16-byte result in. The polling loop is the canonical
 status loop from §4.2, with `max 1000` iterations. **[V]**
 
 ### `setMachineSetting` — a calibration coefficient write **[V]**
@@ -257,7 +394,7 @@ status loop from §4.2, with `max 1000` iterations. **[V]**
 
 | condition | float bits | value |
 |---|---|---|
-| `this[0xb2e] == 'C'` (robot serial's 3rd char) | `0x3f800000` | `1.0` |
+| `this[0xb2e] == 'C'` (the **decoded user serial's** 3rd char, §4.9) | `0x3f800000` | `1.0` |
 | `param_2 == 0` | `0x3f5930be` | ≈ `0.848` |
 | otherwise | `0x3f688ce7` | ≈ `0.908` |
 
@@ -681,19 +818,30 @@ Then the order sequence needed to bring the thermal stream up must be lifted fro
 
 ## 4.8 Read/write safety classification
 
-**[V]** Every recovered function falls into one of three classes. **A Linux port should implement
-only the first class until the parameter block semantics are fully understood.**
+**[V]** Every recovered function falls into one of four classes. The port implements the first
+three; the fourth stays unimplemented. The line between the last two is **persistence**: a runtime
+parameter write is volatile and reversible, a calibration write is not.
 
 ### Safe — reads only
 
 | Function | Transfers |
 |---|---|
-| `getTinyCRobotSn` `@ 0x168cc0` | OUT `0x1d00`, poll, IN 15 B `0x1d08` |
-| `getTinyCUserSn` `@ 0x168a60` | poll, IN 15 B `0x1d08` |
+| `getTinyCRobotSn` `@ 0x168cc0` | OUT `0x1d00` ← `05 84 07 00 00 10 00 10`, poll, IN **16 B** `0x1d08` |
+| `getTinyCUserSn` `@ 0x168a60` | OUT `0x1d00` ← `01 82 00 7f f0 00 00 0f`, poll, IN 15 B `0x1d08` |
 | `getTinyCUserSnCoefficient` `@ 0x168800` | poll, IN **28 B** (`0x1c`) `0x1d08` |
-| `getTinyCParams` `@ 0x167338` | OUT `0x9d00` (`14 85 00 03 …`), read back |
-| `getTinyCUserData` `@ 0x167a24` | OUT `0x1d00` (`0d c1 …`) |
+| `getTinyCParams` `@ 0x167338` | OUT `0x9d00` (`14 85 00 <idx> …`), pre-fill `0x1d08`, poll, IN 2 B `0x1d10` |
+| `getTinyCUserData` `@ 0x167a24` | OUT `0x1d00` (`0d c1 …`), poll, IN **1 B** `0x1d08` |
 | `getTinyCDevicesStatus` `@ 0x168408` | status read |
+
+> **`getTinyCUserData` returns one byte, not fifteen.** Earlier text here claimed a 15-byte user
+> data read; that is wrong. Reading 15 bytes "succeeds" only because the device hands back
+> leftovers from the shared result buffer (see §4.2). The port removed it from `probe`'s read set.
+
+> **Ordering constraint — reads must happen before streaming.** Live-measured 2026-09-25: with the
+> isochronous stream running, `getTinyCRobotSn` fails and only 4 of the 16 parameter slots answer;
+> while idle, every read above succeeds. The vendor behaves the same way — it reads the parameter
+> block at connect, before `tinyStartStream`. The port encodes this by calling
+> `dyt_capture_read_info()` after `dyt_capture_open()` but **before** `dyt_capture_start()`.
 
 ### Stream control — writes device *mode*, not calibration
 
@@ -704,56 +852,152 @@ only the first class until the parameter block semantics are fully understood.**
 | `tinyStopStream` `@ 0x169090` | stop |
 | `setTinyCOutputADValue` `@ 0x169d5c` | OUT `0x1d00` ← `0a 01 00 00 00 00 00 00` |
 
+### Runtime parameters — writes *volatile* state, not calibration
+
+| Function | Transfers |
+|---|---|
+| `sendTinyCParamsModification` `@ 0x167760` | OUT `0x9d00` ← `14 c5 00 <type> 00 00 <hi> <lo>`, then OUT `0x1d08` ← pre-fill; **no poll** |
+
+> **Live-verified 2026-09-25: this is safe and it works.** Writing emissivity `0.1` moved the frame
+> mean from 32.7 °C to 73.9 °C, and distance `0.05 m` to 100.9 °C; restoring each returned the mean
+> to baseline (§4.2). The value is **volatile** — it does not survive a replug — so this is a
+> runtime setting, *not* calibration, and it cannot reach factory data. The port implements it as
+> `dyt_capture_set_param()`. Space consecutive writes ≥ 100 ms (the port uses 250 ms); see §4.2.
+
 ### **Dangerous — writes persistent device calibration**
 
 | Function | Risk |
 |---|---|
 | `setTinySaveCameraParams` `@ 0x1712d4` | **saves** camera parameters to the device |
 | `setMachineSetting` `@ 0x167e3c` | writes a calibration coefficient (§4.2) |
-| `sendTinyCParamsModification` `@ 0x167760` | writes a parameter block |
 
 > **These write to non-volatile device state.** A wrong write may destroy the unit's factory
 > calibration, which **cannot be reconstructed** from the artifacts in this repository — the
 > Windows calibration tables (`tau_*.bin`, `MILI6_*.bin`) are *not* confirmed to be the same data.
 > Do not call them until the read path is fully understood and the exact parameter block layout
 > has been verified against a known-good read. **[I]**
+>
+> **Both remain unimplemented in the port.** `probe` refuses them by opcode (§4.8 self-test) and no
+> code path calls them. `sendTinyCParamsModification` is *not* in this class — see above.
 
 ---
 
-## 4.9 Serial-number decryption (`DecryptSNE`) — recovered
+## 4.9 Serial-number decryption (`DecryptSNE`) — recovered and corrected
 
-**[V]** `UVCPreviewIR::DecryptSNE(void *out, void *in15, char *robot_sn, void *out2)`
-(`@ 0x1698bc`) is a short, fully-recovered byte deobfuscation routine. Ghidra split the working
-array across several locals; reassembled, it is:
+> **Correction (2026-09-25, live device).** The transcription previously published here was
+> **incomplete in three ways**. Because of that, the decode appeared to produce non-printable
+> garbage and the Linux port was shipped treating the *raw* record as the deliverable and the
+> decode as unverified. Re-disassembling `_ZN12UVCPreviewIR9DecryptSNEPvS0_S0_`
+> (`@ 0x1698bc`; file offset `0x698bc`) shows the routine is fully invertible and **does**
+> produce a printable serial. The three errors were:
+>
+> 1. **Six scattered pre-XORs were omitted.** Before the `^= 0x1d` pass, six bytes are mixed with
+>    either the constant `0x12` or a key byte `mod` derived from the module serial (§4.9.1).
+> 2. **The `i == 3` branch was mistranscribed.** It is
+>    `b[3] ^= b[14]; b[4] ^= b[13]; b[5] ^= b[12]` — the old text dropped `b[3] ^= b[14]`.
+> 3. **The result lands in the *last* parameter, not the first.** The parameter the old text
+>    called `out` is really the implicit `this` pointer and is never read; `mempcpy` writes to
+>    the third explicit parameter.
+
+**[V]** The mangled name is `_ZN12UVCPreviewIR9DecryptSNEPvS0_S0_` →
+`DecryptSNE(void*, void*, void*)` — **three** explicit parameters plus the implicit `this`
+(`x0`). Register roles:
+
+| Register | Role | Old doc name |
+|---|---|---|
+| `x0` | `this` — stored on entry, **never read** | *(miscalled `out`)* |
+| `x1` | 15-byte obfuscated input | `in15` |
+| `x2` | NUL-terminated key string; only `key+2` is used | `robot_sn` |
+| `x3` | 15-byte decoded output | `out2` |
+
+Reassembled (every frame slot in the disassembly is accounted for below):
 
 ```c
-/* b[0..14] is a 15-byte working buffer */
+/* x1 = in15 : 15 obfuscated bytes (the raw user SN, see 4.9.2)
+   x2 = key  : NUL-terminated ASCII string; only key+2 is used
+   x3 = out  : 15 decoded bytes                                          */
+
 uint8_t b[15];
 memcpy(b, in15, 15);
 
-b[0] ^= 0x12;
+int mod = atoi((char *)key + 2) % 127;      /* signed; see 4.9.1 */
+
+b[0]  ^= 0x12;
+b[8]  ^= 0x12;
+b[11] ^= (uint8_t)mod;
+b[3]  ^= (uint8_t)mod;
+b[7]  ^= 0x12;
+b[9]  ^= (uint8_t)mod;
+
 for (i = 0; i < 15; i++) b[i] ^= 0x1d;
 
-for (i = 0; i < 5; i += 2) {          /* swap pairs */
+for (i = 0; i < 5; i += 2) {          /* swap pairs, stride 7 */
     uint8_t t = b[i]; b[i] = b[i+7]; b[i+7] = t;
 }
 
 for (i = 0; i < 7; i += 3) {
-    if (i == 0) {                      /* mix in the tail */
-        b[0] ^= b[12]; b[1] ^= b[13]; b[2] ^= b[14];
-    } else if (i == 3) {
-        b[4] ^= b[13]; b[5] ^= b[12];
-    } else {                           /* i == 6: diffuse within the block */
-        b[6] ^= b[9]; b[7] ^= b[10]; b[8] ^= b[11];
-    }
+    if (i == 0)      { b[0] ^= b[12]; b[1] ^= b[13]; b[2] ^= b[14]; }
+    else if (i == 3) { b[3] ^= b[14]; b[4] ^= b[13]; b[5] ^= b[12]; }
+    else             { b[6] ^= b[9];  b[7] ^= b[10]; b[8] ^= b[11]; }
 }
 
-memcpy(out, b, 15);
+memcpy(out, b, 15);                   /* out == x3, the THIRD explicit parameter */
 ```
 
-The decompiler also shows `atoi(robot_sn + 2) % 0x7f` being computed into a local that is never
-subsequently read — it is either genuinely dead code or a Ghidra artefact of register reuse.
-**[I]**
+### 4.9.1 The key is the last four digits of the module serial
+
+The `atoi(...) % 127` result is **not dead code** — the old text claimed it was, but the
+disassembly stores it at `[x29,#-0x3c]` and reads it back three times (for `b[3]`, `b[9]` and
+`b[11]`).
+
+The only call site is `do_tinyC_order` case 1 (`@ 0x169440`–`0x169478`), which passes:
+
+```
+x1 (in15) = this+0xb3c
+x2 (key)  = this+0xb7e          <-- = (module-SN buffer at this+0xb78) + 6
+x3 (out)  = this+0xb2c
+```
+
+`prepare_preview` (`@ 0x169f10`) `memset`s all three of those 16-byte buffers to ASCII `'0'`
+before streaming starts, so each is an ASCII field. `getTinyCRobotSn` then writes 15 bytes of
+module serial at `this+0xb78`, and case 1 NUL-terminates it at `[0xf]`.
+
+So `key = serial + 6` and `key + 2 = serial + 8` — i.e. **the last four digits of the module
+serial**. On the reference unit the module serial is `202605575259`:
+
+```
+key      = "575259"
+key + 2  = "5259"
+atoi     = 5259
+mod      = 5259 % 127 = 52
+```
+
+### 4.9.2 The 15-byte input is the raw *user* serial
+
+The input at `this+0xb3c` is written by `getTinyCUserSn` (order id `0x14`, command
+`01 82 00 7f f0 00 00 0f` — see §4.8), which `do_tinyC_order` case 0 runs immediately before.
+So the label used earlier for that read — "obfuscated identity record" — is a misnomer: it is the
+**raw (obfuscated) user serial**, and `DecryptSNE` turns it into the printable user serial.
+
+### 4.9.3 Verified result on the reference unit
+
+With the reference unit's raw user serial `06 7d 5a 48 2c 66 6a 79 79 58 2d 44 2f 24 2f` and
+`mod = 52`, the routine returns:
+
+```
+44 59 43 53 54 49 30 39 47 47 30 31 32 39 32
+ D  Y  C  S  T  I  0  9  G  G  0  1  2  9  2     ->  "DYCSTI09GG01292"
+```
+
+**Cross-check.** `setMachineSetting` (`@ 0x167e3c`) selects its calibration coefficient with
+`if (this[0xb2e] == 'C')`, and `this+0xb2e` is `out[2]` — the third byte of this very buffer.
+For the reference unit that byte **is** `'C'` (`0x43`). That independently confirms both the
+algorithm and the key (`mod = 52`, *not* the `-64` you get from hashing the whole serial).
+Brute-forcing `mod` over `0..126` with the old, incomplete algorithm is what produced the earlier
+"never printable" conclusion — it was an artefact of the missing pre-XORs.
+
+> **Consequence for the port.** The decode is now a *verified* pure function and should be
+> implemented; the raw 15 bytes are an intermediate value, not the deliverable.
 
 Note the constants `0x12` and `0x1d` and the `0x1d00`/`0x1d08`/`0x9d00` register indices — the
 vendor reuses `0x1d` throughout, which is worth remembering when reading the disassembly.
@@ -855,3 +1099,44 @@ else                                                           mode = 0;
 > **defaults to the order-free dual-half mode** (`DYT_OUTPUT_DEFAULT`) and keeps the AD path behind
 > `--ad-output`. This is also why Thermal-Camera-Redux works unmodified on this unit.
 > See `linux-port/src/capture.h` and `linux-port/testdata/README.md`.
+>
+> **How to read the visible half [V]** (measured 2026-09-25 against
+> `testdata/mode1000_256x384_default.raw`). The top half is YUYV, so each pixel is a byte pair
+> `Y U` / `Y V`; with U = V = 0x80 the chroma is neutral and **the luma is simply the first byte of
+> each pair** — i.e. byte `2x` of row `y`. In the port's `uint16` view of the payload that is the
+> **low byte** of each sample, and the high byte is a constant `0x80`. Measured on the fixture:
+> every odd byte of the top half is exactly `0x80` (one distinct value across all 49,152 bytes), the
+> luma spans 54…89 (mean 64.8 — a real, dim picture, not a placeholder), and it varies by row
+> (row 0 flat at ~54, row 191 spanning 61…89). Decoded as thermal it would read 239.7…240.2 °C,
+> which is why a missed slice is obvious. `src/visible.c` extracts it; `fusion.c` fuses it with the
+> thermal plane.
+>
+> **The slice is asserted, not assumed [V].** The same predicate decides both halves:
+> `dyt_visible_is_grey()` returns **1** for the top half (every chroma byte is `0x80`) and **0** for
+> the bottom half (it is thermal, so its high byte is `0x4c`). `pipeline_test` and `visible_test`
+> both check it, so a regression that read the wrong half would flip two assertions at once.
+>
+> **Fusion, live [V]** (2026-09-25, 0bda:5840 in the default dual-half mode). All six patterns render
+> (`f` cycles them) and the alignment reaches the picture: with `dx = +2` a cross-correlation of two
+> consecutive saves at ×2 zoom puts the peak exactly **4 screen px = 2 source px to the left**,
+> which is the vendor's `X_Coefficient` sense (the coefficient shifts the thermal ROI inside the
+> visible frame, i.e. the visible content moves the other way — `03-android-app-architecture.md`
+> §3.5.2). Two caveats worth keeping:
+>
+> * **The visible sensor auto-exposes.** Its picture dims over the first ~10 s after the stream
+>   starts, so two saves taken seconds apart differ for reasons unrelated to the keys. Measure
+>   alignment from a *close* pair, not across a long gap.
+> * **Case 5 (`edge-blending-black`) is nearly all black on this unit's picture.** The port's
+>   documented simplification of that mask thresholds a dilated edge magnitude at 70, and the
+>   dual-half top half is a low-contrast image (35 grey levels in the frozen fixture), so almost no
+>   gradient clears 70. The vendor's real mask uses two unrecovered `dilate` kernels plus an
+>   unrecovered bias Mat, so this is the simplification showing in the pixels — not a wiring fault,
+>   and not evidence about the vendor's output (`03-android-app-architecture.md` §3.5.2).
+>
+> **The AD output mode has no visible half [V].** `dyt_capture_plane_geometry()` reports
+> `plane_y = 0, plane_h = total` there (measured: `payload 256x192, thermal plane 256x192 at row 0`),
+> so the adapter extracts nothing; a fusion pattern that needs the plane is reported as
+> `(no visible plane)` and the render falls back to plain thermal rather than fusing a stale plane.
+>
+> **Open:** the default alignment is `0,0`, which *assumes* the top half is already pixel-registered
+> with the thermal plane. That has not been measured — see `09-open-questions-and-next-steps.md` §8.

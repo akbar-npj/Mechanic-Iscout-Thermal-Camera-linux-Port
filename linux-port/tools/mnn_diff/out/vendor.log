@@ -1,0 +1,10 @@
+dlopen: OK (libmnnmodel.so)
+init(NULL, NULL) -> 0
+The device support i8sdot:1, support fp16:1, support i8mm: 1
+run_1(1, 2)     -> 0
+run_2            -> 0
+out min 32801 max 33021 mean 32874.38 distinct 221
+out[0:8] : 32801 32801 32801 32801 32802 32802 32802 32802
+in [0:8] : 34 34 34 35 35 35 36 36
+wrote out/vendor_out.raw (196608 uint16)
+run_3(1)        -> 0

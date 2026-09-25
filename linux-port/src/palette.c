@@ -8,7 +8,10 @@
  *
  * build:  cc -O2 -g -Wall -Wextra -ffp-contract=off -I. -c palette.c -o palette.o
  */
+#include <dirent.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "palette.h"
@@ -46,8 +49,47 @@ int dyt_palette_load(dyt_palette_t *p, const char *path)
     return 0;
 }
 
-/* ------------------------------------------------------------- built-ins */
+int dyt_palette_load_dir(dyt_palette_t *out, int max, const char *dir)
+{
+    struct dirent **list = NULL;
+    int n, i, loaded = 0;
 
+    if (!out || max <= 0 || !dir)
+        return -1;
+
+    /* alphasort gives a deterministic order, so the viewer's palette keys
+     * and the "NN-name.dat" numbering agree between runs. */
+    n = scandir(dir, &list, NULL, alphasort);
+    if (n < 0)
+        return -1;
+
+    for (i = 0; i < n && loaded < max; i++) {
+        const char *nm  = list[i]->d_name;
+        size_t      len = strlen(nm);
+        char        path[PATH_MAX];
+        int         w;
+
+        if (len < 4 || strcmp(nm + len - 4, ".dat") != 0)
+            continue;
+
+        w = snprintf(path, sizeof path, "%s/%s", dir, nm);
+        if (w < 0 || (size_t)w >= sizeof path)
+            continue;
+
+        /* A file that is not a palette is skipped, not fatal — the caller
+         * still gets every palette that did load. */
+        if (dyt_palette_load(&out[loaded], path) == 0)
+            loaded++;
+    }
+
+    for (i = 0; i < n; i++)
+        free(list[i]);
+    free(list);
+
+    return loaded;
+}
+
+/* ------------------------------------------------------------- built-ins */
 /* Linear interpolation through a list of anchor colours (n × R,G,B). */
 static void ramp(dyt_palette_t *p, const uint8_t *anchors, int n)
 {

@@ -519,6 +519,8 @@ For clarity, these are **not** required and should not be attempted:
   cross-checking (`07-…` §5).
 * **The WiX Burn bootstrapper / VC++ redistributables** — Microsoft packaging, unrelated to the
   device (`07-…` §1).
-* **`libMNN.so` / `libMNN_Express.so` / `libmnnmodel.so`** — an on-device neural-network runtime
-  shipped with the Android app. Its role is not established (`09-…` §6) but it is almost
-  certainly *not* required for basic thermal capture.
+* **The vendor's `libMNN.so` / `libMNN_Express.so` / `libmnnmodel.so`** — the Android app's
+  neural-network runtime. The *capability* is no longer out of scope: the role is established
+  (`09-…` §6) as a 2× super-resolution model, and Phase 8 implements it against an **upstream**
+  MNN build, not the vendor's bionic binaries. Those binaries are still not needed for basic
+  thermal capture, and are used only as a differential oracle (`linux-port/tools/mnn_diff/`).

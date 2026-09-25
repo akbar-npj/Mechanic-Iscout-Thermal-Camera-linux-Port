@@ -27,8 +27,16 @@ extern "C" {
 #define DYT_PALETTE_N     256            /* entries per palette */
 #define DYT_PALETTE_BYTES (DYT_PALETTE_N * 3)
 
-/* The number of palettes the vendor app exposes (RE Docs 06 §1.4). */
+/* The number of palettes the vendor's Android app exposes (RE Docs 06 §1.4).
+ * This is also the count of built-in stand-in ramps, so it stays 6. */
 #define DYT_PALETTE_BUILTIN_N 6
+
+/* Storage bound for a loaded palette set — a compile-time array dimension,
+ * so it is deliberately not the current count.  linux-port/palettes/ ships
+ * 28 distinct ramps: the Android app's 6, plus the 22 Windows installer
+ * palettes that are not byte-identical to one of those (the Windows set has
+ * 27, but 5 duplicate an Android one).  See palettes/README.md. */
+#define DYT_PALETTE_MAX 32
 
 typedef struct {
     uint8_t rgb[DYT_PALETTE_BYTES];      /* 256 × R,G,B; index 0 = coldest */
@@ -39,6 +47,14 @@ typedef struct {
  * trailing data, so a wrong path or a truncated asset is rejected rather
  * than silently zero-filled.  Returns 0 on success, -1 on failure. */
 int dyt_palette_load(dyt_palette_t *p, const char *path);
+
+/* Load every *.dat palette in `dir` into out[0..max-1], in name order, so
+ * the front-end gets a stable palette list without hard-coding filenames.
+ * Files that are not exactly DYT_PALETTE_BYTES are skipped rather than
+ * rejected, so an unrelated .dat in the directory cannot break the load.
+ * Returns the number loaded (possibly 0), or -1 if `dir` is unreadable.
+ * The caller should fall back to dyt_palette_builtin() when this returns 0. */
+int dyt_palette_load_dir(dyt_palette_t *out, int max, const char *dir);
 
 /* Fill *p with one of the built-in ramps, 0..DYT_PALETTE_BUILTIN_N-1.
  * These are small stand-ins so the viewer still works when the vendor assets

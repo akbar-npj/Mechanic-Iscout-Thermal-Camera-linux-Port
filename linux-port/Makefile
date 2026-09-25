@@ -20,7 +20,7 @@ CXX ?= c++
 # disabled and every fused multiply-add is written explicitly as fmaf().
 # Do not remove it.  See RE Docs 08 §8.6.1.
 CFLAGS ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -ffp-contract=off
-CFLAGS += -Isrc -Ithird_party/libuvc/include
+CFLAGS += -Isrc -Ithird_party/libuvc/include -Ithird_party/stb
 LDLIBS := -lm -lpthread
 
 # libusb-1.0 enables the real control-transfer backend and the probe tool.
@@ -30,6 +30,35 @@ ifneq ($(strip $(USB_LIBS)),)
 CFLAGS += -DDYT_HAVE_LIBUSB $(USB_CFLAGS)
 LDLIBS += $(USB_LIBS)
 HAVE_LIBUSB := 1
+endif
+
+# ---------------------------------------------------------------------------
+# JPEG codec backend (src/jpeg.c).
+#
+# The default is the **vendored stb** (third_party/stb), because it is always
+# present and produces identical bytes on every machine — which is the same
+# reproducibility property the archive rule below protects.  libjpeg is an
+# optional accelerator, selected explicitly:
+#
+#     make JPEG=libjpeg
+#
+# It is detected (not auto-selected) so that a default build does not silently
+# change codec depending on what happens to be installed.  Availability is
+# reported as HAVE_LIBJPEG; asking for libjpeg without it is a build error.
+# ---------------------------------------------------------------------------
+JPEG_CFLAGS := $(shell pkg-config --cflags libjpeg 2>/dev/null)
+JPEG_LIBS   := $(shell pkg-config --libs   libjpeg 2>/dev/null)
+ifneq ($(strip $(JPEG_LIBS)),)
+HAVE_LIBJPEG := 1
+endif
+
+JPEG ?= stb
+ifeq ($(JPEG),libjpeg)
+ifndef HAVE_LIBJPEG
+$(error JPEG=libjpeg requested but libjpeg was not found by pkg-config)
+endif
+CFLAGS += -DDYT_HAVE_LIBJPEG $(JPEG_CFLAGS)
+LDLIBS += $(JPEG_LIBS)
 endif
 
 # OpenCV (C++ only) enables the live viewer, tools/dytview.cpp.  It also needs
@@ -50,6 +79,25 @@ CXXFLAGS += -DDYT_HAVE_OPENCV $(CV_CFLAGS)
 HAVE_OPENCV := 1
 endif
 
+# MNN (C++ only) backs the optional super-resolution seam in src/mnn.c.  It is
+# genuinely optional: without it src/mnn.c compiles to a seam that reports
+# DYT_MNN_UNAVAILABLE and never invents a frame, and every target below still
+# builds.  This is the same gate as OpenCV's.
+#
+# MNN_ROOT must name an install carrying include/MNN/Interpreter.hpp and
+# lib/libMNN.so.  See third_party/README.md for how to produce one.
+MNN_ROOT ?= third_party/mnn-install
+ifneq ($(wildcard $(MNN_ROOT)/include/MNN/Interpreter.hpp),)
+ifneq ($(wildcard $(MNN_ROOT)/lib/libMNN.so),)
+CFLAGS   += -DDYT_HAVE_MNN
+MNN_CFLAGS := -I$(MNN_ROOT)/include
+# The rpath is quoted because this tree's own path contains a space
+# ("Thermal Camera"); unquoted, the shell hands the linker two arguments.
+MNN_LIBS   := -L$(MNN_ROOT)/lib -lMNN -Wl,-rpath,'$(abspath $(MNN_ROOT)/lib)'
+HAVE_MNN   := 1
+endif
+endif
+
 BUILD := build
 
 # ---------------------------------------------------------------------------
@@ -68,30 +116,52 @@ UVC_OBJS   := $(addprefix $(BUILD)/libuvc/,$(UVC_SRCS:.c=.o))
 UVC_CFLAGS ?= -O2 -g -fPIC -w -I$(UVC_DIR)/include $(USB_CFLAGS)
 
 # ---------------------------------------------------------------------------
+# stb — vendored upstream, pinned to commit
+# 2c980bb59875b0d32144a71867fbdebb2f77cd20 (third_party/stb/README.md).
+#
+# src/stb_impl.c is the single translation unit that instantiates the stb
+# implementations.  It is the port's JPEG/PNG codec, so unlike libuvc it *is*
+# on the default build path; -ffp-contract=off is kept even here so no new
+# object can quietly reintroduce contraction.
+# ---------------------------------------------------------------------------
+STB_CFLAGS ?= -O2 -g -w -ffp-contract=off -Ithird_party/stb
+
+# ---------------------------------------------------------------------------
 # Flag-change detection.
 #
-# CFLAGS gains -DDYT_HAVE_LIBUSB when libusb is installed and CXXFLAGS gains
-# -DDYT_HAVE_OPENCV when OpenCV is.  make compares *file mtimes*, never
-# variable values, so a tree configured before those packages were present
-# would keep its old capture.o / dytview forever: capture_demo would silently
-# print "built without libusb" while `make check` stayed green.  Stamp the
-# flags and make every object depend on the stamp, so changing CFLAGS,
-# CXXFLAGS or UVC_CFLAGS forces a rebuild.  The stamp is only rewritten when
-# the flags actually differ, so a normal build still rebuilds nothing.
+# CFLAGS gains -DDYT_HAVE_LIBUSB when libusb is installed, -DDYT_HAVE_LIBJPEG
+# when JPEG=libjpeg is asked for, and CXXFLAGS gains -DDYT_HAVE_OPENCV when
+# OpenCV is.  make compares *file mtimes*, never variable values, so a tree
+# configured before those packages were present would keep its old capture.o /
+# dytview forever: capture_demo would silently print "built without libusb"
+# while `make check` stayed green.  Stamp the flags and make every object
+# depend on the stamp, so changing CFLAGS, CXXFLAGS, UVC_CFLAGS or STB_CFLAGS
+# forces a rebuild.  The stamp is only rewritten when the flags actually
+# differ, so a normal build still rebuilds nothing.
 # ---------------------------------------------------------------------------
 FLAG_STAMP := $(BUILD)/.flags
+FLAG_STAMP_VAL := $(CFLAGS) | $(UVC_CFLAGS) | $(STB_CFLAGS) | $(CXXFLAGS)
 $(shell mkdir -p $(BUILD); \
-        if [ "$$(cat $(FLAG_STAMP) 2>/dev/null)" != '$(CFLAGS) | $(UVC_CFLAGS) | $(CXXFLAGS)' ]; then \
-            printf '%s\n' '$(CFLAGS) | $(UVC_CFLAGS) | $(CXXFLAGS)' > $(FLAG_STAMP); \
+        if [ "$$(cat $(FLAG_STAMP) 2>/dev/null)" != '$(FLAG_STAMP_VAL)' ]; then \
+            printf '%s\n' '$(FLAG_STAMP_VAL)' > $(FLAG_STAMP); \
         fi)
 
 LIB      := $(BUILD)/libdyt.a
 LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/control.o $(BUILD)/serial.o $(BUILD)/calib.o \
-            $(BUILD)/capture.o $(BUILD)/palette.o $(BUILD)/imgwrite.o
+            $(BUILD)/capture.o $(BUILD)/palette.o $(BUILD)/imgwrite.o \
+            $(BUILD)/units.o $(BUILD)/display.o $(BUILD)/measure.o \
+            $(BUILD)/alarm.o $(BUILD)/session.o $(BUILD)/params.o \
+            $(BUILD)/visible.o $(BUILD)/fusion.o $(BUILD)/session_capture.o \
+            $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
+            $(BUILD)/mnn.o
 
 TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
-         $(BUILD)/calib_test $(BUILD)/pipeline_test $(BUILD)/palette_test
+         $(BUILD)/calib_test $(BUILD)/pipeline_test $(BUILD)/palette_test \
+         $(BUILD)/units_test $(BUILD)/display_test $(BUILD)/measure_test \
+         $(BUILD)/alarm_test $(BUILD)/session_test $(BUILD)/params_test \
+         $(BUILD)/visible_test $(BUILD)/fusion_test $(BUILD)/jpeg_test \
+         $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test
 TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
 # capture_demo and probe talk to the device directly through libusb — only
 # buildable with it.  capture_demo's prereq on $(UVC_LIB) is what pulls the
@@ -103,6 +173,19 @@ TOOLS += $(BUILD)/capture_demo $(BUILD)/probe $(BUILD)/isotest
 ifdef HAVE_OPENCV
 TOOLS += $(BUILD)/dytview
 endif
+endif
+
+# The mp4 recorder (Phase 7) needs only OpenCV: its fixture and --selftest paths
+# are device-free, so it is useful — and testable — on a host with no libusb.
+# Live recording additionally needs libuvc, which is linked only when present.
+ifdef HAVE_OPENCV
+TOOLS += $(BUILD)/dytrec
+endif
+
+# libuvc is linked into dytrec only when it was actually built.
+DYTREC_UVC :=
+ifdef HAVE_LIBUSB
+DYTREC_UVC := $(UVC_LIB)
 endif
 
 # Frozen vendor ground truth, produced by tools/thermometry_diff/run.sh
@@ -126,6 +209,13 @@ $(BUILD)/%.o: src/%.c $(FLAG_STAMP) | $(BUILD)
 $(BUILD)/libuvc/%.o: $(UVC_DIR)/src/%.c $(FLAG_STAMP) | $(BUILD)
 	@mkdir -p $(BUILD)/libuvc
 	$(CC) $(UVC_CFLAGS) -c $< -o $@
+
+# The stb implementations (vendored, built -w).  This explicit rule must come
+# before nothing in particular — it simply overrides the generic src/%.c rule,
+# which would otherwise compile it with the port's strict CFLAGS and without
+# the stb include path.
+$(BUILD)/stb_impl.o: src/stb_impl.c $(FLAG_STAMP) | $(BUILD)
+	$(CC) $(STB_CFLAGS) -c $< -o $@
 
 # The 'D' is not optional: without it ar embeds each member's mtime and
 # uid/gid in the archive header, so two builds from identical objects
@@ -161,6 +251,84 @@ $(BUILD)/pipeline_test: src/pipeline_test.c $(LIB) | $(BUILD)
 $(BUILD)/palette_test: src/palette_test.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+# units_test covers the °C/°F/K conversion the vendor app's temp_unit setting
+# exposes (RE Docs 06 §3.2).  Pure — no hardware.
+$(BUILD)/units_test: src/units_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# display_test covers the display-range, palette-selection, mirror/zoom and
+# start-up-filler rules that used to live inside tools/dytview.cpp.
+$(BUILD)/display_test: src/display_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# measure_test drives the point/ROI/line/isotherm geometry over a synthetic
+# ramp, so every expected statistic is checkable by hand.  No hardware.
+$(BUILD)/measure_test: src/measure_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# alarm_test covers the high/low Schmitt triggers: the in-band non-clear and
+# the on-threshold non-trip, which are what make an alarm usable.  No hardware.
+$(BUILD)/alarm_test: src/alarm_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# session_test drives the device-free model object with synthetic frames —
+# including a two-thread torn-read check.  No hardware, no libuvc.
+$(BUILD)/session_test: src/session_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# params_test pins the device's stored-parameter encodings against the
+# literals in MechaniscoutPcap/4.pcapng and the live read-back.  No hardware.
+$(BUILD)/params_test: src/params_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# visible_test covers the YUYV luma extraction against the frozen dual-half
+# fixture (testdata/) and its own synthetic planes.  No hardware.
+$(BUILD)/visible_test: src/visible_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# fusion_test drives all six patterns over synthetic grey + thermal planes
+# and writes a golden PPM per pattern (testdata/fusion/).  No hardware.
+$(BUILD)/fusion_test: src/fusion_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# jpeg_test round-trips a synthetic image through the selected codec backend.
+# JPEG is lossy, so it pins structure (SOI/EOI, dimensions) and a tolerance,
+# not bytes; the container's exact bytes are dytjpeg_test's job.  No hardware.
+$(BUILD)/jpeg_test: src/jpeg_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# dytjpeg_test checks the DYT container's bytes with its own segment walker —
+# it needs no codec, only the frozen dual-half frame's payload as raw data.
+# See testdata/README.md.
+$(BUILD)/dytjpeg_test: src/dytjpeg_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# imgwrite_test covers the PPM writer on its own (it was only ever exercised
+# indirectly, through the golden comparisons) and the PNG writer structurally.
+$(BUILD)/imgwrite_test: src/imgwrite_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# mnn_test pins the Phase 8 super-resolution seam: the shape contract, the
+# model validator, argument checking, and — when a runtime is present — a real
+# upscale compared against the vendor's own mnn_run_2 output frozen in
+# tools/mnn_diff/out/ (provenance in its meta.txt).  It needs the extracted
+# model at models/zoom2.mnn, so run it from the port root.
+#
+# The test itself is C, but the runtime half is C++, so the link goes through
+# $(CXX) whenever MNN is present.
+ifdef HAVE_MNN
+$(BUILD)/mnn_runtime.o: src/mnn_runtime.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(MNN_CFLAGS) -c $< -o $@
+
+MNN_OBJ := $(BUILD)/mnn_runtime.o
+endif
+
+$(BUILD)/mnn_test.o: src/mnn_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) $(MNN_OBJ) | $(BUILD)
+	$(CXX) $(BUILD)/mnn_test.o $(LIB) $(MNN_OBJ) $(LDLIBS) $(MNN_LIBS) -o $@
+
 $(BUILD)/dumpframe: src/dumpframe.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
@@ -174,6 +342,16 @@ $(BUILD)/capture_demo: tools/capture_demo.c $(LIB) $(UVC_LIB) | $(BUILD)
 # HAVE_OPENCV is set — see the TOOLS list above.
 $(BUILD)/dytview: tools/dytview.cpp $(LIB) $(UVC_LIB) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< $(LIB) $(UVC_LIB) $(LDLIBS) $(CV_LIBS) -o $@
+
+# The mp4 recorder (Phase 7).  tools/frame_source.c is C, so it gets its own
+# object rather than being fed to the C++ compiler — it allocates with malloc
+# and relies on C's implicit void* conversions.  Its header lives in tools/, so
+# the generic src/%.c rule does not cover it.
+$(BUILD)/frame_source.o: tools/frame_source.c tools/frame_source.h $(FLAG_STAMP) | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/dytrec: tools/dytrec.cpp $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) $(LDLIBS) $(CV_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.
@@ -196,9 +374,25 @@ check: all
 	                       testdata/mode1000_256x384_default.raw
 	@$(BUILD)/palette_test palettes testdata/mode1000_256x192.raw \
 	                       testdata/golden/mode1000_iron_30-31.2.ppm
+	@$(BUILD)/units_test
+	@$(BUILD)/display_test
+	@$(BUILD)/measure_test
+	@$(BUILD)/alarm_test
+	@$(BUILD)/session_test
+	@$(BUILD)/params_test
+	@$(BUILD)/visible_test testdata/mode1000_256x384_default.raw
+	@$(BUILD)/fusion_test
+	@$(BUILD)/jpeg_test
+	@$(BUILD)/dytjpeg_test testdata/mode1000_256x384_default.raw
+	@$(BUILD)/imgwrite_test
+	@$(BUILD)/mnn_test models/zoom2.mnn tools/mnn_diff/out
 ifdef HAVE_LIBUSB
 	@echo "== probe safety self-test =="
 	@$(BUILD)/probe --selftest
+endif
+ifdef HAVE_OPENCV
+	@echo "== mp4 recorder self-test =="
+	@$(BUILD)/dytrec --selftest
 endif
 	@echo "== frame pipeline vs frozen vendor ground truth =="
 	@fail=0; \
