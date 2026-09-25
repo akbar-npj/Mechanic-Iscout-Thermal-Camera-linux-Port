@@ -36,9 +36,11 @@
 #include <QEventLoop>
 #include <QImage>
 #include <QKeyEvent>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
+#include <QSettings>
 #include <QSize>
 #include <QString>
 #include <QTimer>
@@ -58,6 +60,10 @@
 #endif
 
 /* ---------------------------------------------------------------- layout */
+
+/* The port's version, shown in the About box.  Not in a header: nothing else
+ * reads it, and a second copy would be one to forget. */
+static const char kAppVersion[] = "0.1.0";
 
 static const int kBarW   = 22;   /* colour-bar width, px */
 static const int kBarGap = 14;   /* image -> bar gap */
@@ -81,12 +87,23 @@ struct opts {
     int  width   = 256;
     int  palette = 1;
     int  zoom    = 2;
+    int  unit    = -1;               /* -1 = leave the engine's default (C) */
+    int  fusion  = -1;               /* -1 = leave the engine's default (ir) */
     int  frames  = 0;                /* 0 = run until closed */
     int  fps     = 25;
     bool selftest = false;
 
     bool live        = false;        /* stream from the device, not a fixture */
     bool fixture_set = false;        /* --fixture was given explicitly */
+    /* Which view options the command line actually named.  A saved preference
+     * fills in only what it did not, so an explicit flag always wins. */
+    bool palette_set     = false;
+    bool zoom_set        = false;
+    bool capture_dir_set = false;
+    /* Preferences: `no_prefs` skips both loading and saving, and `prefs_path`
+     * overrides where they live (empty = $DYT_PREFS, else Qt's default). */
+    bool        no_prefs = false;
+    std::string prefs_path;
     dyt_capture_opts cap;            /* the live path's capture settings */
 };
 
@@ -107,6 +124,100 @@ static const char *opts_conflict(const opts &o)
     return nullptr;
 }
 
+/* ------------------------------------------------------------ preferences
+ *
+ * The view state a user expects to survive a restart: which palette, unit,
+ * zoom and fusion they last chose, and where captures go.  QSettings is used
+ * rather than a hand-rolled file because it already does the atomic write and
+ * the XDG location.
+ *
+ * What is deliberately *not* saved is anything about the device — its identity
+ * and stored parameters belong to the camera, not the user — or the
+ * measurement, because a box drawn over one scene is about that scene.
+ *
+ * The path is overridable so a test and a portable run do not touch the real
+ * config: `--prefs PATH` names a file, else `$DYT_PREFS`, else Qt's default.
+ */
+struct prefs {
+    int         palette = -1;      /* -1 = unset, use the built-in default */
+    int         unit    = -1;
+    int         zoom    = -1;
+    int         fusion  = -1;
+    std::string capture_dir;
+};
+
+static std::string prefs_path(const opts &o)
+{
+    if (!o.prefs_path.empty())
+        return o.prefs_path;
+    const char *e = std::getenv("DYT_PREFS");
+    return e ? std::string(e) : std::string();
+}
+
+static std::unique_ptr<QSettings> prefs_open(const std::string &path)
+{
+    if (path.empty())
+        return std::unique_ptr<QSettings>(new QSettings());
+    return std::unique_ptr<QSettings>(
+        new QSettings(QString::fromStdString(path), QSettings::IniFormat));
+}
+
+static void prefs_load(const std::string &path, prefs &p)
+{
+    auto s = prefs_open(path);
+    p.palette = s->value(QStringLiteral("view/palette"), -1).toInt();
+    p.unit    = s->value(QStringLiteral("view/unit"),    -1).toInt();
+    p.zoom    = s->value(QStringLiteral("view/zoom"),    -1).toInt();
+    p.fusion  = s->value(QStringLiteral("view/fusion"),  -1).toInt();
+    p.capture_dir =
+        s->value(QStringLiteral("capture/dir")).toString().toStdString();
+}
+
+static void prefs_save(const std::string &path, const prefs &p)
+{
+    auto s = prefs_open(path);
+    s->setValue(QStringLiteral("view/palette"), p.palette);
+    s->setValue(QStringLiteral("view/unit"),    p.unit);
+    s->setValue(QStringLiteral("view/zoom"),    p.zoom);
+    s->setValue(QStringLiteral("view/fusion"),  p.fusion);
+    s->setValue(QStringLiteral("capture/dir"),
+                QString::fromStdString(p.capture_dir));
+    s->sync();
+}
+
+/* Fill in what the command line did not name, so an explicit flag always wins
+ * over a saved preference.  Mutates a *copy* of the options; the caller's stay
+ * as parsed, which is what --selftest asserts on. */
+static void opts_apply_prefs(opts &eff, const prefs &p)
+{
+    if (!eff.palette_set && p.palette >= 0)
+        eff.palette = p.palette + 1;         /* prefs are 0-based, CLI 1-based */
+    if (!eff.zoom_set && p.zoom >= 0)
+        eff.zoom = p.zoom;
+    if (!eff.capture_dir_set && !p.capture_dir.empty())
+        eff.capture_dir = p.capture_dir;
+    if (eff.unit < 0)
+        eff.unit = p.unit;
+    if (eff.fusion < 0)
+        eff.fusion = p.fusion;
+}
+
+/* The preferences as the session currently stands, ready to be saved. */
+static prefs prefs_from_session(dyt_session_t *sess, const std::string &dir)
+{
+    prefs          p;
+    dyt_snapshot_t snap{};
+
+    if (sess && dyt_session_snapshot(sess, &snap, nullptr, 0) == 0) {
+        p.palette = snap.palette;
+        p.unit    = (int)snap.unit;
+        p.zoom    = snap.xform.zoom;
+        p.fusion  = (int)snap.fusion;
+    }
+    p.capture_dir = dir;
+    return p;
+}
+
 static void usage(const char *prog)
 {
     std::fprintf(stderr,
@@ -117,10 +228,15 @@ static void usage(const char *prog)
         "  --palette N      1-based palette index (default 1)\n"
         "  --palette-dir D  where the *.dat ramps live (default: search)\n"
         "  --zoom N         window magnification (default 2)\n"
+        "  --unit N         0=C, 1=F, 2=K (default C)\n"
+        "  --fusion N       fusion pattern index (default 0 = ir)\n"
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
         "  --png PATH       write the canvas here and exit\n"
         "  --capture-dir D  where 's' (still) and 'v' (clip) write (default .)\n"
+        "  --prefs PATH     preferences file (default: $DYT_PREFS, else the\n"
+        "                   standard config location)\n"
+        "  --no-prefs       do not load or save preferences\n"
         "  --selftest       headless check over the fixture; needs no display\n"
         "\n"
         "live capture (replaces the fixture):\n"
@@ -156,7 +272,9 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--fixture")                 { const char *v = next("--fixture"); if (!v) return false; o.fixture = v; o.fixture_set = true; }
         else if (a == "--palette-dir")             { const char *v = next("--palette-dir"); if (!v) return false; o.palette_dir = v; }
         else if (a == "--png")                     { const char *v = next("--png"); if (!v) return false; o.png = v; }
-        else if (a == "--capture-dir")             { const char *v = next("--capture-dir"); if (!v) return false; o.capture_dir = v; }
+        else if (a == "--capture-dir")             { const char *v = next("--capture-dir"); if (!v) return false; o.capture_dir = v; o.capture_dir_set = true; }
+        else if (a == "--prefs")                   { const char *v = next("--prefs"); if (!v) return false; o.prefs_path = v; }
+        else if (a == "--no-prefs")                o.no_prefs = true;
         /* --width is the sensor width in both modes: the fixture's, and the
          * capture width override when live.  One flag, because a user who says
          * "the sensor is 384 wide" means it whichever source they picked. */
@@ -166,8 +284,10 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--format-index")            { const char *v = next("--format-index"); if (!v) return false; o.cap.format_index = std::atoi(v); }
         else if (a == "--vid")                     { const char *v = next("--vid"); if (!v) return false; o.cap.vid = (uint16_t)std::strtoul(v, nullptr, 0); }
         else if (a == "--pid")                     { const char *v = next("--pid"); if (!v) return false; o.cap.pid = (uint16_t)std::strtoul(v, nullptr, 0); }
-        else if (a == "--palette")                 { const char *v = next("--palette"); if (!v) return false; o.palette = std::atoi(v); }
-        else if (a == "--zoom")                    { const char *v = next("--zoom"); if (!v) return false; o.zoom = std::atoi(v); }
+        else if (a == "--palette")                 { const char *v = next("--palette"); if (!v) return false; o.palette = std::atoi(v); o.palette_set = true; }
+        else if (a == "--zoom")                    { const char *v = next("--zoom"); if (!v) return false; o.zoom = std::atoi(v); o.zoom_set = true; }
+        else if (a == "--unit")                    { const char *v = next("--unit"); if (!v) return false; o.unit = std::atoi(v); }
+        else if (a == "--fusion")                  { const char *v = next("--fusion"); if (!v) return false; o.fusion = std::atoi(v); }
         else if (a == "--frames")                  { const char *v = next("--frames"); if (!v) return false; o.frames = std::atoi(v); }
         else if (a == "--fps")                     { const char *v = next("--fps"); if (!v) return false; o.fps = std::atoi(v); }
         else {
@@ -220,6 +340,13 @@ static dyt_session_t *setup_session(const opts &o)
     if (zoom < DYT_ZOOM_MIN) zoom = DYT_ZOOM_MIN;
     if (zoom > DYT_ZOOM_MAX) zoom = DYT_ZOOM_MAX;
     dyt_session_zoom(sess, zoom - DYT_ZOOM_MIN);
+
+    /* A unit or fusion pattern that came from the command line or a saved
+     * preference; -1 means "leave the engine's default". */
+    if (o.unit >= 0)
+        dyt_session_set_unit(sess, (dyt_unit_t)o.unit);
+    if (o.fusion >= 0)
+        dyt_session_set_fusion(sess, (dyt_fusion_t)o.fusion);
 
     return sess;
 }
@@ -1480,6 +1607,10 @@ public:
      * anything saved since it was last looked at. */
     std::function<void()> on_gallery_refresh_;
 
+    /* The About box.  A callback so --selftest can see the key without a modal
+     * dialog blocking the event loop. */
+    std::function<void()> on_about_;
+
     /* The browsing state, owned here and read by the canvas at paint time. */
     dyt_vm_gallery_t *gallery() { return &gal_; }
 
@@ -1606,6 +1737,13 @@ protected:
         /* The device panel. */
         if (raw == 'd' && view_) {
             view_->toggle_info();
+            return;
+        }
+
+        /* About / the key list.  A callback rather than the dialog inline so
+         * --selftest can observe the key without a modal window. */
+        if ((raw == '?' || raw == Qt::Key_F1) && on_about_) {
+            on_about_();
             return;
         }
 
@@ -3149,6 +3287,66 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 44. Preferences round-trip, and a command-line flag wins over a saved
+     * one.  Written to a temporary file so a test run never touches the real
+     * config. */
+    {
+        char  tmpl[] = "/tmp/dytqt-prefs-XXXXXX";
+        char *dir    = mkdtemp(tmpl);
+        std::string path;
+        bool round = false, prec = false, from = false;
+
+        if (dir) {
+            path = std::string(dir) + "/prefs.ini";
+
+            prefs p;
+            p.palette = 4; p.unit = 1; p.zoom = 3; p.fusion = 2;
+            p.capture_dir = "/tmp/elsewhere";
+            prefs_save(path, p);
+
+            prefs q;
+            prefs_load(path, q);
+            round = q.palette == 4 && q.unit == 1 && q.zoom == 3 &&
+                    q.fusion == 2 && q.capture_dir == "/tmp/elsewhere";
+
+            opts eff;                       /* --palette named, --zoom not */
+            eff.palette = 2; eff.palette_set = true;
+            opts_apply_prefs(eff, q);
+            prec = eff.palette == 2 && eff.zoom == 3 &&
+                   eff.capture_dir == "/tmp/elsewhere" &&
+                   eff.unit == 1 && eff.fusion == 2;
+
+            prefs cur = prefs_from_session(sess, ".");
+            from = cur.palette >= 0 && cur.zoom >= 1 &&
+                   !cur.capture_dir.empty();
+
+            remove(path.c_str());
+            rmdir(dir);
+        }
+
+        const bool ok = round && prec && from;
+        std::printf("  %-4s preferences round-trip and the command line wins "
+                    "(round-trip %s, precedence %s, from session %s)\n",
+                    ok ? "ok" : "FAIL", round ? "yes" : "NO",
+                    prec ? "yes" : "NO", from ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 45. The About key routes, and F1 is the same key. */
+    {
+        int about = 0;
+        win.on_about_ = [&]() { about++; };
+        send_char('?');
+        send_key(Qt::Key_F1);
+        const bool ok = about == 2;
+        std::printf("  %-4s the About key routes ('?' and F1, %d)\n",
+                    ok ? "ok" : "FAIL", about);
+        if (!ok)
+            fails++;
+        win.on_about_ = nullptr;
+    }
+
     /* Leave the view model's state as the rest of the run found it. */
     fv->clear_info();
     win.on_quit_  = nullptr;
@@ -3487,8 +3685,56 @@ private:
     bool busy_ = false;   /* written only on the GUI thread */
 };
 
-static int run_gui(const opts &o, QApplication &app)
+/* The About box's text.  Kept here rather than in a resource so it can be
+ * built from the same feature macros the build actually used — an About box
+ * that claims OpenCV in a build without it is worse than none. */
+static std::string about_text()
 {
+    std::string s;
+
+    s += std::string("dytqt ") + kAppVersion +
+         " \xe2\x80\x94 DYT thermal camera\n\n";
+    s += "A Linux port of the Mechanic-Ti / DYT USB thermal camera viewer.\n";
+    s += "Every pixel and every string comes from libdyt, the same engine\n";
+    s += "the OpenCV viewer (tools/dytview) draws with.\n\n";
+    s += "Qt " QT_VERSION_STR " (Widgets)\n";
+    s += "built with:";
+#ifdef DYT_HAVE_LIBUSB
+    s += " libusb";
+#endif
+#ifdef DYT_HAVE_OPENCV
+    s += " OpenCV";
+#endif
+#ifdef DYT_HAVE_MNN
+    s += " MNN";
+#endif
+    s += "\n\nkeys\n";
+    s += "  p l b n       point / line / box / clear\n";
+    s += "  a i           alarm / isotherm\n";
+    s += "  e A R D y     emissivity / ambient / reflected / distance, send\n";
+    s += "  d r           device panel / retry\n";
+    s += "  s v           save a still / record a clip\n";
+    s += "  g o x         gallery: browse / open / export\n";
+    s += "  1-0 , .       palette        u  unit\n";
+    s += "  t             range auto/fixed\n";
+    s += "  h H           flip horizontally / vertically\n";
+    s += "  + -           zoom\n";
+    s += "  f [ ] ; '     fusion pattern, alignment\n";
+    s += "  q             quit\n";
+    return s;
+}
+
+static int run_gui(const opts &o_in, QApplication &app)
+{
+    /* A saved preference fills in only what the command line did not name, so
+     * an explicit flag always wins. */
+    opts o = o_in;
+    if (!o.no_prefs) {
+        prefs p;
+        prefs_load(prefs_path(o_in), p);
+        opts_apply_prefs(o, p);
+    }
+
     dyt_session_t *sess = setup_session(o);
     if (!sess)
         return 1;
@@ -3724,6 +3970,11 @@ static int run_gui(const opts &o, QApplication &app)
         dyt_vm_gallery_load(win.gallery(), o.capture_dir.c_str());
     };
 
+    win.on_about_ = [&]() {
+        QMessageBox::about(&win, QStringLiteral("About dytqt"),
+                           QString::fromStdString(about_text()));
+    };
+
     /* Render a still at the source's own size with the app's palette, into
      * `rgb`.  Returns false and leaves `rgb` empty when it cannot.  Shared by
      * open and export so the two cannot show/export different pixels. */
@@ -3932,6 +4183,12 @@ static int run_gui(const opts &o, QApplication &app)
         }
     }
 
+    /* Save the view state the user ended on, so the next run opens the way
+     * this one closed.  Done before the session is freed, because the state
+     * comes from the session. */
+    if (!o.no_prefs)
+        prefs_save(prefs_path(o), prefs_from_session(sess, o.capture_dir));
+
     dyt_session_free(sess);
     return rc;
 }
@@ -3944,8 +4201,13 @@ int main(int argc, char **argv)
 
     /* The selftest must not need a display, and must not steal one if the
      * user has one.  This has to happen before QApplication exists. */
-    if (o.selftest)
+    if (o.selftest) {
         qputenv("QT_QPA_PLATFORM", "offscreen");
+        /* And it must not read the user's saved view state: a test that
+         * changed its answer depending on what the developer last pressed is
+         * not a test. */
+        o.no_prefs = true;
+    }
 
     QApplication app(argc, argv);
 

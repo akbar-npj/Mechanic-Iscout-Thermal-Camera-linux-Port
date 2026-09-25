@@ -122,6 +122,17 @@ QT6_CFLAGS += -fPIC
 HAVE_QT6   := 1
 endif
 
+# The Qt app's About box names the features the binary was built with, so it
+# needs the same two macros the C objects get.  It links both libraries (libuvc
+# through UVC_LINK, MNN through libdyt), so a box that claimed otherwise would
+# be lying about the binary it is in.
+ifdef HAVE_LIBUSB
+QT_DEFS += -DDYT_HAVE_LIBUSB
+endif
+ifdef HAVE_MNN
+QT_DEFS += -DDYT_HAVE_MNN
+endif
+
 BUILD := build
 
 # ---------------------------------------------------------------------------
@@ -468,7 +479,7 @@ $(BUILD)/dytrec: tools/dytrec.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_sou
 # -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
 # it relatively, whereas gui/dytqt.cpp does not.
 $(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(QT6_LIBS) -o $@
+	$(CXX) $(CXXFLAGS) $(QT_DEFS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(QT6_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.
