@@ -61,9 +61,14 @@
 
 /* ---------------------------------------------------------------- layout */
 
-/* The port's version, shown in the About box.  Not in a header: nothing else
- * reads it, and a second copy would be one to forget. */
-static const char kAppVersion[] = "0.1.0";
+/* The port's version, shown in the About box and named by the package.  The
+ * Makefile passes the version the package is built as (VERSION -> the
+ * -DDYT_VERSION macro), so the About box and the .deb cannot disagree; the
+ * literal below is the fallback for a hand compile without the Makefile. */
+#ifndef DYT_VERSION
+#define DYT_VERSION "0.1.0"
+#endif
+static const char kAppVersion[] = DYT_VERSION;
 
 static const int kBarW   = 22;   /* colour-bar width, px */
 static const int kBarGap = 14;   /* image -> bar gap */
@@ -2041,6 +2046,11 @@ static double retry_delay_s(int attempt)
  * start-up filler), the geometry is the sensor's, all three status lines are
  * populated, and the canvas actually painted more than one colour.
  */
+
+/* Defined with the About action below; the selftest reads it to check the
+ * version it reports. */
+static std::string about_text();
+
 static int selftest(const opts &o)
 {
     int fails = 0;
@@ -3345,6 +3355,20 @@ static int selftest(const opts &o)
         if (!ok)
             fails++;
         win.on_about_ = nullptr;
+    }
+
+    /* 46. The About text names the app and the version the package carries.
+     * kAppVersion is the Makefile's VERSION when built that way, so this is
+     * also what a stale About box would fail. */
+    {
+        const std::string t = about_text();
+        const bool ok = kAppVersion[0] != '\0' &&
+                        t.find("dytqt") != std::string::npos &&
+                        t.find(kAppVersion) != std::string::npos;
+        std::printf("  %-4s the About text names the app and its version "
+                    "(%s)\n", ok ? "ok" : "FAIL", kAppVersion);
+        if (!ok)
+            fails++;
     }
 
     /* Leave the view model's state as the rest of the run found it. */

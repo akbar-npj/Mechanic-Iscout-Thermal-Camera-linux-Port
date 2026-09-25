@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=dytqt
+GenericName=Thermal Camera
+Comment=View and record from a DYT/Mechanic-Ti USB thermal camera
+Exec=dytqt
+Icon=dytqt
+Terminal=false
+Categories=Graphics;Science;
+Keywords=thermal;infrared;camera;thermography;temperature;radiometric;
+StartupNotify=true
+StartupWMClass=dytqt

@@ -589,6 +589,13 @@ DATADIR  = $(PREFIX)/share
 APPDIR   = $(DATADIR)/applications
 ICONDIR  = $(DATADIR)/icons/hicolor
 
+# The vendor palettes ship with the app: the engine falls back to six built-in
+# ramps when it cannot find them, so without this an installed dytqt would
+# silently offer 6 of the 28.  dyt_vm_find_data_dir() looks for them under
+# <datadir>/dytqt/palettes in each $XDG_DATA_DIRS entry, which is this location
+# for both /usr and /usr/local.
+PALETTEDIR = $(DATADIR)/dytqt/palettes
+
 # The hicolor sizes this icon is installed at.  The SVG alone is not enough:
 # several desktops still do not read scalable icons, so the Makefile rasterises
 # it with ImageMagick at install time and ships no PNG in the source tree.
@@ -615,22 +622,25 @@ install: $(BUILD)/dytqt
 	@test -n "$(ICON_TOOL)" || { \
 	    echo "install: ImageMagick (magick or convert) is needed for the icon" >&2; \
 	    exit 1; }
-	install -d $(DESTDIR)$(BINDIR)
-	install -m 0755 $(BUILD)/dytqt $(DESTDIR)$(BINDIR)/dytqt
-	install -d $(DESTDIR)$(APPDIR)
-	install -m 0644 packaging/dytqt.desktop $(DESTDIR)$(APPDIR)/dytqt.desktop
+	install -d "$(DESTDIR)$(BINDIR)"
+	install -m 0755 $(BUILD)/dytqt "$(DESTDIR)$(BINDIR)/dytqt"
+	install -d "$(DESTDIR)$(APPDIR)"
+	install -m 0644 packaging/dytqt.desktop "$(DESTDIR)$(APPDIR)/dytqt.desktop"
+	install -d "$(DESTDIR)$(PALETTEDIR)"
+	install -m 0644 palettes/*.dat "$(DESTDIR)$(PALETTEDIR)/"
 	@for s in $(ICON_SIZES); do \
-	    install -d $(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps; \
+	    install -d "$(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps"; \
 	    $(ICON_TOOL) -background none packaging/dytqt.svg -resize $${s}x$${s} \
-	        $(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png || exit 1; \
+	        "PNG32:$(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png" || exit 1; \
 	done
 	@echo "installed dytqt $(VERSION) to $(DESTDIR)$(PREFIX)"
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/dytqt
-	rm -f $(DESTDIR)$(APPDIR)/dytqt.desktop
+	rm -f "$(DESTDIR)$(BINDIR)/dytqt"
+	rm -f "$(DESTDIR)$(APPDIR)/dytqt.desktop"
+	rm -rf "$(DESTDIR)$(PALETTEDIR)"
 	@for s in $(ICON_SIZES); do \
-	    rm -f $(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png; \
+	    rm -f "$(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png"; \
 	done
 	@echo "removed dytqt from $(DESTDIR)$(PREFIX)"
 
@@ -639,7 +649,10 @@ deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
 	    echo "deb: dpkg-deb is required (install dpkg)" >&2; exit 1; }
 	rm -rf $(DEB_ROOT)
 	install -d $(DEB_ROOT)/DEBIAN
-	$(MAKE) install DESTDIR=$(abspath $(DEB_ROOT)) PREFIX=/usr BUILD=$(BUILD)
+# DESTDIR stays relative: this tree's path contains a space ("Thermal Camera"),
+# and an absolute DESTDIR would be split by the sub-make.  The recipes quote
+# their paths, but the make variable itself must not carry the space.
+	$(MAKE) install DESTDIR=$(DEB_ROOT) PREFIX=/usr BUILD=$(BUILD)
 	@dep="$(DEB_DEPENDS)"; \
 	if command -v dpkg-shlibdeps >/dev/null 2>&1; then \
 	    if d=$$(dpkg-shlibdeps -O $(BUILD)/dytqt 2>/dev/null \
@@ -661,6 +674,10 @@ deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
 	install -d $(DEB_ROOT)/usr/share/doc/$(DEB_NAME)
 	install -m 0644 packaging/deb/copyright \
 	    $(DEB_ROOT)/usr/share/doc/$(DEB_NAME)/copyright
+# The staged copy is stripped (the build tree keeps its symbols, so a local
+# `make install` stays debuggable); this is a 10x size difference.
+	@command -v strip >/dev/null 2>&1 && \
+	    strip $(DEB_ROOT)/usr/bin/dytqt || true
 	dpkg-deb --root-owner-group --build $(DEB_ROOT) $(DEB_FILE)
 	@echo "built $(DEB_FILE)"
 	@dpkg-deb --info $(DEB_FILE)

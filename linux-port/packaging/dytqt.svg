@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  dytqt icon — the source of truth for the raster sizes the Makefile installs.
+
+  A camera body with a thermal lens: the lens gradient runs from white-hot
+  through orange to a dark rim, the way the app's palettes render a hot spot.
+  Drawn with plain shapes and one radial gradient so ImageMagick can rasterise
+  it without librsvg (this host has no rsvg-convert).
+
+  The dark rounded square is full-bleed and the body is inset, so the icon
+  still reads at 16x16 where the lens is a single warm pixel cluster.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="lens" cx="50%" cy="45%" r="60%">
+      <stop offset="0%" stop-color="#fff7c2"/>
+      <stop offset="45%" stop-color="#ffb020"/>
+      <stop offset="80%" stop-color="#c33a00"/>
+      <stop offset="100%" stop-color="#3a0d00"/>
+    </radialGradient>
+  </defs>
+  <rect width="256" height="256" rx="40" fill="#1b2733"/>
+  <rect x="150" y="52" width="52" height="34" rx="10" fill="#33475b"/>
+  <rect x="30" y="70" width="196" height="140" rx="22" fill="#33475b"/>
+  <circle cx="128" cy="140" r="56" fill="url(#lens)" stroke="#0d141b" stroke-width="8"/>
+</svg>
