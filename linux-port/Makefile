@@ -219,7 +219,8 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/alarm.o $(BUILD)/session.o $(BUILD)/params.o \
             $(BUILD)/visible.o $(BUILD)/fusion.o $(BUILD)/session_capture.o \
             $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
-            $(BUILD)/mnn.o $(BUILD)/view_model.o $(BUILD)/frame_ready.o
+            $(BUILD)/mnn.o $(BUILD)/sr.o $(BUILD)/view_model.o \
+            $(BUILD)/frame_ready.o
 
 # The MNN runtime object belongs *in* the archive, beside mnn.o.  mnn.o is a
 # member of libdyt.a and, when a runtime is present, references
@@ -239,7 +240,7 @@ TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/alarm_test $(BUILD)/session_test $(BUILD)/params_test \
          $(BUILD)/visible_test $(BUILD)/fusion_test $(BUILD)/jpeg_test \
          $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test \
-         $(BUILD)/view_model_test $(BUILD)/frame_ready_test \
+         $(BUILD)/sr_test $(BUILD)/view_model_test $(BUILD)/frame_ready_test \
          $(BUILD)/poll_model_test
 TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
 # capture_demo and probe talk to the device directly through libusb — only
@@ -446,6 +447,14 @@ $(BUILD)/mnn_test.o: src/mnn_test.c $(HDRS) $(LIB) | $(BUILD)
 $(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) | $(BUILD)
 	$(CXX) $(BUILD)/mnn_test.o $(LIB) $(LDLIBS) $(MNN_LIBS) -o $@
 
+# sr_test covers the super-resolution *policy* — which 8 bits each mode feeds
+# the model, that the thermal mode's grey is the palette's own normalisation,
+# the model's byte packing, and the nearest-2x of the channel the model did not
+# upscale.  All pure: no model, no runtime, no device.  The model call itself
+# is mnn_test's job.
+$(BUILD)/sr_test: src/sr_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 $(BUILD)/dumpframe: src/dumpframe.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
@@ -538,6 +547,7 @@ check: all
 	@$(BUILD)/dytjpeg_test testdata/mode1000_256x384_default.raw
 	@$(BUILD)/imgwrite_test
 	@$(BUILD)/mnn_test models/zoom2.mnn tools/mnn_diff/out
+	@$(BUILD)/sr_test
 ifdef HAVE_LIBUSB
 	@echo "== probe safety self-test =="
 	@$(BUILD)/probe --selftest
