@@ -34,9 +34,11 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "capture.h"
 #include "frame_source.h"
 #include "palette.h"
 #include "session.h"
+#include "session_capture.h"
 #include "view_model.h"
 
 /* ---------------------------------------------------------------- layout */
@@ -52,6 +54,10 @@ static const int kStripPad = 4;  /* the strip's own margin */
 /* ---------------------------------------------------------------- options */
 
 struct opts {
+    /* Defaulted here rather than in main() so no caller can forget: parse_args
+     * fills cap from the command line, and the selftest constructs bare opts. */
+    opts() { dyt_capture_opts_default(&cap); }
+
     std::string fixture = "testdata/mode1000_256x384_default.raw";
     std::string palette_dir;
     std::string png;                 /* save the canvas here, then exit */
@@ -61,21 +67,53 @@ struct opts {
     int  frames  = 0;                /* 0 = run until closed */
     int  fps     = 25;
     bool selftest = false;
+
+    bool live        = false;        /* stream from the device, not a fixture */
+    bool fixture_set = false;        /* --fixture was given explicitly */
+    dyt_capture_opts cap;            /* the live path's capture settings */
 };
+
+/* Why this combination of options is unusable, or NULL when it is fine.
+ *
+ * Split out of parse_args so the rule can be asserted on without the usage text
+ * landing in `make check`.  Refusing beats resolving: silently letting --live
+ * win, or silently ignoring it, would each leave the user with a window that is
+ * not showing what they asked for. */
+static const char *opts_conflict(const opts &o)
+{
+    if (!o.live)
+        return nullptr;
+    if (o.fixture_set)
+        return "--live and --fixture ask for two different sources";
+    if (o.selftest)
+        return "--live and --selftest ask for two different sources";
+    return nullptr;
+}
 
 static void usage(const char *prog)
 {
     std::fprintf(stderr,
         "usage: %s [options]\n"
         "  --fixture PATH   raw payload to replay (default %s)\n"
-        "  --width N        sensor width of the fixture (default 256)\n"
+        "  --width N        sensor width of the fixture (default 256); with\n"
+        "                   --live, the capture width override instead\n"
         "  --palette N      1-based palette index (default 1)\n"
         "  --palette-dir D  where the *.dat ramps live (default: search)\n"
         "  --zoom N         window magnification (default 2)\n"
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
         "  --png PATH       write the canvas here and exit\n"
-        "  --selftest       headless check over the fixture; needs no display\n",
+        "  --selftest       headless check over the fixture; needs no display\n"
+        "\n"
+        "live capture (replaces the fixture):\n"
+        "  --live           stream from the camera instead of replaying a file\n"
+        "  --vid V --pid P  USB ids (0x0000 0x0000 = first matching device)\n"
+        "  --format-index N UVC bFormatIndex (0 = auto, uncompressed 16-bpp)\n"
+        "  --height N       capture height (0 = auto)\n"
+        "  --t-amb C        LUT ambient for the live path (default 25.0)\n"
+        "  --ad-output      send setTinyCOutputADValue and read the flat\n"
+        "                   256x192 raw-AD frame; default is the device's own\n"
+        "                   256x384 dual-half frame, which needs no order\n",
         prog, opts{}.fixture.c_str());
 }
 
@@ -93,10 +131,20 @@ static bool parse_args(int argc, char **argv, opts &o)
 
         if (a == "--help" || a == "-h")            { usage(argv[0]); return false; }
         else if (a == "--selftest")                o.selftest = true;
-        else if (a == "--fixture")                 { const char *v = next("--fixture"); if (!v) return false; o.fixture = v; }
+        else if (a == "--live")                    o.live = true;
+        else if (a == "--ad-output")               o.cap.output = DYT_OUTPUT_AD;
+        else if (a == "--fixture")                 { const char *v = next("--fixture"); if (!v) return false; o.fixture = v; o.fixture_set = true; }
         else if (a == "--palette-dir")             { const char *v = next("--palette-dir"); if (!v) return false; o.palette_dir = v; }
         else if (a == "--png")                     { const char *v = next("--png"); if (!v) return false; o.png = v; }
-        else if (a == "--width")                   { const char *v = next("--width"); if (!v) return false; o.width = std::atoi(v); }
+        /* --width is the sensor width in both modes: the fixture's, and the
+         * capture width override when live.  One flag, because a user who says
+         * "the sensor is 384 wide" means it whichever source they picked. */
+        else if (a == "--width")                   { const char *v = next("--width"); if (!v) return false; o.width = std::atoi(v); o.cap.width = o.width; }
+        else if (a == "--height")                  { const char *v = next("--height"); if (!v) return false; o.cap.height = std::atoi(v); }
+        else if (a == "--t-amb")                   { const char *v = next("--t-amb"); if (!v) return false; o.cap.t_amb = std::strtof(v, nullptr); }
+        else if (a == "--format-index")            { const char *v = next("--format-index"); if (!v) return false; o.cap.format_index = std::atoi(v); }
+        else if (a == "--vid")                     { const char *v = next("--vid"); if (!v) return false; o.cap.vid = (uint16_t)std::strtoul(v, nullptr, 0); }
+        else if (a == "--pid")                     { const char *v = next("--pid"); if (!v) return false; o.cap.pid = (uint16_t)std::strtoul(v, nullptr, 0); }
         else if (a == "--palette")                 { const char *v = next("--palette"); if (!v) return false; o.palette = std::atoi(v); }
         else if (a == "--zoom")                    { const char *v = next("--zoom"); if (!v) return false; o.zoom = std::atoi(v); }
         else if (a == "--frames")                  { const char *v = next("--frames"); if (!v) return false; o.frames = std::atoi(v); }
@@ -109,6 +157,10 @@ static bool parse_args(int argc, char **argv, opts &o)
     }
     if (o.width <= 0 || o.fps <= 0) {
         std::fprintf(stderr, "dytqt: --width and --fps must be positive\n");
+        return false;
+    }
+    if (const char *why = opts_conflict(o)) {
+        std::fprintf(stderr, "dytqt: %s\n", why);
         return false;
     }
     return true;
@@ -576,6 +628,19 @@ struct pump {
 
         ticks++;
 
+        if (!fs) {
+            /* Bring-up failed, so there is no source to pull from — but the
+             * window must still say so rather than sit blank.  This is the
+             * NoDevice path, and the reason a failed bring-up does not exit. */
+            dyt_snapshot_t snap{};
+            const bool have = dyt_session_snapshot(sess, &snap, nullptr, 0) == 0;
+            const DevState ds = device_state(live, bringup_done, bringup_rc, have,
+                                             have && snap.ready != 0);
+            win->view()->set_placeholder(QString::fromUtf8(state_placeholder(ds)));
+            win->set_state_line(ds, snap, fps.fps());
+            return true;
+        }
+
         const dyt_fs_status_t st = dyt_frame_source_next(fs, &rgb, &w, &h);
         if (st == DYT_FS_END)
             return false;                 /* the fixture's budget is spent */
@@ -644,7 +709,8 @@ static int selftest(const opts &o)
 
     dyt_frame_source_t *fs = dyt_frame_source_open_fixture(
         sess, o.fixture.c_str(), o.width, DYT_MODE_1000,
-        DYT_PLANE_BOTTOM_HALF, 25.0f, 0x82, 0, 0);
+        DYT_PLANE_BOTTOM_HALF, o.cap.t_amb, o.cap.sensor_mode,
+        o.cap.fix_mode, 0);
     if (!fs) {
         dyt_session_free(sess);
         return 1;
@@ -655,6 +721,7 @@ static int selftest(const opts &o)
     pm.fs   = fs;
     pm.sess = sess;
     pm.win  = &win;
+    pm.mode = DYT_MODE_1000;
     if (dyt_session_get_palette(sess, o.palette - 1, &pm.pal) != 0) {
         dyt_frame_source_close(fs);
         dyt_session_free(sess);
@@ -956,6 +1023,50 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 17. --live contradicts the fixture-only options, and the contradiction is
+     * refused rather than silently resolved one way.  Checked through the pure
+     * rule rather than parse_args, so the usage text it prints does not land in
+     * the middle of `make check`. */
+    {
+        opts a;  a.live = true; a.fixture_set = true;
+        opts b;  b.live = true; b.selftest    = true;
+        opts c;  c.live = true;
+        opts d;                              /* the fixture path, as shipped */
+        const bool ok = opts_conflict(a) != nullptr &&
+                        opts_conflict(b) != nullptr &&
+                        opts_conflict(c) == nullptr &&
+                        opts_conflict(d) == nullptr;
+        std::printf("  %-4s --live contradicts --fixture/--selftest, and is "
+                    "refused\n", ok ? "ok" : "FAIL");
+        if (!ok)
+            fails++;
+    }
+
+    /* 18. The capture options reach the struct the capture layer reads.  No
+     * device is touched: this only proves the flags are wired to the right
+     * fields, which is exactly the kind of thing that silently does nothing. */
+    {
+        opts t;
+        const char *av[] = { "dytqt", "--live", "--vid", "0x1234",
+                             "--pid", "0x5678", "--format-index", "3",
+                             "--height", "256", "--t-amb", "21.5",
+                             "--ad-output" };
+        const bool ok = parse_args(13, const_cast<char **>(av), t) &&
+                        t.live &&
+                        t.cap.vid == 0x1234 && t.cap.pid == 0x5678 &&
+                        t.cap.format_index == 3 && t.cap.height == 256 &&
+                        t.cap.t_amb == 21.5f &&
+                        t.cap.output == DYT_OUTPUT_AD;
+        std::printf("  %-4s the capture options reach dyt_capture_opts "
+                    "(%04x:%04x, fmt %d, h %d, t_amb %.1f, %s)\n",
+                    ok ? "ok" : "FAIL", (unsigned)t.cap.vid,
+                    (unsigned)t.cap.pid, t.cap.format_index, t.cap.height,
+                    (double)t.cap.t_amb,
+                    t.cap.output == DYT_OUTPUT_AD ? "AD" : "dual-half");
+        if (!ok)
+            fails++;
+    }
+
     dyt_frame_source_close(fs);
     dyt_session_free(sess);
 
@@ -965,33 +1076,124 @@ static int selftest(const opts &o)
 
 /* ------------------------------------------------------------------- main */
 
+/* ---------------------------------------------------------- live bring-up */
+
+/* Everything the live path owns, so teardown can unwind exactly what was
+ * created and nothing else.  `rc` is 0 only when the whole sequence succeeded;
+ * `fs` is NULL until then, which is what the pump keys NoDevice off. */
+struct live {
+    dyt_capture_t         *cap  = nullptr;
+    dyt_session_capture_t *sc   = nullptr;
+    dyt_frame_source_t    *fs   = nullptr;
+    int                    rc   = -1;
+    dyt_mode_t             mode = DYT_MODE_1000;
+};
+
+/* Bring the device up, or fail leaving `L` in a state tear_down_live() can
+ * still unwind.  The order is load-bearing, from the canonical sequence in
+ * session_capture.h:21-27:
+ *
+ *   - dyt_session_capture_set_capture() must precede dyt_capture_start(),
+ *     because the adapter reads its capture handle on every frame;
+ *   - dyt_capture_read_info() must run after open() and *before* start(),
+ *     because the identity reads only answer cleanly while the device is idle
+ *     (measured 2026-09-25);
+ *   - the frame source is opened last, since it only renders what the adapter
+ *     has already installed.
+ *
+ * Every failure prints its own reason to stderr — the capture layer has no
+ * message string to retrieve — so the window only has to show NO DEVICE.
+ *
+ * Known limit: dyt_capture_open() has no timeout (every libuvc control
+ * transfer in it passes timeout 0, which libusb reads as "wait forever"), so a
+ * wedged device hangs this call and with it the GUI thread.  The worker thread
+ * that fixes it is task #87; see gui/README.md. */
+static int bring_up_live(const opts &o, dyt_session_t *sess, live &L)
+{
+    if (dyt_capture_open(&L.cap, &o.cap) != 0)
+        return -1;
+
+    L.mode = dyt_capture_mode(L.cap);
+
+    L.sc = dyt_session_capture_create(sess);
+    if (!L.sc || dyt_session_capture_set_capture(L.sc, L.cap) != 0) {
+        std::fprintf(stderr, "dytqt: out of memory\n");
+        return -1;
+    }
+
+    dyt_device_info_t info;
+    if (dyt_capture_read_info(L.cap, &info) == 0 && info.have_sn)
+        std::fprintf(stderr, "dytqt: serial %s\n", info.sn_str);
+
+    if (dyt_capture_start(L.cap, dyt_session_capture_on_frame, L.sc) != 0)
+        return -1;
+
+    L.fs = dyt_frame_source_open_live(sess);
+    if (!L.fs) {
+        std::fprintf(stderr, "dytqt: out of memory\n");
+        return -1;
+    }
+
+    L.rc = 0;
+    return 0;
+}
+
+/* Unwind in reverse.  dyt_capture_stop() comes first because it joins libuvc's
+ * callback thread, and that thread is writing into the session through the
+ * adapter — freeing either before it stops is a use-after-free.  Everything
+ * here is NULL-safe and idempotent, so it is also the failure path. */
+static void tear_down_live(live &L)
+{
+    if (L.cap) dyt_capture_stop(L.cap);
+    if (L.fs)  dyt_frame_source_close(L.fs);
+    if (L.cap) dyt_capture_close(L.cap);
+    if (L.sc)  dyt_session_capture_free(L.sc);
+    L = live{};
+}
+
 static int run_gui(const opts &o, QApplication &app)
 {
     dyt_session_t *sess = setup_session(o);
     if (!sess)
         return 1;
 
-    dyt_frame_source_t *fs = dyt_frame_source_open_fixture(
-        sess, o.fixture.c_str(), o.width, DYT_MODE_1000,
-        DYT_PLANE_BOTTOM_HALF, 25.0f, 0x82, 0, 0);
-    if (!fs) {
-        dyt_session_free(sess);
-        return 1;
-    }
-
     MainWindow win;
     pump       pm;
-    pm.fs   = fs;
     pm.sess = sess;
     pm.win  = &win;
+    pm.live = o.live;
     if (dyt_session_get_palette(sess, o.palette - 1, &pm.pal) != 0) {
-        dyt_frame_source_close(fs);
         dyt_session_free(sess);
         return 1;
     }
 
+    /* Paint before bring-up.  dyt_capture_open() and the first
+     * dyt_capture_start() can each take seconds — and in AD mode start() blocks
+     * ~3 s + 200 ms by design (capture.c:600-615) — so an unpainted window for
+     * that long looks like a hang.  Same reasoning as dytview.cpp:977-979. */
     win.fit_to_view();
     win.show();
+    QApplication::processEvents();
+
+    live L;
+    if (!o.live) {
+        pm.fs = dyt_frame_source_open_fixture(
+            sess, o.fixture.c_str(), o.width, DYT_MODE_1000,
+            DYT_PLANE_BOTTOM_HALF, o.cap.t_amb, o.cap.sensor_mode,
+            o.cap.fix_mode, 0);
+        if (!pm.fs) {
+            dyt_session_free(sess);
+            return 1;
+        }
+    } else {
+        L.rc = bring_up_live(o, sess, L) == 0 ? 0 : -1;
+        pm.bringup_rc   = L.rc;
+        pm.fs           = L.fs;      /* NULL when bring-up failed */
+        pm.mode         = L.mode;
+        if (L.rc != 0)
+            std::fprintf(stderr, "dytqt: no camera; the window will say so\n");
+    }
+    pm.bringup_done = true;
 
     QTimer timer;
     QObject::connect(&timer, &QTimer::timeout, [&]() {
@@ -1014,14 +1216,22 @@ static int run_gui(const opts &o, QApplication &app)
     const int rc = app.exec();
 
     if (!o.png.empty()) {
-        const QPixmap grab = win.grab();
-        if (grab.save(QString::fromUtf8(o.png.c_str())))
-            std::printf("dytqt: canvas written to %s\n", o.png.c_str());
-        else
-            std::fprintf(stderr, "dytqt: could not write %s\n", o.png.c_str());
+        /* Only meaningful once something has been painted.  A live source that
+         * never produced a real frame would otherwise write the placeholder —
+         * and a properly settled live still belongs with the capture task
+         * (#90), not here. */
+        if (pm.frames == 0) {
+            std::fprintf(stderr, "dytqt: no frame painted; nothing written\n");
+        } else {
+            const QPixmap grab = win.grab();
+            if (grab.save(QString::fromUtf8(o.png.c_str())))
+                std::printf("dytqt: canvas written to %s\n", o.png.c_str());
+            else
+                std::fprintf(stderr, "dytqt: could not write %s\n", o.png.c_str());
+        }
     }
 
-    dyt_frame_source_close(fs);
+    tear_down_live(L);
     dyt_session_free(sess);
     return rc;
 }

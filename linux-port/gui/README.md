@@ -183,12 +183,14 @@ position-independent.
 ./build/dytqt --selftest               # headless check, needs no display
 ./build/dytqt --palette 5 --zoom 3
 ./build/dytqt --png /tmp/canvas.png    # save the window and exit
+./build/dytqt --live                   # stream from the camera
+./build/dytqt --live --vid 0x0bda --pid 0x5840
 ```
 
 | option | meaning |
 |---|---|
 | `--fixture PATH` | raw payload to replay (default `testdata/mode1000_256x384_default.raw`) |
-| `--width N` | sensor width of the fixture (default 256) |
+| `--width N` | sensor width of the fixture (default 256); with `--live`, the capture width override instead |
 | `--palette N` | 1-based palette index (default 1) |
 | `--palette-dir D` | where the `*.dat` ramps live (default: search) |
 | `--zoom N` | window magnification (default 2) |
@@ -196,6 +198,23 @@ position-independent.
 | `--fps N` | timer rate (default 25) |
 | `--png PATH` | write the canvas here and exit |
 | `--selftest` | headless check over the fixture; needs no display |
+| `--live` | stream from the camera instead of replaying a fixture |
+| `--vid V --pid P` | USB vendor/product id (`0x0000 0x0000` = first matching device) |
+| `--format-index N` | UVC bFormatIndex (0 = auto, uncompressed 16-bpp) |
+| `--height N` | capture height (0 = auto) |
+| `--t-amb C` | LUT ambient for the live path (default 25.0) |
+| `--ad-output` | read the flat 256×192 raw-AD frame; default is the device's own 256×384 dual-half frame |
+
+`--live` contradicts `--fixture` and `--selftest` — they ask for two different
+sources — and the contradiction is refused rather than silently resolved one way.
+`--width` is the one flag that means the same thing in both modes: the sensor's
+width, whether that width comes from a file or the camera.
+
+The default live path is the device's own **dual-half** frame (256×384, payload
+order unneeded), which is the same default `dytview` and `dytrec` ship. `--ad-output`
+switches to the raw-AD frame (256×192) by sending `setTinyCOutputADValue` and
+reading the flat plane; it is the path the vendor's AD-mode tools use, and is
+only there because the port's super-resolution model was recovered against it.
 
 `--selftest` runs the same code path the window does, under the offscreen
 platform plugin, and asserts on the result rather than leaving a human to look
@@ -223,6 +242,8 @@ $ ./build/dytqt --selftest
   ok   a failed bring-up is a state, not a crash (NO DEVICE)
   ok   zoom 2 is applied to the frame (512x384, hint 660x400)
   ok   the mirror is applied (zoom 2, flip_h, 6x2, ends #0000ff/#ff0000)
+  ok   --live contradicts --fixture/--selftest, and is refused
+  ok   the capture options reach dyt_capture_opts (1234:5678, fmt 3, h 256, t_amb 21.5, AD)
 === ALL PASS ===
 ```
 
@@ -240,6 +261,12 @@ The `766.5 fps` on line 3 is not a bug — `--selftest` paces nothing, so it run
 the 25 frames as fast as it can. Assertion 9 checks the *label* there and
 assertion 12 pins the arithmetic instead.
 
+Assertions 17 and 18 cover the live path without a camera: 17 checks that
+`--live` is refused when it contradicts the fixture-only flags, and 18 checks
+that the capture options actually land in `dyt_capture_opts` — the kind of wiring
+that otherwise silently does nothing. Both are driven through the pure rule and
+`parse_args`, so no usage text is printed into `make check`'s output.
+
 ## Where the frames come from, and on which thread
 
 Both the window and `--selftest` replay a frozen fixture through
@@ -248,22 +275,48 @@ Both the window and `--selftest` replay a frozen fixture through
 exactly as the live capture adapter does. So the app needs no camera to be
 built, run or tested.
 
-The device path needs **no queued signal**, which is worth recording because the
-spike's NOTE assumed otherwise. A live frame is installed by the adapter
-(`src/session_capture.c`) on libuvc's callback thread, and the pump only ever
-*reads* the session through its own lock (`dyt_session_snapshot`, via
-`dyt_vm_grab`). The widget tree is therefore only ever touched on the GUI thread,
-and the poll model stated in `session.h` already covers the hand-off.
+`--live` swaps the fixture source for `dyt_frame_source_open_live()`, which
+pulls from the session the adapter (`src/session_capture.c`) installs frames
+into on libuvc's callback thread. The pump only ever *reads* the session through
+its own lock (`dyt_session_snapshot`, via `dyt_vm_grab`), so the widget tree is
+only ever touched on the GUI thread — which is why the device path needs **no
+queued signal**, a point worth recording because the spike's NOTE assumed
+otherwise. The poll model stated in `session.h` already covers the hand-off.
 `src/frame_ready.c` exists to *wake* a poller on demand instead of polling on a
 timer; it is an optimisation, not a correctness requirement, and is not wired in
 yet.
 
+## Bring-up and teardown
+
+The live path is a single bring-up function that either succeeds completely or
+leaves the state machine in `NO DEVICE`. The ordering is load-bearing, from the
+canonical sequence in `session_capture.h:21-27`:
+
+1. `dyt_capture_open()` — finds and claims the device.
+2. `dyt_session_capture_set_capture()` — **before** `start()`, because the
+   adapter reads its capture handle on every frame.
+3. `dyt_capture_read_info()` — **after** open, **before** start; the identity
+   reads (serial, etc.) only answer cleanly while the device is idle (measured
+   2026-09-25).
+4. `dyt_capture_start()` — registers the frame callback and begins streaming.
+5. `dyt_frame_source_open_live()` — last; it only renders what the adapter has
+   already installed.
+
+Teardown is the exact reverse, and is also the failure path: `dyt_capture_stop()`
+comes first because it joins libuvc's callback thread, and that thread is writing
+into the session through the adapter — freeing either the adapter or the capture
+before it stops is a use-after-free. Everything in `tear_down_live()` is
+NULL-safe and idempotent, so it unwinds exactly what was created and nothing
+else, whether bring-up succeeded at step 5 or failed at step 1.
+
+The window is painted before bring-up: `dyt_capture_open()` and the first
+`dyt_capture_start()` can each take seconds — and in AD mode `start()` blocks
+~3 s + 200 ms by design (`capture.c:600-615`) — so an unpainted window for that
+long looks like a hang. The forced paint covers the ordinary slow-open case;
+the wedged-device case is the known limit below.
+
 ## What is *not* established
 
-* **The device path.** `dytqt` is fixture-only so far: `--live`, the capture
-  options, bring-up and teardown are the second half of task #86.
-  `dyt_frame_source_open_live()` is the intended entry point, and the state
-  machine it feeds is already written and pinned.
 * **`dyt_capture_open()` has no timeout.** Every libuvc control transfer in it
   passes timeout `0`, which libusb reads as *wait indefinitely*, so a wedged
   device can hang the GUI thread with no way out — the window would freeze and a
