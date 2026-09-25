@@ -28,6 +28,10 @@ LDLIBS := -lm -lpthread
 # .deb cannot disagree.  See the packaging section at the end of this file.
 VERSION ?= 0.1.0
 
+# The build directory.  Defined here, before the feature-detection blocks, so
+# their rules (the build-tree libMNN.so symlink) can name a path under it.
+BUILD := build
+
 # libusb-1.0 enables the real control-transfer backend and the probe tool.
 USB_CFLAGS := $(shell pkg-config --cflags libusb-1.0 2>/dev/null)
 USB_LIBS   := $(shell pkg-config --libs   libusb-1.0 2>/dev/null)
@@ -96,11 +100,28 @@ ifneq ($(wildcard $(MNN_ROOT)/include/MNN/Interpreter.hpp),)
 ifneq ($(wildcard $(MNN_ROOT)/lib/libMNN.so),)
 CFLAGS   += -DDYT_HAVE_MNN
 MNN_CFLAGS := -I$(MNN_ROOT)/include
-# The rpath is quoted because this tree's own path contains a space
-# ("Thermal Camera"); unquoted, the shell hands the linker two arguments.
-MNN_LIBS   := -L$(MNN_ROOT)/lib -lMNN -Wl,-rpath,'$(abspath $(MNN_ROOT)/lib)'
+# Where libMNN.so is looked for at run time, relative to the binary — never an
+# absolute path into the machine that built it, because `make deb` would ship
+# that path (lintian's binary-or-shlib-defines-rpath).  Two entries cover both
+# layouts: beside a build-tree binary, and one directory up and over from an
+# installed one ($(BINDIR) -> $(LIBDIR)/dytqt, both under $(PREFIX)).  The
+# quoted form is required — the tree's own path contains a space, and unquoted
+# the shell would hand the linker two arguments.
+#
+# $$ORIGIN is make-escaped: one `$` survives to the recipe and the shell's
+# single quotes leave it for the linker.
+MNN_RPATH  := -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../lib/dytqt'
+MNN_LIBS   := -L$(MNN_ROOT)/lib -lMNN $(MNN_RPATH)
 HAVE_MNN   := 1
 endif
+endif
+
+# The build-tree libMNN.so the $ORIGIN rpath resolves to, as a prerequisite of
+# the two binaries that link the runtime.  Empty without MNN, so those rules do
+# not depend on a target that has no rule.
+MNN_DEP :=
+ifdef HAVE_MNN
+MNN_DEP := $(BUILD)/libMNN.so
 endif
 
 # ---------------------------------------------------------------------------
@@ -142,8 +163,6 @@ endif
 # built as.  The single quotes survive make and the shell and leave the double
 # quotes for the compiler, so the macro is the string "0.1.0" and not a number.
 QT_DEFS += -DDYT_VERSION='"$(VERSION)"'
-
-BUILD := build
 
 # ---------------------------------------------------------------------------
 # libuvc — vendored upstream, pinned to tag v0.0.8
@@ -442,12 +461,20 @@ $(BUILD)/imgwrite_test: src/imgwrite_test.c $(LIB) | $(BUILD)
 ifdef HAVE_MNN
 $(BUILD)/mnn_runtime.o: src/mnn_runtime.cpp $(HDRS) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(MNN_CFLAGS) -c $< -o $@
+
+# The build-tree half of the $ORIGIN rpath: the loader expands $ORIGIN to the
+# binary's own directory, so libMNN.so has to be *there* for a build-tree run to
+# start at all.  A symlink rather than a copy keeps the 3.3 MB library out of
+# the build tree and means rebuilding MNN does not need a re-copy.  The path is
+# quoted for the same reason the rpath is — the tree's path has a space.
+$(BUILD)/libMNN.so: $(MNN_ROOT)/lib/libMNN.so | $(BUILD)
+	ln -sf "$(abspath $(MNN_ROOT)/lib/libMNN.so)" $@
 endif
 
 $(BUILD)/mnn_test.o: src/mnn_test.c $(HDRS) $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) | $(BUILD)
+$(BUILD)/mnn_test: $(BUILD)/mnn_test.o $(LIB) $(MNN_DEP) | $(BUILD)
 	$(CXX) $(BUILD)/mnn_test.o $(LIB) $(LDLIBS) $(MNN_LIBS) -o $@
 
 # sr_test covers the super-resolution *policy* — which 8 bits each mode feeds
@@ -513,7 +540,7 @@ $(BUILD)/dytrec: tools/dytrec.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_sou
 #
 # -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
 # it relatively, whereas gui/dytqt.cpp does not.
-$(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
+$(BUILD)/dytqt: gui/dytqt.cpp tools/recorder.h $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(MNN_DEP) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(QT_DEFS) $(QT6_CFLAGS) -Itools $< $(REC_OBJ) $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) $(MNN_LIBS) $(QT6_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
@@ -600,6 +627,7 @@ clean:
 PREFIX  ?= /usr/local
 DESTDIR ?=
 BINDIR   = $(PREFIX)/bin
+LIBDIR   = $(PREFIX)/lib
 DATADIR  = $(PREFIX)/share
 APPDIR   = $(DATADIR)/applications
 ICONDIR  = $(DATADIR)/icons/hicolor
@@ -610,6 +638,21 @@ ICONDIR  = $(DATADIR)/icons/hicolor
 # <datadir>/dytqt/palettes in each $XDG_DATA_DIRS entry, which is this location
 # for both /usr and /usr/local.
 PALETTEDIR = $(DATADIR)/dytqt/palettes
+
+# The super-resolution model, found by dyt_vm_find_model() under
+# <datadir>/dytqt/models — the same search the palettes use, and the same
+# location for both prefixes.  It is inert without a runtime (dyt_mnn_load
+# refuses), but it is 13 KB and shipping it means a build that gains MNN needs
+# no second install step.
+MODELDIR = $(DATADIR)/dytqt/models
+
+# The shipped MNN runtime.  It goes one directory *up* from $(BINDIR) and into
+# its own subdirectory rather than $(LIBDIR) itself, because it is a private
+# dependency of this app and not something another program should pick up by
+# accident.  That relative layout is what the binary's
+# -rpath '$ORIGIN/../lib/dytqt' expects (see MNN_RPATH); the two are a pair and
+# must not be changed one without the other.
+MNNDIR = $(LIBDIR)/dytqt
 
 # The hicolor sizes this icon is installed at.  The SVG alone is not enough:
 # several desktops still do not read scalable icons, so the Makefile rasterises
@@ -625,6 +668,14 @@ DEB_MAINTAINER ?= dytqt port <noreply@example.invalid>
 # The OpenCV runtime packages carry the upstream soname (libopencv-core406 on
 # Debian bookworm, ...410 on trixie), so this default names one release; set
 # DEB_DEPENDS for your target.  The Qt6 and libusb names are unversioned.
+#
+# libMNN is deliberately absent, and needs no entry: it ships *inside* this
+# package (at $(MNNDIR)) and its own NEEDED entries are libstdc++/libm/
+# libgcc_s/libc, which are already here.  dpkg-shlibdeps cannot know that — it
+# resolves the soname against the installed package database and finds nothing —
+# so the measurement runs with --ignore-missing-info and simply omits it.  The
+# alternative, a fabricated shlibs file for libMNN, would be a lie about a
+# library no Debian package provides.
 DEB_DEPENDS ?= libc6, libstdc++6, libgcc-s1, libusb-1.0-0, \
 	libopencv-core406, libopencv-imgproc406, libopencv-highgui406, \
 	libopencv-videoio406, libopencv-imgcodecs406, \
@@ -643,6 +694,18 @@ install: $(BUILD)/dytqt
 	install -m 0644 packaging/dytqt.desktop "$(DESTDIR)$(APPDIR)/dytqt.desktop"
 	install -d "$(DESTDIR)$(PALETTEDIR)"
 	install -m 0644 palettes/*.dat "$(DESTDIR)$(PALETTEDIR)/"
+	install -d "$(DESTDIR)$(MODELDIR)"
+	install -m 0644 models/zoom2.mnn "$(DESTDIR)$(MODELDIR)/zoom2.mnn"
+# The runtime is shipped only when the binary was built against one: without it
+# the binary has no libMNN.so NEEDED entry, so a copy would be dead weight and
+# the note below says why it is absent.  install(1) rather than a symlink,
+# because the .deb must carry the library itself.
+ifdef HAVE_MNN
+	install -d "$(DESTDIR)$(MNNDIR)"
+	install -m 0755 "$(MNN_ROOT)/lib/libMNN.so" "$(DESTDIR)$(MNNDIR)/libMNN.so"
+else
+	@echo "install: no MNN runtime in this build; super-resolution stays off"
+endif
 	@for s in $(ICON_SIZES); do \
 	    install -d "$(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps"; \
 	    $(ICON_TOOL) -background none packaging/dytqt.svg -resize $${s}x$${s} \
@@ -654,6 +717,10 @@ uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/dytqt"
 	rm -f "$(DESTDIR)$(APPDIR)/dytqt.desktop"
 	rm -rf "$(DESTDIR)$(PALETTEDIR)"
+	rm -rf "$(DESTDIR)$(MODELDIR)"
+# Only the app's own subdirectory: $(LIBDIR) may hold libraries this package did
+# not put there, so it must never be removed wholesale.
+	rm -rf "$(DESTDIR)$(MNNDIR)"
 	@for s in $(ICON_SIZES); do \
 	    rm -f "$(DESTDIR)$(ICONDIR)/$${s}x$${s}/apps/dytqt.png"; \
 	done
@@ -670,7 +737,7 @@ deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
 	$(MAKE) install DESTDIR=$(DEB_ROOT) PREFIX=/usr BUILD=$(BUILD)
 	@dep="$(DEB_DEPENDS)"; \
 	if command -v dpkg-shlibdeps >/dev/null 2>&1; then \
-	    if d=$$(dpkg-shlibdeps -O $(BUILD)/dytqt 2>/dev/null \
+	    if d=$$(dpkg-shlibdeps --ignore-missing-info -O $(BUILD)/dytqt 2>/dev/null \
 	            | sed -n 's/^shlibs:Depends=//p') && [ -n "$$d" ]; then \
 	        dep="$$d"; echo "deb: Depends measured from the binary"; \
 	    else \

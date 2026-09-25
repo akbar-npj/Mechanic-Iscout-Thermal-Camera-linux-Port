@@ -812,6 +812,8 @@ make deb                              # build/dytqt_<version>_<arch>.deb
 | `$(DATADIR)/applications/dytqt.desktop` | the desktop entry |
 | `$(DATADIR)/icons/hicolor/<N>x<N>/apps/dytqt.png` | 16, 24, 32, 48, 64, 128, 256 |
 | `$(DATADIR)/dytqt/palettes/*.dat` | the 28 vendor palettes |
+| `$(DATADIR)/dytqt/models/zoom2.mnn` | the super-resolution model (13 KB) |
+| `$(LIBDIR)/dytqt/libMNN.so` | the MNN runtime — only when the build has one |
 
 The palettes are not optional decoration: the engine falls back to **six**
 built-in ramps when it cannot find them, so a package that shipped none would
@@ -820,14 +822,27 @@ here. `dyt_vm_find_data_dir()` searches `<datadir>/dytqt/<leaf>` under each
 `$XDG_DATA_DIRS` entry (default `/usr/local/share:/usr/share`), the location
 both `/usr` and `/usr/local` installs use, so an installed binary finds them
 from any cwd. Running from the source tree still prefers the tree's own
-`palettes/`, which the search tries first.
+`palettes/`, which the search tries first. The model is found by the same search
+(`dyt_vm_find_model`), which is why it goes under `dytqt/models` and not beside
+the binary; it ships even in a build without a runtime, where it is inert.
+
+`libMNN.so` is the one file with a layout constraint: the binary's rpath is
+`$ORIGIN:$ORIGIN/../lib/dytqt`, so the library must land exactly one directory up
+from `$(BINDIR)`. `$ORIGIN` is resolved by the loader at run time, which is what
+lets the same build work under `/usr` and `/usr/local` — and, with the first
+entry, from the build tree too, where the Makefile satisfies it with a
+`build/libMNN.so` symlink. Deliberately *not* an absolute path: a `.deb` would
+ship that path (lintian's `binary-or-shlib-defines-rpath`), and on a machine
+that happened to have it, the app would load a library the package does not
+contain. `make install` skips the library and says so when the build has no
+runtime.
 
 The icon is rasterised from `packaging/dytqt.svg` at install time, at 8-bit
 RGBA (the default was 16-bit, which some icon loaders handle poorly), so
 `make install` needs ImageMagick (`magick` or `convert`).
 
 `deb` wraps that same layout with `dpkg-deb`, so the file list cannot drift
-from `install`. Two details are worth knowing:
+from `install`. Three details are worth knowing:
 
 * **`Depends` is measured when it can be, and says so when it cannot.** With
   `dpkg-shlibdeps` (from `dpkg-dev`) present it is read off the binary's
@@ -835,19 +850,32 @@ from `install`. Two details are worth knowing:
   which path it took, so a guess is never mistaken for a measurement. The
   default names Debian bookworm's OpenCV soname packages — override
   `DEB_DEPENDS` for another release.
+* **`libMNN.so` needs no `Depends` entry** — it ships inside this package, and
+  its own `NEEDED` entries (`libstdc++`, `libm`, `libgcc_s`, `libc`) are already
+  covered. `dpkg-shlibdeps` cannot know that, so the measurement runs with
+  `--ignore-missing-info` and omits it; the alternative, a fabricated `shlibs`
+  file, would claim a library no Debian package provides.
 * **The staged binary is stripped** (3.4 MB → 334 KB). `make install` keeps its
   symbols, so a local install stays debuggable.
 
 This build host is Fedora, so the `.deb` is a cross-format artifact: `dpkg-deb`
-builds and inspects it, but nothing in the tree installs it.
+builds and inspects it, but nothing in the tree installs it. It was inspected
+here: the file list above is what the package contains, the stripped binary
+still carries its `$ORIGIN` rpath, and running the staged `usr/bin/dytqt` with
+`XDG_DATA_DIRS` pointed at the staged `usr/share` loads the staged model and
+passes the full selftest — which is the end-to-end check that the two relative
+paths (the rpath and the data search) are right.
 
 `make check` runs `packaging/check.sh`, which pins the cross-file invariants a
 syntax linter cannot see: that the entry's `Exec`, `Icon` and `StartupWMClass`
 name the binary the Makefile installs, the icon it ships, and the WM_CLASS the
 app actually sets — `("dytqt","dytqt")`, measured with `xprop`, not assumed —
-and that the icon rasterises to something non-blank at 16 and 256 px. A typo in
-any of those validates cleanly and still launches nothing, which is the failure
-that check exists to catch.
+that the icon rasterises to something non-blank at 16 and 256 px, that the model
+ships where the app's own search looks, and that a binary linking `libMNN.so`
+carries the `$ORIGIN` rpath and no path into the build tree. Each of those fails
+*silently* otherwise: a typo in any of the metadata entries validates cleanly and
+still launches nothing, a model in the wrong place looks exactly like a build
+without a runtime, and a bad rpath makes the installed app not start at all.
 
 The version is single-sourced: the Makefile's `VERSION` feeds `-DDYT_VERSION`
 for the GUI and names the package, so the About box and the `.deb` cannot
@@ -1013,12 +1041,6 @@ only when the session wrote a parameter — then abandons it the same way.
   Nor has SR been run against the camera: the live dual-half frame splits to
   exactly 256×192, so it is expected to apply, but the verification here is the
   fixture's, and the rate the model adds to the live path is unmeasured.
-* **The package does not ship the model or the MNN runtime yet.** `install`
-  copies the binary, the desktop entry, the icon and the palettes. The model
-  search also looks in `<datadir>/dytqt/models/zoom2.mnn`, but nothing puts it
-  there, so an installed app finds no model and the SR keys refuse with the
-  notice that says so. Running from the source tree — where `models/zoom2.mnn`
-  is — is unaffected.
 * **A failed 2× allocation would report active while rendering plain.** The
   snapshot's `sr_active` is the *predicate* — the factor the next render will
   use — rather than "what the last render did", which is what lets a front end

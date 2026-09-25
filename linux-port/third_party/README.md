@@ -49,6 +49,22 @@ The result should be a `libMNN.so` that NEEDs only `libstdc++`, `libm`,
 readelf -d mnn-install/lib/libMNN.so | grep NEEDED
 ```
 
+### How the app finds it
+
+`make install` ships `libMNN.so` (and `models/zoom2.mnn`) with the app: the
+library goes to `$(LIBDIR)/dytqt`, the model to `$(DATADIR)/dytqt/models`, and
+the binary's rpath is `$ORIGIN:$ORIGIN/../lib/dytqt` — so the same build works
+from `/usr` and `/usr/local`, and from the build tree, without ever naming an
+absolute path that a `.deb` would then ship. In the build tree the rpath's first
+entry is satisfied by a symlink the Makefile creates at `build/libMNN.so`; a
+build without MNN creates neither the symlink nor the rpath, because the binary
+has no `libMNN.so` NEEDED entry to satisfy.
+
+That pairing is checked: `packaging/check.sh` (part of `make check`) fails if a
+binary that links libMNN.so lacks the rpath, if the install would not ship the
+library, or if the rpath carries a path into the build tree. `make install`
+prints a note and skips the library when the build has no runtime.
+
 ### The one patch
 
 MNN's `CMakeLists.txt` sets `-D__STRICT_ANSI__` for Linux:

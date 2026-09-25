@@ -8,9 +8,15 @@
 # validates cleanly and still launches nothing, which is the failure this
 # catches.
 #
+# The super-resolution payload is checked the same way: the model has to land
+# where the app's own search looks, and a binary that links libMNN.so has to
+# ship the library at the one path its $ORIGIN rpath resolves to.  Both are
+# silent failures — the first looks like a build without a runtime, the second
+# makes the installed app fail to start.
+#
 # Exits non-zero on a real mismatch.  The optional tools (desktop-file-validate,
-# ImageMagick) are used when present and reported as skipped when not, so the
-# check still means something on a host that lacks them.
+# ImageMagick, readelf) are used when present and reported as skipped when not,
+# so the check still means something on a host that lacks them.
 set -u
 
 desktop=packaging/dytqt.desktop
@@ -103,6 +109,61 @@ if command -v magick >/dev/null 2>&1 || command -v convert >/dev/null 2>&1; then
     fi
 else
     skip "the icon rasterises" "ImageMagick absent"
+fi
+
+# --- the super-resolution payload ---
+#
+# Two cross-file invariants that fail silently otherwise.  The app searches for
+# the model under <datadir>/dytqt/models/zoom2.mnn (dyt_vm_find_model), so
+# `make install` has to put it exactly there; get that wrong and an installed
+# app reports no model and the SR keys refuse — which is indistinguishable from
+# a build without the runtime, and so never looks like a packaging bug.  And a
+# binary that links libMNN.so must ship the library at the one place its
+# $ORIGIN rpath looks, or the installed app will not start at all.
+
+model=models/zoom2.mnn
+msize=$(wc -c < "$model" 2>/dev/null | tr -d ' ')
+if [ -n "$msize" ] && [ "$msize" -gt 1000 ]; then
+    ok "the super-resolution model ships ($model, $msize bytes)"
+else
+    fail "the super-resolution model ships (got '${msize:-missing}' bytes)"
+fi
+
+# The model's directory as the search spells it, and the file name it appends.
+if grep -q 'dytqt/models' Makefile && grep -q 'zoom2\.mnn' Makefile; then
+    ok "install puts the model where the app searches for it"
+else
+    fail "install puts the model where the app searches for it"
+fi
+
+if [ -f build/dytqt ] && command -v readelf >/dev/null 2>&1; then
+    runpath=$(readelf -d build/dytqt 2>/dev/null \
+              | sed -n 's/.*(RUNPATH).*\[\(.*\)\].*/\1/p')
+    if readelf -d build/dytqt 2>/dev/null | grep -q 'libMNN'; then
+        case "$runpath" in
+            *'$ORIGIN'*'../lib/dytqt'*)
+                ok "dytqt links libMNN.so and its rpath finds the shipped copy" ;;
+            *)
+                fail "dytqt links libMNN.so and its rpath finds the shipped copy (runpath '${runpath:-<none>}')" ;;
+        esac
+        if grep -q 'libMNN\.so' Makefile; then
+            ok "install ships the libMNN.so the binary needs"
+        else
+            fail "install ships the libMNN.so the binary needs"
+        fi
+        # An absolute path into the build tree would be shipped in the .deb —
+        # lintian's binary-or-shlib-defines-rpath, and a way for a target
+        # machine to load a library the package does not contain.
+        if readelf -d build/dytqt 2>/dev/null | grep -qF "$(pwd)"; then
+            fail "the rpath carries no path into the build tree"
+        else
+            ok "the rpath carries no path into the build tree"
+        fi
+    else
+        skip "dytqt links the shipped libMNN.so" "this build has no MNN"
+    fi
+else
+    skip "dytqt links the shipped libMNN.so" "build/dytqt absent or readelf missing"
 fi
 
 if [ "$fails" -ne 0 ]; then
