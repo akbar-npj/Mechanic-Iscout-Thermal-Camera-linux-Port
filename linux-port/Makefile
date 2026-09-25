@@ -98,6 +98,30 @@ HAVE_MNN   := 1
 endif
 endif
 
+# ---------------------------------------------------------------------------
+# Qt6 Widgets (C++ only) backs the native GUI shell, gui/dytqt.cpp.
+#
+# Qt is an *alternative* front end to the OpenCV viewer, not a replacement for
+# the port's rule that every capability is reachable without a display: the Qt
+# app is a thin shell over the same toolkit-independent presentation layer
+# (src/view_model.c) that tools/dytview.cpp draws with.  Only QtWidgets is
+# named; QtGui and QtCore arrive as its dependencies, and pkg-config's
+# Qt6Widgets.pc already carries all three sets of flags.
+#
+# -fPIC is not optional on Qt6: the Qt libraries are built with
+# -reduce-relocations, so an executable that links them must itself be
+# position-independent or the link fails with "recompile with -fPIC".
+#
+# Detected, never required — without Qt6 the GUI target is simply absent and
+# every other target still builds.
+# ---------------------------------------------------------------------------
+QT6_CFLAGS := $(shell pkg-config --cflags Qt6Widgets 2>/dev/null)
+QT6_LIBS   := $(shell pkg-config --libs   Qt6Widgets 2>/dev/null)
+ifneq ($(strip $(QT6_LIBS)),)
+QT6_CFLAGS += -fPIC
+HAVE_QT6   := 1
+endif
+
 BUILD := build
 
 # ---------------------------------------------------------------------------
@@ -183,7 +207,14 @@ ifdef HAVE_OPENCV
 TOOLS += $(BUILD)/dytrec
 endif
 
-# libuvc is linked into dytrec only when it was actually built.
+# The Qt6 GUI shell.  Like dytrec, its fixture and --selftest paths are
+# device-free, so it is useful on a host with no libusb; live capture goes
+# through the same tools/frame_source.c and so needs libuvc only when present.
+ifdef HAVE_QT6
+TOOLS += $(BUILD)/dytqt
+endif
+
+# libuvc is linked into dytrec and dytqt only when it was actually built.
 DYTREC_UVC :=
 ifdef HAVE_LIBUSB
 DYTREC_UVC := $(UVC_LIB)
@@ -363,6 +394,17 @@ $(BUILD)/frame_source.o: tools/frame_source.c tools/frame_source.h $(FLAG_STAMP)
 $(BUILD)/dytrec: tools/dytrec.cpp $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) $(LDLIBS) $(CV_LIBS) -o $@
 
+# The Qt6 GUI shell.  It links the same two pieces as dytrec — the port library
+# and the frame source — plus Qt6 Widgets.  The frame source is the seam that
+# keeps the app testable: pointed at a fixture it is device-free, pointed at
+# libuvc it is the live camera, and the GUI code does not change between them.
+# $(DYTREC_UVC) is empty when libusb is absent, exactly as for dytrec.
+#
+# -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
+# it relatively, whereas gui/dytqt.cpp does not.
+$(BUILD)/dytqt: gui/dytqt.cpp $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) -Itools $< $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) $(LDLIBS) $(QT6_LIBS) -o $@
+
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.
 $(BUILD)/isotest: tools/isotest.c | $(BUILD)
@@ -404,6 +446,10 @@ endif
 ifdef HAVE_OPENCV
 	@echo "== mp4 recorder self-test =="
 	@$(BUILD)/dytrec --selftest
+endif
+ifdef HAVE_QT6
+	@echo "== Qt6 GUI self-test =="
+	@$(BUILD)/dytqt --selftest
 endif
 	@echo "== frame pipeline vs frozen vendor ground truth =="
 	@fail=0; \
