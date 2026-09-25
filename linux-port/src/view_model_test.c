@@ -30,6 +30,44 @@
 
 static int fails;
 
+/* A stub upscaler, so the super-resolution key routing can be exercised.  It
+ * is never run — the key test does not render — which is exactly what makes
+ * the point: the seam is a function pointer (session.h), so this module's
+ * tests need no MNN runtime at all. */
+static int stub_upscale(const uint8_t *in, uint8_t *out, int cap, int *n)
+{
+    (void)in; (void)out; (void)cap; (void)n;
+    return -1;
+}
+
+/* A 2x upscaler that duplicates each pixel, written in the model's packing, so
+ * the still writer can be driven at 2x without a runtime.  Because it
+ * duplicates, the 2x frame is exactly the nearest-2x of the plain one. */
+static int dup_upscale(const uint8_t *in, uint8_t *out, int cap, int *n)
+{
+    const int w = DYT_SR_IN_W, h = DYT_SR_IN_H;
+    const int stride = (2 * w) * 2;
+    int x, y;
+
+    if (!in || !out || !n || cap < w * h * 8)
+        return -1;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t v = in[2 * (y * w + x)];
+            int     o = (2 * y) * stride + 4 * x;
+
+            out[o] = out[o + 2] = out[o + stride] = out[o + stride + 2] = v;
+            out[o + 1]           = DYT_SR_PACK_HIGH;
+            out[o + 3]           = DYT_SR_PACK_HIGH;
+            out[o + stride + 1]  = DYT_SR_PACK_HIGH;
+            out[o + stride + 3]  = DYT_SR_PACK_HIGH;
+        }
+    }
+    *n = w * h * 8;
+    return 0;
+}
+
 static void ok(const char *what) { printf("  ok   %s\n", what); }
 
 static void fail(const char *what, const char *detail)
@@ -177,6 +215,26 @@ static void test_status_line(void)
         ok("status: an unknown mode is not guessed");
     else
         fail("status: an unknown mode is not guessed", b);
+
+    /* Super-resolution appears only when it is on — it is an addition to what
+     * is displayed rather than a mode of its own — and a mode that cannot be
+     * honoured on this frame says so, exactly as an unhonourable fusion
+     * pattern does. */
+    s.sr        = DYT_SR_THERMAL;
+    s.sr_active = 1;
+    s.xform.sr  = 2;
+    snprintf(s.sr_name, sizeof s.sr_name, "thermal");
+    dyt_vm_status_line(&s, DYT_MODE_1000, b, sizeof b);
+    strcheck("status: an active super-resolution shows its factor", b,
+             "mode 1000 | fusion ir | iron 1/27 | C | sr:thermal x2 | x1HV | "
+             "154 frames");
+
+    s.sr_active = 0;
+    s.xform.sr  = 1;
+    dyt_vm_status_line(&s, DYT_MODE_1000, b, sizeof b);
+    strcheck("status: an inactive super-resolution says so", b,
+             "mode 1000 | fusion ir | iron 1/27 | C | sr:thermal (inactive) | "
+             "x1HV | 154 frames");
 }
 
 static void test_readout_line(void)
@@ -500,6 +558,56 @@ static void test_isotherm(void)
              (int)dyt_vm_apply_isotherm(NULL, 2, 2, temps, 4, 30.f, 40.f), -1);
     intcheck("isotherm: NULL temperatures rejected",
              (int)dyt_vm_apply_isotherm(bgr, 2, 2, NULL, 4, 30.f, 40.f), -1);
+
+    /* The same pass when the image is a magnification of the temperature
+     * plane — which it is at 2x — so each temperature covers a 2x2 block.
+     * Without this the overlay silently dims nothing at 2x (the plane has a
+     * quarter of the samples the image needs), which is the bug it prevents. */
+    {
+        uint8_t big[4 * 4 * 3];
+        float   t2[4];
+
+        memset(big, 100, sizeof big);
+        t2[0] = 35.f;  /* in    -> the block at (0,0) */
+        t2[1] = 25.f;  /* below -> the block at (1,0) */
+        t2[2] = 45.f;  /* above -> the block at (0,1) */
+        t2[3] = 35.f;  /* in    -> the block at (1,1) */
+
+        dimmed = dyt_vm_apply_isotherm_scaled(big, 4, 4, t2, 4, 2, 2,
+                                              30.f, 40.f);
+        intcheck("isotherm 2x: the two out-of-band blocks are dimmed",
+                 (int)dimmed, 8);
+        intcheck("isotherm 2x: an in-band block is untouched", big[0], 100);
+        intcheck("isotherm 2x: so is the other in-band block",
+                 big[(2 * 4 + 2) * 3], 100);
+        intcheck("isotherm 2x: the below-band block is dimmed",
+                 big[(0 * 4 + 2) * 3], 50);
+        intcheck("isotherm 2x: the above-band block is dimmed",
+                 big[(2 * 4 + 0) * 3], 50);
+
+        intcheck("isotherm 2x: a short plane is rejected",
+                 (int)dyt_vm_apply_isotherm_scaled(big, 4, 4, t2, 3, 2, 2,
+                                                   30.f, 40.f), -1);
+        intcheck("isotherm 2x: a zero temperature width is rejected",
+                 (int)dyt_vm_apply_isotherm_scaled(big, 4, 4, t2, 4, 0, 2,
+                                                   30.f, 40.f), -1);
+
+        /* At scale 1 the scaled entry point must be byte-for-byte the plain
+         * one — that is how the plain one is implemented, so this pins it. */
+        {
+            uint8_t a[2 * 2 * 3], c[2 * 2 * 3];
+            float   t3[4] = { 35.f, 25.f, 45.f, 35.f };
+            long    d1, d2;
+
+            memset(a, 100, sizeof a);
+            memset(c, 100, sizeof c);
+            d1 = dyt_vm_apply_isotherm(a, 2, 2, t3, 4, 30.f, 40.f);
+            d2 = dyt_vm_apply_isotherm_scaled(c, 2, 2, t3, 4, 2, 2,
+                                              30.f, 40.f);
+            intcheck("isotherm: the scaled entry agrees with the plain one at 1x",
+                     d1 == d2 && memcmp(a, c, sizeof a) == 0, 1);
+        }
+    }
 }
 
 /* -------------------------------------------------- session-backed entries */
@@ -703,6 +811,22 @@ static void test_utilities(void)
         ok("util: an unreadable palette directory falls through");
     else
         fail("util: an unreadable palette directory falls through", b);
+
+    /* The model is found the same way, and for the same reason: `make check`
+     * runs from the port root, so the tree's own copy must win. */
+    intcheck("util: the model is found",
+             dyt_vm_find_model(NULL, b, sizeof b), 1);
+    strcheck("util: and it is the tree's model", b, "models/zoom2.mnn");
+
+    intcheck("util: an explicit model path wins",
+             dyt_vm_find_model("models/zoom2.mnn", b, sizeof b), 1);
+    strcheck("util: and is used verbatim", b, "models/zoom2.mnn");
+
+    dyt_vm_find_model("/nonexistent-model-xyz.mnn", b, sizeof b);
+    if (strcmp(b, "/nonexistent-model-xyz.mnn") != 0)
+        ok("util: an unreadable model path falls through");
+    else
+        fail("util: an unreadable model path falls through", b);
 
     test_data_dir();
 }
@@ -951,6 +1075,42 @@ static void test_gallery(void)
         feed_raw(s, img, raw, 16, 16);
         intcheck("gal: the still writes",
                  dyt_vm_write_still(s, still, msg, sizeof msg), 0);
+        dyt_session_free(s);
+    }
+
+    /* The same with super-resolution on.  The embedded JPEG is 2x, so the
+     * writer must size its buffer from the snapshot's factor rather than from
+     * the temperature plane; sizing it from the plane makes the render return
+     * -2 and the still fail, which is the bug this pins. */
+    {
+        dyt_session_t  *s = dyt_session_create();
+        const size_t    npix = (size_t)DYT_SR_IN_W * DYT_SR_IN_H;
+        float          *img = malloc(npix * sizeof *img);
+        uint16_t       *raw = malloc(npix * sizeof *raw);
+        dyt_snapshot_t  snap;
+        char            still2[DYT_VM_PATH_CAP];
+
+        if (!s || !img || !raw) {
+            fail("gal 2x: allocate", "out of memory");
+        } else {
+            snprintf(still2, sizeof still2,
+                     "%s/dyt_20260101-000003.dyt.jpg", dir);
+            feed_raw(s, img, raw, DYT_SR_IN_W, DYT_SR_IN_H);
+            dyt_session_set_sr_upscaler(s, dup_upscale);
+            dyt_session_set_sr(s, DYT_SR_THERMAL);
+
+            intcheck("gal 2x: the snapshot reports the factor",
+                     dyt_session_snapshot(s, &snap, NULL, 0) == 0 &&
+                     snap.sr_active == 1 && snap.xform.sr == 2, 1);
+            intcheck("gal 2x: the still writes with super-resolution on",
+                     dyt_vm_write_still(s, still2, msg, sizeof msg), 0);
+
+            /* Removed again: the scan cases below count this directory, and a
+             * fourth file would (correctly) change every one of them. */
+            unlink(still2);
+        }
+        free(img);
+        free(raw);
         dyt_session_free(s);
     }
 
@@ -1246,8 +1406,35 @@ static void test_view_keys(void)
                  "no move");
     }
 
+    /* Super-resolution: 'z' is the vendor's plane, 'Z' the thermal extension,
+     * and the two are mutually exclusive because the mode is one value.  A
+     * mode needs an upscaler behind it, so the test hands one in — the seam is
+     * a pointer (session.h), which is what keeps this testable with no MNN. */
+    {
+        dyt_session_set_sr_upscaler(s, stub_upscale);
+
+        intcheck("view: 'z' is a view key", dyt_vm_view_key(s, 'z'), 1);
+        intcheck("view: 'z' selects the visible plane",
+                 dyt_session_get_sr(s), DYT_SR_VISIBLE);
+
+        intcheck("view: 'Z' is a view key", dyt_vm_view_key(s, 'Z'), 1);
+        intcheck("view: 'Z' switches to the thermal plane",
+                 dyt_session_get_sr(s), DYT_SR_THERMAL);
+
+        dyt_vm_view_key(s, 'Z');
+        intcheck("view: 'Z' again turns it off",
+                 dyt_session_get_sr(s), DYT_SR_OFF);
+
+        /* With nothing behind it the mode is refused, but the key is still
+         * consumed — the front end must not fall through to its own bindings. */
+        dyt_session_set_sr_upscaler(s, NULL);
+        intcheck("view: 'z' is consumed without an upscaler",
+                 dyt_vm_view_key(s, 'z'), 1);
+        intcheck("view: the mode stays off", dyt_session_get_sr(s), DYT_SR_OFF);
+    }
+
     /* A key that is not a view key is reported, so the caller falls through. */
-    intcheck("view: 'z' is not a view key", dyt_vm_view_key(s, 'z'), 0);
+    intcheck("view: 'w' is not a view key", dyt_vm_view_key(s, 'w'), 0);
     intcheck("view: 'p' is not a view key", dyt_vm_view_key(s, 'p'), 0);
     intcheck("view: a NULL session is refused", dyt_vm_view_key(NULL, '3'), 0);
 

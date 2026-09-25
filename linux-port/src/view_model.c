@@ -147,6 +147,19 @@ int dyt_vm_status_line(const dyt_snapshot_t *snap, dyt_mode_t mode,
     appf(out, n, &off, " | %s",
         dyt_unit_suffix(snap->unit) ? dyt_unit_suffix(snap->unit) : "?");
 
+    /* Super-resolution, shown only when it is on: it is an addition to what is
+     * displayed rather than a mode of its own, so an "sr:off" on every line
+     * would be noise.  A mode that cannot be honoured on this frame — the
+     * visible plane is not on screen, or there is no visible half at all — is
+     * called out for the same reason the fusion pattern is. */
+    if (snap->sr != DYT_SR_OFF) {
+        appf(out, n, &off, " | sr:%s", snap->sr_name);
+        if (snap->sr_active)
+            appf(out, n, &off, " x%d", snap->xform.sr);
+        else
+            app(out, n, &off, " (inactive)");
+    }
+
     appf(out, n, &off, " | x%d%s | %ld frames", snap->xform.zoom, mm,
         (long)snap->seq);
 
@@ -545,23 +558,37 @@ int dyt_vm_alarm_band(const dyt_snapshot_t *snap,
 
 /* --------------------------------------------------------------- overlays */
 
-long dyt_vm_apply_isotherm(uint8_t *bgr, int w, int h,
-                           const float *temps, int temps_n,
-                           float lo, float hi)
+long dyt_vm_apply_isotherm_scaled(uint8_t *bgr, int w, int h,
+                                  const float *temps, int temps_n,
+                                  int tw, int th, float lo, float hi)
 {
     long dimmed = 0;
     int  yy;
 
-    if (!bgr || !temps || w <= 0 || h <= 0 || temps_n < w * h)
+    if (!bgr || !temps || w <= 0 || h <= 0 || tw <= 0 || th <= 0 ||
+        temps_n < tw * th)
         return -1;
 
+    /* The image may be a magnification of the temperature plane — the
+     * super-resolution render is 2x — so each image pixel samples the
+     * temperature it was magnified from.  With tw == w and th == h the
+     * division is exact and this is the plain pass. */
     for (yy = 0; yy < h; yy++) {
         uint8_t *row = bgr + (size_t)yy * (size_t)w * 3;
+        int      ty  = (int)((long long)yy * th / h);
         int      xx;
 
+        if (ty >= th) ty = th - 1;
+
         for (xx = 0; xx < w; xx++) {
-            float t      = temps[(size_t)yy * (size_t)w + xx];
-            int   inside = (t == t) && t >= lo && t <= hi;
+            int   tx     = (int)((long long)xx * tw / w);
+            float t;
+            int   inside;
+
+            if (tx >= tw) tx = tw - 1;
+
+            t      = temps[(size_t)ty * (size_t)tw + tx];
+            inside = (t == t) && t >= lo && t <= hi;
 
             if (!inside) {
                 row[xx * 3 + 0] = (uint8_t)(row[xx * 3 + 0] / 2);
@@ -572,6 +599,14 @@ long dyt_vm_apply_isotherm(uint8_t *bgr, int w, int h,
         }
     }
     return dimmed;
+}
+
+long dyt_vm_apply_isotherm(uint8_t *bgr, int w, int h,
+                           const float *temps, int temps_n,
+                           float lo, float hi)
+{
+    return dyt_vm_apply_isotherm_scaled(bgr, w, h, temps, temps_n,
+                                        w, h, lo, hi);
 }
 
 /* ----------------------------------------------------------------- output */
@@ -598,13 +633,23 @@ int dyt_vm_write_still(dyt_session_t *s, const char *path, char *msg, size_t n)
     if (!snap.have_raw)
         FAIL("still: no raw payload");
 
-    rgb = (uint8_t *)malloc((size_t)snap.width * snap.height * 3);
-    if (!rgb)
-        FAIL("still: out of memory");
+    /* The embedded JPEG is the picture as displayed, so with super-resolution
+     * on it is 2x the temperature plane — sized from the snapshot's own factor
+     * rather than assumed, exactly as the frame sources size theirs.  The
+     * container below still records the *payload's* native geometry, so a
+     * vendor tool re-renders the raw data at full resolution. */
+    {
+        int f = snap.xform.sr >= 1 ? snap.xform.sr : 1;
 
-    if (dyt_session_render_rgb(s, rgb, snap.width * snap.height * 3,
-                               &w, &h) != 0)
-        FAIL("still: render failed");
+        rgb = (uint8_t *)malloc((size_t)snap.width * f *
+                                (size_t)snap.height * f * 3);
+        if (!rgb)
+            FAIL("still: out of memory");
+
+        if (dyt_session_render_rgb(s, rgb, snap.width * f * snap.height * f * 3,
+                                   &w, &h) != 0)
+            FAIL("still: render failed");
+    }
 
     if (dyt_jpeg_encode(rgb, w, h, 85, &jpg, &jlen) != 0)
         FAIL("still: JPEG encode failed");
@@ -1007,6 +1052,20 @@ int dyt_vm_view_key(dyt_session_t *s, int key)
     case ']': dyt_session_adjust_fusion_align(s, +1, 0); return 1;
     case ';': dyt_session_adjust_fusion_align(s, 0, -1); return 1;
     case '\'': dyt_session_adjust_fusion_align(s, 0, +1); return 1;
+
+    /* Super-resolution: one feature with two planes, so the bindings are tied
+     * together by case (the h/H precedent).  "z" is the vendor's own plane,
+     * "Z" the thermal extension (sr.h).  The mode is a single value, so
+     * turning one on turns the other off — both describe the same 2x render,
+     * and there is no coherent reading of "both". */
+    case 'z':
+        dyt_session_set_sr(s, dyt_session_get_sr(s) == DYT_SR_VISIBLE
+                                  ? DYT_SR_OFF : DYT_SR_VISIBLE);
+        return 1;
+    case 'Z':
+        dyt_session_set_sr(s, dyt_session_get_sr(s) == DYT_SR_THERMAL
+                                  ? DYT_SR_OFF : DYT_SR_THERMAL);
+        return 1;
     default: break;
     }
     return 0;
@@ -1038,8 +1097,9 @@ int dyt_vm_exe_dir(char *out, size_t n)
     return 0;
 }
 
-/* One candidate directory: readable?  On success copies it to `out`. */
-static int palette_dir_ok(const char *p, char *out, size_t n)
+/* One candidate path — a directory or a file: readable?  On success copies it
+ * to `out`. */
+static int readable_path(const char *p, char *out, size_t n)
 {
     if (!p || !p[0] || access(p, R_OK) != 0)
         return 0;
@@ -1079,7 +1139,7 @@ int dyt_vm_find_data_dir(const char *leaf, char *out, size_t n)
 
         if (len > 0 && len + (size_t)need < sizeof cand) {
             snprintf(cand, sizeof cand, "%.*s/dytqt/%s", (int)len, p, leaf);
-            if (palette_dir_ok(cand, out, n))
+            if (readable_path(cand, out, n))
                 return 1;
         }
         if (!sep)
@@ -1101,25 +1161,69 @@ int dyt_vm_find_palette_dir(const char *dir_opt, char *out, size_t n)
     out[0] = '\0';
 
     /* An explicit request wins. */
-    if (palette_dir_ok(dir_opt, out, n))
+    if (readable_path(dir_opt, out, n))
         return 1;
 
     /* Then beside the cwd and the executable, so a source-tree run keeps using
      * the tree's own palettes rather than an installed copy. */
     for (i = 0; i < 2; i++)
-        if (palette_dir_ok(fixed[i], out, n))
+        if (readable_path(fixed[i], out, n))
             return 1;
 
     if (dyt_vm_exe_dir(ed, sizeof ed) == 0) {
         for (i = 0; i < 2; i++) {
             snprintf(cand, sizeof cand, "%s/%s", ed, fixed[i]);
-            if (palette_dir_ok(cand, out, n))
+            if (readable_path(cand, out, n))
                 return 1;
         }
     }
 
     /* Finally the installed location. */
     return dyt_vm_find_data_dir("palettes", out, n);
+}
+
+int dyt_vm_find_model(const char *path_opt, char *out, size_t n)
+{
+    char        cand[4096];
+    char        ed[2048];
+    const char *fixed[] = { "models/zoom2.mnn", "../models/zoom2.mnn" };
+    int         i;
+
+    if (!out || n == 0)
+        return 0;
+    out[0] = '\0';
+
+    /* An explicit request wins. */
+    if (readable_path(path_opt, out, n))
+        return 1;
+
+    /* Then beside the cwd and the executable, so a source-tree run uses the
+     * tree's own model rather than an installed copy. */
+    for (i = 0; i < 2; i++)
+        if (readable_path(fixed[i], out, n))
+            return 1;
+
+    if (dyt_vm_exe_dir(ed, sizeof ed) == 0) {
+        for (i = 0; i < 2; i++) {
+            snprintf(cand, sizeof cand, "%s/%s", ed, fixed[i]);
+            if (readable_path(cand, out, n))
+                return 1;
+        }
+    }
+
+    /* Finally the installed location: <datadir>/dytqt/models/zoom2.mnn, which
+     * is where `make install` puts it (the palettes' sibling). */
+    if (dyt_vm_find_data_dir("models", cand, sizeof cand)) {
+        /* Sized for the suffix so the append cannot be truncated — `cand` is
+         * already at its limit when the data directory is a long one. */
+        char full[sizeof cand + sizeof "/zoom2.mnn"];
+
+        snprintf(full, sizeof full, "%s/zoom2.mnn", cand);
+        if (readable_path(full, out, n))
+            return 1;
+    }
+
+    return 0;
 }
 
 int dyt_vm_timestamp(char *out, size_t n)

@@ -259,6 +259,19 @@ long dyt_vm_apply_isotherm(uint8_t *bgr, int w, int h,
                            const float *temps, int temps_n,
                            float lo, float hi);
 
+/* The same pass when the image is a magnification of the temperature plane —
+ * which it is whenever the super-resolution render is on, at 2x.  `temps` is
+ * tw*th floats and the image is w*h; each image pixel samples the temperature
+ * it was magnified from, so the dimming follows the data rather than the
+ * scale.  With tw == w and th == h this is exactly the pass above, and that is
+ * how it is implemented.
+ *
+ * Returns the number of pixels dimmed, or -1 on a bad argument (including a
+ * temperature plane with fewer than tw*th samples). */
+long dyt_vm_apply_isotherm_scaled(uint8_t *bgr, int w, int h,
+                                  const float *temps, int temps_n,
+                                  int tw, int th, float lo, float hi);
+
 /* ----------------------------------------------------------------- output */
 
 /* Write a DYT still: the rendered picture as JPEG, with the device's own raw
@@ -267,6 +280,12 @@ long dyt_vm_apply_isotherm(uint8_t *bgr, int w, int h,
  *
  * The raw payload comes from the session, not from dyt_capture_last_raw():
  * that pointer is only valid on the frame callback thread.
+ *
+ * With super-resolution on, the embedded JPEG is the 2x picture while the
+ * container still records the payload's native geometry — so the file carries
+ * both the full-resolution raw a vendor tool wants and the picture the user
+ * was actually looking at.  The render buffer is sized from the snapshot's
+ * factor accordingly.
  *
  * Returns 0 on success.  On failure returns -1 and, when `msg` is non-NULL,
  * writes why into it. */
@@ -452,6 +471,14 @@ int dyt_vm_find_data_dir(const char *leaf, char *out, size_t n);
  * finally dyt_vm_find_data_dir("palettes", ...).  Returns 1 and fills `out`
  * when one is readable, 0 otherwise. */
 int dyt_vm_find_palette_dir(const char *dir_opt, char *out, size_t n);
+
+/* Find the super-resolution model, the same way and for the same reason:
+ * `path_opt` first when non-NULL and non-empty, then "models/zoom2.mnn",
+ * "../models/zoom2.mnn", both again relative to the executable, and finally
+ * <datadir>/dytqt/models/zoom2.mnn.  Returns 1 and fills `out` when one is
+ * readable, 0 otherwise — which is what lets a packaged dytqt find the model
+ * it ships from any cwd, and a source-tree run use the tree's own. */
+int dyt_vm_find_model(const char *path_opt, char *out, size_t n);
 
 /* "YYYYMMDD-HHMMSS" in local time, for a filename.  Returns 0 on success. */
 int dyt_vm_timestamp(char *out, size_t n);
