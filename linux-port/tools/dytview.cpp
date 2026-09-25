@@ -351,7 +351,7 @@ static cv::Mat waiting_canvas(viewer *v, const char *msg){
         put_text(m, v->note, 20, 132, cv::Scalar(170, 170, 170), 0.45);
     put_text(m, "keys: 1-9/0 palette   , . cycle   u unit   r range",
              20, 220, cv::Scalar(130, 130, 130), 0.45);
-    put_text(m, "      h/v mirror   +/- zoom   s still   w png   q quit",
+    put_text(m, "      h/v mirror   x rotate   +/- zoom   s still   w png   q quit",
              20, 244, cv::Scalar(130, 130, 130), 0.45);
     put_text(m, "      p point   l line   b box   o polygon   n clear",
              20, 268, cv::Scalar(130, 130, 130), 0.45);
@@ -405,14 +405,23 @@ static cv::Mat render(viewer *v)
         dyt_vm_apply_isotherm(bgr.data, w, h, v->scr.temps, v->scr.cap,
                               snap.iso_lo, snap.iso_hi);
 
-    /* Mirror and zoom are applied here, after the render, which is exactly the
-     * order dyt_view_transform_map()/project() assume. */
+    /* Rotation, mirror and zoom are applied here, after the render, which is
+     * exactly the order dyt_view_transform_map()/project() assume — and in
+     * reverse, so the mapping inverts what is on screen.  Every field of the
+     * transform is honoured: rendering a subset of it would put a click on the
+     * wrong pixel, which is the one failure this geometry exists to prevent. */
     cv::Mat big;
     if (snap.xform.zoom > 1)
         cv::resize(bgr, big, cv::Size(), snap.xform.zoom, snap.xform.zoom,
                    cv::INTER_NEAREST);
     else
         big = bgr;
+    if (snap.xform.rot == DYT_ROT_90)
+        cv::rotate(big, big, cv::ROTATE_90_CLOCKWISE);
+    else if (snap.xform.rot == DYT_ROT_180)
+        cv::rotate(big, big, cv::ROTATE_180);
+    else if (snap.xform.rot == DYT_ROT_270)
+        cv::rotate(big, big, cv::ROTATE_90_COUNTERCLOCKWISE);
     if (snap.xform.flip_h) cv::flip(big, big, 1);
     if (snap.xform.flip_v) cv::flip(big, big, 0);
 
@@ -783,7 +792,7 @@ static void usage(const char *prog)
         "  --t-amb C --sensor-mode 0x82 --fix-mode 0x78\n"
         "\n"
         "keys: 1-9/0 palette · , . cycle palette · u unit · r auto/locked range\n"
-        "      h/v mirror · + / - zoom · q or ESC quit\n"
+        "      h/v mirror · x rotate a quarter turn · + / - zoom · q or ESC quit\n"
         "      s save a DYT still (picture + raw payload) · w save a PNG of the\n"
         "      whole window\n"
         "      p point · l line · b box · o polygon (click per vertex,\n"
@@ -1080,6 +1089,11 @@ int main(int argc, char **argv)
             dyt_session_toggle_flip_h(v.sess);
         } else if (key == 'v') {
             dyt_session_toggle_flip_v(v.sess);
+        } else if (key == 'x') {
+            /* A quarter turn clockwise per press, the step the Qt shell's rail
+             * takes.  The picture and the pointer mapping both follow the
+             * session's transform, so there is nothing to keep in step here. */
+            dyt_session_rotate(v.sess, DYT_ROT_90);
         } else if (key == '+' || key == '=') {
             dyt_session_zoom(v.sess, 1);
         } else if (key == '-' || key == '_') {

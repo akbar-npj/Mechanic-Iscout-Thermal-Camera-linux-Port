@@ -357,44 +357,125 @@ static void test_transform(void)
     mapcheck("flip both + zoom origin", &t, 4, 3, 0, 0, 3, 2);
     mapcheck("flip both + zoom corner", &t, 4, 3, 7, 5, 0, 0);
 
+    /* --- rotation ---------------------------------------------------------
+     * A quarter turn swaps the axes, so a 4x3 source comes out 3x4, and the
+     * source's top-left corner lands at the output's top-right: the turn is
+     * clockwise, the direction the rail's Rotate button steps. */
+    printf("-- rotation --\n");
+
+    dyt_view_transform_init(&t);
+    intcheck("init no rotation", t.rot, DYT_ROT_NONE);
+
+    dyt_view_transform_rotate(&t, 90);
+    intcheck("rotate 90 sets the field", t.rot, DYT_ROT_90);
+    dyt_view_transform_size(&t, 4, 3, &dw, &dh);
+    intcheck("rot 90 swaps the width",  dw, 3);
+    intcheck("rot 90 swaps the height", dh, 4);
+
+    mapcheck("rot 90 top-left goes to the top-right", &t, 4, 3, 2, 0, 0, 0);
+    mapcheck("rot 90 top-right goes to the bottom-right", &t, 4, 3, 2, 3, 3, 0);
+    mapcheck("rot 90 bottom-left goes to the top-left", &t, 4, 3, 0, 0, 0, 2);
+    mapcheck("rot 90 bottom-right goes to the bottom-left", &t, 4, 3, 0, 3, 3, 2);
+
+    /* The plan's own case: the hot pixel of a 4x2 ramp at (3,0) must come out
+     * at (1,3) — a quarter turn clockwise sends the top-right corner to the
+     * bottom-right — and the output must be 2x4. */
+    {
+        int hx = -1, hy = -1;
+        dyt_view_transform_t r;
+
+        dyt_view_transform_init(&r);
+        dyt_view_transform_rotate(&r, 90);
+        dyt_view_transform_size(&r, 4, 2, &dw, &dh);
+        intcheck("rot 90 of a 4x2 ramp is 2x4", dw * 10 + dh, 24);
+        intcheck("rot 90 puts the 4x2 ramp's hot pixel at (1,3)",
+                 dyt_view_transform_project(&r, 4, 2, 2, 4, 3, 0, &hx, &hy) == 0
+                     ? hx * 10 + hy : -1,
+                 13);
+    }
+
+    dyt_view_transform_rotate(&t, 90);
+    intcheck("rotate 90 again", t.rot, DYT_ROT_180);
+    mapcheck("rot 180 top-left goes to the bottom-right", &t, 4, 3, 3, 2, 0, 0);
+    mapcheck("rot 180 is its own inverse", &t, 4, 3, 0, 0, 3, 2);
+
+    dyt_view_transform_rotate(&t, 90);
+    intcheck("rotate 90 a third time", t.rot, DYT_ROT_270);
+    dyt_view_transform_size(&t, 4, 3, &dw, &dh);
+    intcheck("rot 270 swaps the axes too", dw * 10 + dh, 34);
+    mapcheck("rot 270 top-left goes to the bottom-left", &t, 4, 3, 0, 3, 0, 0);
+
+    dyt_view_transform_rotate(&t, 90);
+    intcheck("a fourth turn is back to none", t.rot, DYT_ROT_NONE);
+    mapcheck("rot 0 again", &t, 4, 3, 0, 0, 0, 0);
+
+    /* Backwards wraps through 270 rather than going negative, and a delta that
+     * is not a quarter turn is rounded rather than dropped. */
+    dyt_view_transform_rotate(&t, -90);
+    intcheck("a turn the other way lands on 270", t.rot, DYT_ROT_270);
+    dyt_view_transform_rotate(&t, 45);
+    intcheck("a 45-degree step rounds to a quarter turn", t.rot, DYT_ROT_NONE);
+    dyt_view_transform_rotate(&t, 450);
+    intcheck("a 450-degree step is a quarter turn plus a full one", t.rot,
+             DYT_ROT_90);
+
+    /* Rotation composes with the zoom, and with the mirrors — which are applied
+     * *after* it, in output space, so a rotated picture mirrors the way it
+     * looks rather than the way its source was. */
+    dyt_view_transform_init(&t);
+    dyt_view_transform_rotate(&t, 90);
+    dyt_view_transform_zoom(&t, 1);
+    dyt_view_transform_size(&t, 4, 3, &dw, &dh);
+    intcheck("rot 90 + zoom 2 size", dw * 10 + dh, 68);
+    mapcheck("rot 90 + zoom 2 origin", &t, 4, 3, 0, 0, 0, 2);
+
+    dyt_view_transform_init(&t);
+    dyt_view_transform_rotate(&t, 90);
+    dyt_view_transform_toggle_flip_h(&t);
+    mapcheck("rot 90 + flip_h mirrors the output", &t, 4, 3, 2, 0, 0, 2);
+
     /* project() is the inverse of map(): the centre of a magnified block maps
      * back to the pixel it came from.  This is what keeps a marker on the
      * right pixel when the image is mirrored, so it is checked over every
-     * flip/zoom/sr combination rather than one example. */
+     * flip/rotation/zoom/sr combination rather than one example. */
     {
         dyt_view_transform_t t2;
-        int fh, fv, z, s, sx, sy, ox, oy, bx, by, bad = 0;
+        int fh, fv, r, z, s, sx, sy, ox, oy, bx, by, bad = 0;
 
         for (fh = 0; fh < 2; fh++) {
             for (fv = 0; fv < 2; fv++) {
-                for (z = 1; z <= 4; z++) {
-                    for (s = 1; s <= 2; s++) {
-                        int dw2, dh2, k;
+                for (r = 0; r < 4; r++) {
+                    for (z = 1; z <= 4; z++) {
+                        for (s = 1; s <= 2; s++) {
+                            int dw2, dh2, k;
 
-                        dyt_view_transform_init(&t2);
-                        t2.flip_h = fh;
-                        t2.flip_v = fv;
-                        for (k = 1; k < z; k++)
-                            dyt_view_transform_zoom(&t2, 1);
-                        dyt_view_transform_set_sr(&t2, s);
+                            dyt_view_transform_init(&t2);
+                            t2.flip_h = fh;
+                            t2.flip_v = fv;
+                            for (k = 0; k < r; k++)
+                                dyt_view_transform_rotate(&t2, 90);
+                            for (k = 1; k < z; k++)
+                                dyt_view_transform_zoom(&t2, 1);
+                            dyt_view_transform_set_sr(&t2, s);
 
-                        dyt_view_transform_size(&t2, 4, 3, &dw2, &dh2);
+                            dyt_view_transform_size(&t2, 4, 3, &dw2, &dh2);
 
-                        for (sy = 0; sy < 3; sy++) {
-                            for (sx = 0; sx < 4; sx++) {
-                                if (dyt_view_transform_project(&t2, 4, 3, dw2, dh2,
-                                                               sx, sy, &ox, &oy) != 0 ||
-                                    dyt_view_transform_map(&t2, 4, 3, dw2, dh2,
-                                                           ox, oy, &bx, &by) != 0 ||
-                                    bx != sx || by != sy)
-                                    bad = 1;
+                            for (sy = 0; sy < 3; sy++) {
+                                for (sx = 0; sx < 4; sx++) {
+                                    if (dyt_view_transform_project(&t2, 4, 3, dw2, dh2,
+                                                                   sx, sy, &ox, &oy) != 0 ||
+                                        dyt_view_transform_map(&t2, 4, 3, dw2, dh2,
+                                                               ox, oy, &bx, &by) != 0 ||
+                                        bx != sx || by != sy)
+                                        bad = 1;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        intcheck("project/map round trip over all flip x zoom x sr", bad, 0);
+        intcheck("project/map round trip over all flip x rot x zoom x sr", bad, 0);
     }
 
     /* The super-resolution factor magnifies like the zoom does, so the mapping

@@ -711,16 +711,19 @@ static QString state_line(DevState s, const dyt_snapshot_t &snap, double fps)
 /* ------------------------------------------------------------ the transform
  *
  * dyt_view_transform_map() states the contract (display.h:146): "the output is
- * the source magnified by `zoom` and then mirrored".  Transcribing it in that
- * order is what keeps this a direct expression of the contract the pointer
- * mapping inverts — and that is the property that matters, because a front end
- * that scaled or mirrored differently would put a click on the wrong pixel.
+ * the source rotated clockwise, magnified by `zoom` and then mirrored".
+ * Transcribing it in that order is what keeps this a direct expression of the
+ * contract the pointer mapping inverts — and that is the property that matters,
+ * because a front end that scaled, turned or mirrored differently would put a
+ * click on the wrong pixel.
  *
- * (The two orders happen to *agree* for uniform integer magnification:
- * mirroring a z-times block-magnified image and magnifying a mirrored source
- * both send output pixel ox to source n-1-ox/z.  So this is not a fix for odd
- * zoom; it is refusing to depend on that coincidence.  Assertion 16 pins the
- * mirror actually happening.)
+ * (The magnification and the mirror happen to *commute* with each other for
+ * uniform integer magnification: mirroring a z-times block-magnified image and
+ * magnifying a mirrored source both send output pixel ox to source n-1-ox/z.  So
+ * this is not a fix for odd zoom; it is refusing to depend on that coincidence.
+ * The rotation does not commute with either — which is why it goes first, in
+ * source space, and why map() undoes it last.  Assertion 16 pins the mirror
+ * actually happening, and 53g the rotation.)
  *
  * Qt::FastTransformation is mandatory rather than a performance choice: it is
  * Qt's nearest-neighbour, matching map()'s integer division and the OpenCV
@@ -728,12 +731,21 @@ static QString state_line(DevState s, const dyt_snapshot_t &snap, double fps)
  * pixels somewhere the shared pointer mapping does not agree with. */
 static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
 {
-    /* Both branches must own their pixels: `src` wraps the engine's buffer,
-     * which is only valid until the next dyt_frame_source_next(). */
-    QImage out = (t.zoom > 1)
-        ? src.scaled(src.width() * t.zoom, src.height() * t.zoom,
-                     Qt::IgnoreAspectRatio, Qt::FastTransformation)
-        : src.copy();
+    /* Own the pixels from the start: `src` wraps the engine's buffer, which is
+     * only valid until the next dyt_frame_source_next(), and a branch below
+     * that did nothing would otherwise hand that buffer straight back. */
+    QImage out = src.copy();
+
+    /* A quarter turn first, in source space.  QTransform::rotate() turns
+     * clockwise for a positive angle in Qt's y-down coordinates, which is the
+     * direction dyt_view_transform_rotate() counts in. */
+    if (t.rot)
+        out = out.transformed(QTransform().rotate(t.rot),
+                              Qt::FastTransformation);
+
+    if (t.zoom > 1)
+        out = out.scaled(out.width() * t.zoom, out.height() * t.zoom,
+                         Qt::IgnoreAspectRatio, Qt::FastTransformation);
 
     Qt::Orientations ori;
     if (t.flip_h) ori |= Qt::Horizontal;
@@ -2365,12 +2377,12 @@ public:
         for (int i = Tutorials; i < N_RailItems; i++)
             lay->addWidget(make_button((RailItem)i));
 
-        /* Rotate and Compare have no engine behind them yet — rotation and the
-         * two-board comparison land in later steps.  Disabled rather than
-         * silently inert: a greyed button reads as "not yet", where a live
-         * button that does nothing reads as broken.  The click handler keeps
-         * its two cases, so enabling them is a one-line change here. */
-        for (RailItem i : { Rotate, Compare })
+        /* Compare has no engine behind it yet — the two-board comparison lands
+         * in a later step.  Disabled rather than silently inert: a greyed
+         * button reads as "not yet", where a live button that does nothing
+         * reads as broken.  The click handler keeps its case, so enabling it is
+         * a one-line change here. */
+        for (RailItem i : { Compare })
             if (btn_[i])
                 btn_[i]->setEnabled(false);
     }
@@ -3767,10 +3779,10 @@ public:
         panel_->on_key = [this](int k) { handle_key(k); };
 
         /* The rail's items.  Setting and Contact open a dialog; Palette opens
-         * its picker; Mark and Reset act on the session; Tutorials is the
-         * guide.  Rotate and Compare stay no-ops until the engine behind them
-         * exists (rotation and the two-board comparison), so no rail button is
-         * ever a control that does nothing *silently* — the two that wait are
+         * its picker; Mark and Reset act on the session; Rotate turns the
+         * picture; Tutorials is the guide.  Compare stays a no-op until the
+         * engine behind it exists (the two-board comparison), so no rail button
+         * is ever a control that does nothing *silently* — the one that waits is
          * documented here and in the README. */
         rail_->on_action = [this](IconRail::RailItem i) {
             switch (i) {
@@ -3794,13 +3806,21 @@ public:
                 if (sess_)
                     dyt_session_reset_view(sess_);
                 break;
+            case IconRail::Rotate:
+                /* A quarter turn clockwise per click, the step the reference's
+                 * own Rotate button takes.  It is a session call, not a GUI
+                 * flag, because the rotation is part of the transform the
+                 * pointer mapping inverts — a copy kept here would let the
+                 * picture and the clicks disagree.  Reset Image clears it. */
+                if (sess_)
+                    dyt_session_rotate(sess_, DYT_ROT_90);
+                break;
             case IconRail::Tutorials:
                 if (on_help_)
                     on_help_();
                 break;
-            case IconRail::Rotate:
             case IconRail::Compare:
-                break;      /* the engine behind each lands in a later step */
+                break;      /* the engine behind it lands in a later step */
             case IconRail::ContactUs: {
                 ContactDialog d(this);
                 d.exec();
@@ -4603,6 +4623,13 @@ private:
                 const QSignalBlocker block(b);
                 b->setChecked(snap_.tool != DYT_TOOL_NONE);
             }
+            /* Rotate is a *mode* rather than an action, so its lit state is
+             * worth showing: it says the picture is turned, and it goes out
+             * again when Reset Image clears the rotation. */
+            if (QPushButton *b = rail_->button(IconRail::Rotate)) {
+                const QSignalBlocker block(b);
+                b->setChecked(snap_.xform.rot != DYT_ROT_NONE);
+            }
         }
 
         /* The Settings dialog's two window-state boxes, so 'd' toggled from the
@@ -5264,10 +5291,12 @@ static int selftest(const opts &o)
     }
 
     /* 16. The mirror is applied, in the sense dyt_view_transform_map() inverts.
-     * Driven directly, because the window has no way to reach it yet: no key
-     * or option sets the flip until the interaction task, and the fixture
-     * opens unmirrored.  A 3x1 source with a distinct pixel at each end, at
-     * zoom 2 with flip_h, must come out 6 wide with the ends swapped. */
+     * Driven directly through transformed() rather than by pressing a key,
+     * because what is under test here is the *render*: the flip's routing to
+     * the session is assertion 44's, and the mapping is display_test's, but
+     * neither proves Qt mirrors the picture the way the mapping says.  A 3x1
+     * source with a distinct pixel at each end, at zoom 2 with flip_h, must
+     * come out 6 wide with the ends swapped. */
     {
         QImage src(3, 1, QImage::Format_RGB888);
         src.setPixelColor(0, 0, QColor(255, 0, 0));
@@ -5287,6 +5316,55 @@ static int selftest(const opts &o)
                     out.width(), out.height(),
                     out.pixelColor(0, 0).name().toUtf8().constData(),
                     out.pixelColor(5, 0).name().toUtf8().constData());
+        if (!ok)
+            fails++;
+    }
+
+    /* 16b. The rotation is applied — and, the part that actually matters, the
+     * Qt render and the engine's mapping agree about *which way*.  A source
+     * encodes its own coordinates in its pixel colours, and every pixel of the
+     * turned output must be the source pixel dyt_view_transform_map() names.
+     * That is the same property the pointer routing rests on, and the one a
+     * front end that turned the picture the other way round would fail while
+     * still producing a correctly sized image. */
+    {
+        const int SW = 3, SH = 2;
+        QImage src(SW, SH, QImage::Format_RGB888);
+        for (int y = 0; y < SH; y++)
+            for (int x = 0; x < SW; x++)
+                src.setPixelColor(x, y, QColor(x * 40, y * 40, 0));
+
+        dyt_view_transform_t t{};
+        t.rot = DYT_ROT_90;
+        const QImage out = transformed(src, t);
+
+        int bad = 0, seen = 0;
+        for (int oy = 0; oy < out.height(); oy++) {
+            for (int ox = 0; ox < out.width(); ox++) {
+                int sx = -1, sy = -1;
+
+                if (dyt_view_transform_map(&t, SW, SH, out.width(),
+                                           out.height(), ox, oy,
+                                           &sx, &sy) != 0 ||
+                    out.pixelColor(ox, oy) != src.pixelColor(sx, sy))
+                    bad++;
+                seen++;
+            }
+        }
+
+        /* And the turn is clockwise, which is the direction the rail's button
+         * names: the source's top-left corner comes out at the output's
+         * top-right, and its bottom-right at the output's bottom-left. */
+        const bool dir =
+            out.width() == SH && out.height() == SW &&
+            out.pixelColor(out.width() - 1, 0) == src.pixelColor(0, 0) &&
+            out.pixelColor(0, out.height() - 1) == src.pixelColor(SW - 1, SH - 1);
+
+        const bool ok = bad == 0 && seen == SW * SH && dir;
+        std::printf("  %-4s the rotation is applied (rot %d, %dx%d, %d of %d "
+                    "pixels off, clockwise %s)\n", ok ? "ok" : "FAIL", t.rot,
+                    out.width(), out.height(), bad, seen,
+                    dir ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -7666,7 +7744,70 @@ static int selftest(const opts &o)
                               r2.xform.zoom == DYT_ZOOM_MIN &&
                               r2.range_mode == DYT_RANGE_AUTO;
 
-        /* Put the framing back as it was found.  Without this the reset would
+        /* --- Tutorials opens the guide, through the front end's callback, so
+         * no modal opens here. */
+        int help = 0;
+        win.on_help_ = [&]() { help++; };
+        QPushButton *tbtn = rail ? rail->button(IconRail::Tutorials) : nullptr;
+        if (tbtn)
+            tbtn->click();
+        win.on_help_ = nullptr;
+        const bool help_ok = help == 1;
+
+        /* --- Rotate.  Clicked for real, then checked against the *session*:
+         * a quarter turn per click, the output geometry swapped with it, and
+         * Reset Image taking it back off — which is the reset's own promise,
+         * and the reason rotation is a session field rather than a GUI one. */
+        QPushButton *rot = rail ? rail->button(IconRail::Rotate) : nullptr;
+        QPushButton *cmp = rail ? rail->button(IconRail::Compare) : nullptr;
+
+        /* The canvas's own hint, before and after: it is what fit_to_view()
+         * sizes the window from, so a hint that did not swap would leave the
+         * turned picture cropped.  A frame is painted first, so the "before"
+         * hint is the same zoom the "after" one is — the reset above changed
+         * the framing, and comparing across that would measure the reset. */
+        pm.step();
+        const QSize hint0 = win.view() ? win.view()->sizeHint() : QSize();
+
+        if (rot)
+            rot->click();
+        dyt_snapshot_t q1{};
+        dyt_session_snapshot(sess, &q1, nullptr, 0);
+        pm.step();                      /* a frame painted through the turn */
+
+        const QSize hint1 = win.view() ? win.view()->sizeHint() : QSize();
+        const bool rot_fit_ok = hint0.isValid() && hint1.isValid() &&
+                                hint1.width()  < hint0.width() &&
+                                hint1.height() > hint0.height();
+
+        /* The turned geometry must be the untilted one with the axes swapped.
+         * Compared against size() of the same transform with rot cleared rather
+         * than against v0.width/height, because size() carries the zoom and the
+         * sr factor too — and those are not what is under test here. */
+        dyt_view_transform_t flat = q1.xform;
+        flat.rot = DYT_ROT_NONE;
+
+        int rw = 0, rh = 0, pw = 0, ph = 0, wx = 0, wy = 0, bx2 = 0, by2 = 0;
+        dyt_view_transform_size(&flat, v0.width, v0.height, &pw, &ph);
+        dyt_view_transform_size(&q1.xform, v0.width, v0.height, &rw, &rh);
+        const bool rot_ok = q1.xform.rot == DYT_ROT_90 &&
+                            rw == ph && rh == pw &&
+                            dyt_view_transform_project(&q1.xform, v0.width,
+                                                       v0.height, rw, rh,
+                                                       0, 0, &wx, &wy) == 0 &&
+                            dyt_view_transform_map(&q1.xform, v0.width,
+                                                   v0.height, rw, rh,
+                                                   wx, wy, &bx2, &by2) == 0 &&
+                            bx2 == 0 && by2 == 0;
+
+        if (rbtn)
+            rbtn->click();
+        dyt_snapshot_t q2{};
+        dyt_session_snapshot(sess, &q2, nullptr, 0);
+        const bool rot_reset_ok = q2.xform.rot == DYT_ROT_NONE;
+
+        /* Put the framing back as it was found.  Without this the reset — and
+         * the Rotate above, which ends by pressing the same button — would
          * quietly become the state the geometry assertions after this one
          * measure, so a change here could break them for a reason that has
          * nothing to do with geometry. */
@@ -7678,37 +7819,28 @@ static int selftest(const opts &o)
             dyt_session_toggle_flip_h(sess);
         if ((r3.xform.flip_v != 0) != (v0.xform.flip_v != 0))
             dyt_session_toggle_flip_v(sess);
+        if (r3.xform.rot != v0.xform.rot)
+            dyt_session_rotate(sess, v0.xform.rot - r3.xform.rot);
         dyt_session_set_range_mode(sess, v0.range_mode);
         pm.step();
 
-        /* --- Tutorials opens the guide, through the front end's callback, so
-         * no modal opens here. */
-        int help = 0;
-        win.on_help_ = [&]() { help++; };
-        QPushButton *tbtn = rail ? rail->button(IconRail::Tutorials) : nullptr;
-        if (tbtn)
-            tbtn->click();
-        win.on_help_ = nullptr;
-        const bool help_ok = help == 1;
-
-        /* --- The two whose engine has not landed are unavailable, not inert. */
-        QPushButton *rot = rail ? rail->button(IconRail::Rotate) : nullptr;
-        QPushButton *cmp = rail ? rail->button(IconRail::Compare) : nullptr;
-        const bool pending_ok = rot && !rot->isEnabled() &&
-                                cmp && !cmp->isEnabled();
+        /* --- The one whose engine has not landed is unavailable, not inert. */
+        const bool pending_ok = cmp && !cmp->isEnabled();
 
         const bool ok = count_ok && mark_ok && low_ok && high_ok &&
                         popup_ok && mark_tool_ok && reset_ok && help_ok &&
-                        pending_ok;
+                        rot_ok && rot_fit_ok && rot_reset_ok && pending_ok;
         std::printf("  %-4s the rail's items reach what they claim "
                     "(%d palette entries %s, mark %s, pick %s/%s, popup %s, "
-                    "re-arm %s, reset %s, tutorials %s, pending %s)\n",
+                    "re-arm %s, reset %s, rotate %s, refit %s, rotate-reset %s, "
+                    "tutorials %s, pending %s)\n",
                     ok ? "ok" : "FAIL", (int)pals.size(),
                     count_ok ? "yes" : "NO", mark_ok ? "yes" : "NO",
                     low_ok ? "yes" : "NO", high_ok ? "yes" : "NO",
                     popup_ok ? "yes" : "NO", mark_tool_ok ? "yes" : "NO",
-                    reset_ok ? "yes" : "NO", help_ok ? "yes" : "NO",
-                    pending_ok ? "yes" : "NO");
+                    reset_ok ? "yes" : "NO", rot_ok ? "yes" : "NO",
+                    rot_fit_ok ? "yes" : "NO", rot_reset_ok ? "yes" : "NO",
+                    help_ok ? "yes" : "NO", pending_ok ? "yes" : "NO");
         if (!ok)
             fails++;
     }

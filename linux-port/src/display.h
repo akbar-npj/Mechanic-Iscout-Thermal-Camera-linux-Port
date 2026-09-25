@@ -131,18 +131,35 @@ void dyt_display_update(dyt_display_t *d, const dyt_frame_stats_t *st);
 #define DYT_SR_MAX 2
 
 typedef struct {
-    int flip_h;   /* mirror left<->right */
-    int flip_v;   /* mirror top<->bottom */
+    int flip_h;   /* mirror left<->right, in output space */
+    int flip_v;   /* mirror top<->bottom, in output space */
+    int rot;      /* clockwise rotation in degrees, one of DYT_ROT_* */
     int zoom;     /* integer magnification, DYT_ZOOM_MIN..DYT_ZOOM_MAX */
     int sr;       /* super-resolution magnification, DYT_SR_MIN..DYT_SR_MAX */
 } dyt_view_transform_t;
 
-/* Identity: no flip, zoom 1, sr 1. */
+/* Rotation, clockwise, in degrees.  A quarter turn is the only granularity the
+ * vendor's viewer offers — its Rotate button steps 90° at a time — and it is the
+ * only granularity the mapping can invert *exactly* on an integer grid: any
+ * other angle would need a resample, and then a click could not name a source
+ * pixel without agreeing on the filter. */
+#define DYT_ROT_NONE 0
+#define DYT_ROT_90   90
+#define DYT_ROT_180  180
+#define DYT_ROT_270  270
+
+/* Identity: no flip, no rotation, zoom 1, sr 1. */
 void dyt_view_transform_init(dyt_view_transform_t *t);
 
 /* Toggle the mirrors.  Backs the viewer's "h"/"v" keys. */
 void dyt_view_transform_toggle_flip_h(dyt_view_transform_t *t);
 void dyt_view_transform_toggle_flip_v(dyt_view_transform_t *t);
+
+/* Step the rotation by `delta` degrees, wrapping through the four quarter
+ * turns.  Backs the rail's Rotate button (a click passes +90).  A delta that is
+ * not a multiple of 90 is rounded away from zero rather than dropped, so a
+ * fractional request still moves the picture. */
+void dyt_view_transform_rotate(dyt_view_transform_t *t, int delta);
 
 /* Step the zoom by `delta`, clamped to DYT_ZOOM_MIN..DYT_ZOOM_MAX. */
 void dyt_view_transform_zoom(dyt_view_transform_t *t, int delta);
@@ -152,19 +169,22 @@ void dyt_view_transform_zoom(dyt_view_transform_t *t, int delta);
  * is the one the image the front end is holding was actually produced at. */
 void dyt_view_transform_set_sr(dyt_view_transform_t *t, int sr);
 
-/* Size of the transformed output for a given source size: the source magnified
- * by zoom * sr. */
+/* Size of the transformed output for a given source size: the source rotated,
+ * then magnified by zoom * sr.  A quarter turn swaps the axes, so a 256x192
+ * frame is 192x256 at 90° — which is the whole reason a front end must ask
+ * rather than assume. */
 void dyt_view_transform_size(const dyt_view_transform_t *t,
                              int src_w, int src_h, int *dst_w, int *dst_h);
 
 /* Map output pixel (ox, oy) in a dst_w x dst_h image back to source pixel
  * coordinates in a src_w x src_h image.
  *
- * The output is the source magnified by `zoom * sr` and then mirrored, so the
- * mapping undoes the mirror in output space and then divides by that product.
- * Nearest-neighbour semantics: every output pixel maps to exactly one source
- * pixel.  Returns 0 on success, -1 if the point falls outside the source
- * (which a caller iterating its own output should not see). */
+ * The output is the source rotated clockwise by `rot`, magnified by `zoom * sr`
+ * and then mirrored, so the mapping undoes that in reverse: the mirror in
+ * output space, then the magnification, then the rotation.  Nearest-neighbour
+ * semantics: every output pixel maps to exactly one source pixel.  Returns 0 on
+ * success, -1 if the point falls outside the source (which a caller iterating
+ * its own output should not see). */
 int dyt_view_transform_map(const dyt_view_transform_t *t,
                            int src_w, int src_h, int dst_w, int dst_h,
                            int ox, int oy, int *sx, int *sy);

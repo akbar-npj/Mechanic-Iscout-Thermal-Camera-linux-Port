@@ -192,6 +192,7 @@ void dyt_view_transform_init(dyt_view_transform_t *t)
 
     t->flip_h = 0;
     t->flip_v = 0;
+    t->rot    = DYT_ROT_NONE;
     t->zoom   = DYT_ZOOM_MIN;
     t->sr     = DYT_SR_MIN;
 }
@@ -206,6 +207,36 @@ void dyt_view_transform_toggle_flip_v(dyt_view_transform_t *t)
 {
     if (t)
         t->flip_v = !t->flip_v;
+}
+
+/* Any degree value a caller may have stored, reduced to a quarter turn 0..3:
+ * 45 reads as 1 (rounds up), -90 as 3, 359 as 0.  Every function below then
+ * works in quarter turns, so a field set by hand rather than by
+ * dyt_view_transform_rotate() still behaves. */
+static int rot_quarter(int deg)
+{
+    int q = (deg % 360 + 360) % 360;
+
+    return ((q + 45) / 90) % 4;
+}
+
+void dyt_view_transform_rotate(dyt_view_transform_t *t, int delta)
+{
+    /* The four fields the transform holds, named rather than derived from one
+     * of them, so the mapping from a quarter turn back to degrees is explicit. */
+    static const int kDeg[4] = { DYT_ROT_NONE, DYT_ROT_90,
+                                 DYT_ROT_180,  DYT_ROT_270 };
+    int steps, q;
+
+    if (!t)
+        return;
+
+    /* Quarter turns, rounded away from zero, so a fractional request moves the
+     * picture rather than being dropped. */
+    steps = (delta >= 0) ? (delta + 45) / 90 : (delta - 45) / 90;
+
+    q = ((rot_quarter(t->rot) + steps) % 4 + 4) % 4;   /* double modulo: wraps */
+    t->rot = kDeg[q];
 }
 
 void dyt_view_transform_zoom(dyt_view_transform_t *t, int delta)
@@ -248,16 +279,22 @@ void dyt_view_transform_size(const dyt_view_transform_t *t,
                              int src_w, int src_h, int *dst_w, int *dst_h)
 {
     int z = t ? transform_scale(t) : DYT_ZOOM_MIN;
+    int q = t ? rot_quarter(t->rot) : 0;
+    /* A quarter turn swaps the axes: at 90° the output is as wide as the
+     * source is tall.  This is why the front end must ask for the size rather
+     * than assume src * zoom. */
+    int rw = (q & 1) ? src_h : src_w;
+    int rh = (q & 1) ? src_w : src_h;
 
-    if (dst_w) *dst_w = src_w * z;
-    if (dst_h) *dst_h = src_h * z;
+    if (dst_w) *dst_w = rw * z;
+    if (dst_h) *dst_h = rh * z;
 }
 
 int dyt_view_transform_map(const dyt_view_transform_t *t,
                            int src_w, int src_h, int dst_w, int dst_h,
                            int ox, int oy, int *sx, int *sy)
 {
-    int z, x, y;
+    int z, q, x, y, rw, rh, ux, uy;
 
     if (!t || src_w <= 0 || src_h <= 0)
         return -1;
@@ -265,20 +302,33 @@ int dyt_view_transform_map(const dyt_view_transform_t *t,
         return -1;
 
     z = transform_scale(t);
+    q = rot_quarter(t->rot);
 
-    /* The output is the source magnified then mirrored, so undo the mirror
-     * in output space first, then divide by the magnification (nearest-
-     * neighbour). */
+    /* The output is the source rotated, magnified and then mirrored, so undo
+     * that in reverse: the mirror in output space first, then divide by the
+     * magnification (nearest-neighbour), which leaves a pixel of the *rotated*
+     * image. */
     x = t->flip_h ? (dst_w - 1 - ox) : ox;
     y = t->flip_v ? (dst_h - 1 - oy) : oy;
     x /= z;
     y /= z;
 
-    if (x < 0 || y < 0 || x >= src_w || y >= src_h)
+    rw = (q & 1) ? src_h : src_w;
+    rh = (q & 1) ? src_w : src_h;
+    if (x < 0 || y < 0 || x >= rw || y >= rh)
         return -1;
 
-    if (sx) *sx = x;
-    if (sy) *sy = y;
+    /* Finally undo the rotation.  The forward form is in project(); each case
+     * here is its exact inverse. */
+    switch (q) {
+    case 1:  ux = y;             uy = src_h - 1 - x; break;   /* 90 cw */
+    case 2:  ux = src_w - 1 - x; uy = src_h - 1 - y; break;   /* 180 */
+    case 3:  ux = src_w - 1 - y; uy = x;             break;   /* 270 cw */
+    default: ux = x;             uy = y;             break;   /* 0 */
+    }
+
+    if (sx) *sx = ux;
+    if (sy) *sy = uy;
     return 0;
 }
 
@@ -286,7 +336,7 @@ int dyt_view_transform_project(const dyt_view_transform_t *t,
                                int src_w, int src_h, int dst_w, int dst_h,
                                int sx, int sy, int *ox, int *oy)
 {
-    int z, x, y;
+    int z, q, x, y;
 
     if (!t || src_w <= 0 || src_h <= 0)
         return -1;
@@ -294,11 +344,22 @@ int dyt_view_transform_project(const dyt_view_transform_t *t,
         return -1;
 
     z = transform_scale(t);
+    q = rot_quarter(t->rot);
 
-    /* Centre of the magnified block, then the mirror — the exact inverse of
-     * dyt_view_transform_map's "undo mirror, then divide". */
-    x = sx * z + z / 2;
-    y = sy * z + z / 2;
+    /* Rotate first, into the rotated image's own coordinates.  A source
+     * pixel (sx, sy) lands at the position below; map() inverts each case. */
+    switch (q) {
+    case 1:  x = src_h - 1 - sy; y = sx;             break;   /* 90 cw */
+    case 2:  x = src_w - 1 - sx; y = src_h - 1 - sy; break;   /* 180 */
+    case 3:  x = sy;             y = src_w - 1 - sx; break;   /* 270 cw */
+    default: x = sx;             y = sy;             break;   /* 0 */
+    }
+
+    /* Then the magnification — the centre of the block — and the mirror last,
+     * in output space.  The exact inverse of map()'s "undo mirror, then
+     * divide". */
+    x = x * z + z / 2;
+    y = y * z + z / 2;
     if (t->flip_h) x = dst_w - 1 - x;
     if (t->flip_v) y = dst_h - 1 - y;
 

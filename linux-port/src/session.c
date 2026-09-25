@@ -912,6 +912,15 @@ void dyt_session_zoom(dyt_session_t *s, int delta)
     pthread_mutex_unlock(&s->m);
 }
 
+void dyt_session_rotate(dyt_session_t *s, int delta)
+{
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->m);
+    dyt_view_transform_rotate(&s->xform, delta);
+    pthread_mutex_unlock(&s->m);
+}
+
 void dyt_session_reset_view(dyt_session_t *s)
 {
     if (!s)

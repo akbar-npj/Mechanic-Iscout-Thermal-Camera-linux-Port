@@ -184,20 +184,36 @@ page could not be made to fit a small screen either. 53h checks both halves.
 ### The rail
 
 The rail's eight items split three ways: those that act on the session, those
-that open a dialog or a popup, and the two whose engine has not landed.
+that open a dialog or a popup, and the one whose engine has not landed.
 
 The **top group** acts on the picture. **Palette** opens its picker; **Mark**
 re-arms the tool the user last had — `sync_actions()` remembers the last
 *active* tool, so `n` clearing the tool does not erase it, and Mark brings it
-back rather than always choosing Spot; **Reset** calls `dyt_session_reset_view`,
-one session operation rather than four GUI setters, so a caller cannot forget one
-of the four things a reset undoes (zoom to the floor, both mirrors off, range
-back to AUTO — palette, unit and fusion are deliberately left alone, since they
-are how the picture is rendered rather than how it is framed). **Rotate** and
-**Compare** are **disabled**: rotation and the two-board comparison land in later
-steps, and a greyed button reads as "not yet" where a live button that does
-nothing reads as broken. The click handler keeps their two cases, so enabling
-them is a one-line change.
+back rather than always choosing Spot; **Rotate** turns the picture a quarter
+clockwise per click; **Reset** calls `dyt_session_reset_view`, one session
+operation rather than five GUI setters, so a caller cannot forget one of the five
+things a reset undoes (zoom to the floor, both mirrors off, the rotation back to
+0, range back to AUTO — palette, unit and fusion are deliberately left alone,
+since they are how the picture is rendered rather than how it is framed).
+**Compare** is **disabled**: the two-board comparison lands in a later step, and
+a greyed button reads as "not yet" where a live button that does nothing reads
+as broken. The click handler keeps its case, so enabling it is a one-line change.
+
+**Rotate** is a session call rather than a GUI flag, because the rotation is part
+of the transform the pointer mapping inverts — a copy kept in the window would
+let the picture and the clicks disagree. That is also why it is a *quarter turn*
+and not a free angle: a quarter turn is the only granularity an integer grid can
+invert exactly, so a click on a turned picture still names one source pixel
+rather than depending on a resample filter. The button is checkable and lit while
+the rotation is not zero, which says "the picture is turned" at a glance and goes
+out again when Reset clears it. Assertion 53g clicks it and then checks the
+*session* — the rotation advanced, the output geometry swapped its axes, a point
+still maps back to the pixel `project()` sent it from, and the canvas's own hint
+swapped with it (so `fit_to_view()` re-fits the window rather than leaving the
+turned picture cropped) — and assertion 16b renders a rotated frame and requires
+every output pixel to be the source pixel `dyt_view_transform_map()` names.
+`tools/dytview.cpp` honours the same field and has an `x` key for it, so the two
+front ends cannot render the transform differently.
 
 The **Palette picker** is a popup under the button rather than a tab or a dialog,
 because the reference's rail item is exactly that: a picker you open, choose from
@@ -466,19 +482,33 @@ collapse the colour scale onto it, so `pump::step()` holds the placeholder
 instead. Once a frame *has* been painted the placeholder is ignored, so a live
 stall keeps showing the last real frame rather than flickering back.
 
-### Zoom and mirror
+### Zoom, mirror and rotation
 
 `dyt_view_transform_map()` states the contract (`display.h:146`): *"the output is
-the source magnified by `zoom` and then mirrored"*. `transformed()` transcribes it
-in that order, which is what keeps it a direct expression of the contract the
-pointer mapping inverts — a front end that scaled or mirrored differently would
-put a click on the wrong pixel.
+the source rotated clockwise, magnified by `zoom` and then mirrored"*.
+`transformed()` transcribes it in that order, which is what keeps it a direct
+expression of the contract the pointer mapping inverts — a front end that scaled,
+turned or mirrored differently would put a click on the wrong pixel.
 
-The two orders happen to *agree* for uniform integer magnification (mirroring a
-`z`-times block-magnified image and magnifying a mirrored source both send output
-pixel `ox` to source `n-1-ox/z`), so this is not a fix for odd zoom. It is
-refusing to depend on that coincidence. Assertion 16 pins the mirror actually
-happening, driven directly, because nothing yet sets the flip from the UI.
+The magnification and the mirror happen to *agree* for uniform integer
+magnification (mirroring a `z`-times block-magnified image and magnifying a
+mirrored source both send output pixel `ox` to source `n-1-ox/z`), so this is not
+a fix for odd zoom. It is refusing to depend on that coincidence. The rotation
+does not commute with either, which is why it goes *first*, in source space, and
+why `map()` undoes it last. Assertion 16 pins the mirror actually happening and
+assertion 16b the rotation: both render a small image whose pixels encode their
+own coordinates through `transformed()` and require the result to match what
+`map()` names, so the two cannot disagree about which way round the picture goes.
+
+A rotation is a quarter turn and nothing else. That is the granularity the
+vendor's own Rotate button steps, and it is the only granularity an integer grid
+can invert exactly: any other angle needs a resample, and then a click could not
+name a source pixel without the render and the mapping agreeing on a filter.
+`dyt_view_transform_rotate()` takes a delta in degrees and wraps through the four
+quarters (a delta that is not a multiple of 90 is rounded rather than dropped),
+and `dyt_view_transform_size()` is what reports the axes swapping — a 256×192
+frame is 192×256 at 90°, so a front end that rendered `src * zoom` would put
+every overlay in the wrong place the moment the picture was turned.
 
 `Qt::FastTransformation` is mandatory rather than a performance choice: it is Qt's
 nearest-neighbour, matching `map()`'s integer division and the OpenCV viewer's
@@ -1065,6 +1095,7 @@ $ ./build/dytqt --selftest
   ok   a failed bring-up is a state, not a crash (NO DEVICE)
   ok   zoom 2 is applied to the frame (512x384, hint 660x400)
   ok   the mirror is applied (zoom 2, flip_h, 6x2, ends #0000ff/#ff0000)
+  ok   the rotation is applied (rot 90, 2x3, 0 of 6 pixels off, clockwise yes)
   ok   --live contradicts --fixture/--selftest, and is refused
   ok   the capture options reach dyt_capture_opts (1234:5678, fmt 3, h 256, t_amb 21.5, AD)
   ok   the stall watchdog fires on a freeze, not on motion or warm-up
@@ -1110,7 +1141,7 @@ $ ./build/dytqt --selftest
   ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
-  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, tutorials yes, pending yes)
+  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, pending yes)
   ok   the control panel asks for its content's height (panel 731 of 731, page 705 of 705, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
@@ -1157,9 +1188,9 @@ band and disarming, the isotherm toggling, and the strip reporting the
 measurement. The expected source pixel comes from `dyt_view_transform_map()`
 itself, so they pin the *routing* (that a widget coordinate reaches
 `dyt_vm_tool_mouse()` with the right `dst` size) rather than the transform, which
-assertion 16 already covers. The measurement overlay's *painting* is deliberately
-not asserted for the box and the line: a pixel check on a drawn rectangle is
-brittle, so it was verified by eye from a fixture render instead.
+assertions 16 and 16b already cover. The measurement overlay's *painting* is
+deliberately not asserted for the box and the line: a pixel check on a drawn
+rectangle is brittle, so it was verified by eye from a fixture render instead.
 
 **24b** is the polygon, and it is the one that does assert a measurement
 overlay's painting — by *counting* the mark colour with the outline placed and
