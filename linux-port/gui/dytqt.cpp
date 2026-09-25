@@ -247,6 +247,45 @@ private:
     double    t0_ = 0.0, t1_ = 0.0;
 };
 
+/* Is the stream still moving?
+ *
+ * The only liveness signal the session offers is `seq`, the count of frames the
+ * engine has processed (session.h:73).  A disconnect and a wedge look identical
+ * from here — libuvc handles LIBUSB_TRANSFER_NO_DEVICE silently, so the callback
+ * simply stops and `seq` freezes — which is why the state this feeds is named
+ * for the symptom, not the cause.
+ *
+ * `ready` gates it.  While the start-up filler is streaming, `ready` is 0, so a
+ * warm-up is never a stall; and because `seq` advances during the filler too, a
+ * working warm-up does not trip the counter either.  Both guards are wanted:
+ * the first covers a device that connects and sends nothing, the second a
+ * device that connects and sends only filler. */
+struct StallWatch {
+    static constexpr double kStallS = 1.5;   /* ~37 frame intervals at 25 fps */
+
+    bool      have_ = false;
+    long long last_seq_ = 0;
+    double    last_change_t_ = 0.0;
+
+    bool observe(long long seq, double t, bool ready)
+    {
+        if (!have_) {
+            have_ = true;
+            last_seq_ = seq;
+            last_change_t_ = t;
+            return false;
+        }
+        if (seq != last_seq_) {
+            last_seq_ = seq;
+            last_change_t_ = t;
+            return false;
+        }
+        return ready && (t - last_change_t_ > kStallS);
+    }
+
+    void reset() { have_ = false; }
+};
+
 /* ---------------------------------------------------------- device state
  *
  * next_live() returns WAIT both before the first frame *and* for the whole
@@ -255,18 +294,20 @@ private:
  * therefore decided from the session's own `seq`/`ready`, which is the same
  * scalars-only snapshot next_live() takes internally and costs nothing.
  *
- * Kept a pure function of five booleans so every state is reachable in
+ * Kept a pure function of six booleans so every state is reachable in
  * `--selftest` with no device attached — which is the only way two of these
- * five can ever be tested at all. */
-enum class DevState { Fixture, Connecting, NoDevice, WarmingUp, Live };
+ * six can ever be tested at all. */
+enum class DevState { Fixture, Connecting, NoDevice, WarmingUp, Live, Stalled };
 
 static DevState device_state(bool live, bool bringup_done, int bringup_rc,
-                             bool snap_ok, bool snap_ready)
+                             bool snap_ok, bool snap_ready, bool stalled)
 {
-    if (!live)              return DevState::Fixture;
-    if (!bringup_done)      return DevState::Connecting;
-    if (bringup_rc != 0)    return DevState::NoDevice;
+    if (!live)                   return DevState::Fixture;
+    if (!bringup_done)           return DevState::Connecting;
+    if (bringup_rc != 0)         return DevState::NoDevice;
     if (!snap_ok || !snap_ready) return DevState::WarmingUp;
+    /* Checked last, so a stall can never mask Connecting/NoDevice/WarmingUp. */
+    if (stalled)                 return DevState::Stalled;
     return DevState::Live;
 }
 
@@ -278,6 +319,7 @@ static const char *state_label(DevState s)
     case DevState::NoDevice:   return "NO DEVICE";
     case DevState::WarmingUp:  return "WARMING UP";
     case DevState::Live:       return "LIVE";
+    case DevState::Stalled:    return "NO SIGNAL";
     }
     return "?";
 }
@@ -289,6 +331,7 @@ static const char *state_placeholder(DevState s)
     case DevState::Connecting: return "connecting to camera…";
     case DevState::NoDevice:   return "no camera found (see stderr)";
     case DevState::WarmingUp:  return "warming up - waiting for live data…";
+    case DevState::Stalled:    return "no signal - last frame held";
     default:                   return "waiting for a frame";
     }
 }
@@ -304,15 +347,17 @@ static const char *state_placeholder(DevState s)
  * image, where it is already clipped; extending it would clip further and
  * would change another front end's display for no gain.  See gui/README.md.
  *
- * The rate is only shown for the two states that have painted frames: a
- * "0.0 fps" beside CONNECTING would be a claim about a stream that is not
- * running yet. */
+ * The rate is only shown for the states that have painted frames: a "0.0 fps"
+ * beside CONNECTING would be a claim about a stream that is not running yet.
+ * STALLED is included on purpose — there the 0.0 *is* the evidence, and hiding
+ * it would leave the frozen picture looking healthy. */
 static QString state_line(DevState s, const dyt_snapshot_t &snap, double fps)
 {
     QString out = QStringLiteral("range %1   |   %2")
                       .arg(QString::fromUtf8(dyt_range_mode_name(snap.range_mode)),
                            QString::fromUtf8(state_label(s)));
-    if (s == DevState::Fixture || s == DevState::Live)
+    if (s == DevState::Fixture || s == DevState::Live ||
+        s == DevState::Stalled)
         out += QStringLiteral("  %1 fps").arg(fps, 0, 'f', 1);
     return out;
 }
@@ -614,6 +659,7 @@ struct pump {
     int       fails  = 0;
     double    worst_ms = 0.0;  /* slowest single step, for the fps headroom claim */
     FpsMeter  fps;
+    StallWatch stall;
 
     double now_s() const
     {
@@ -631,11 +677,12 @@ struct pump {
         if (!fs) {
             /* Bring-up failed, so there is no source to pull from — but the
              * window must still say so rather than sit blank.  This is the
-             * NoDevice path, and the reason a failed bring-up does not exit. */
+             * NoDevice path, and the reason a failed bring-up does not exit.
+             * No source means no liveness signal, so `stalled` is false. */
             dyt_snapshot_t snap{};
             const bool have = dyt_session_snapshot(sess, &snap, nullptr, 0) == 0;
             const DevState ds = device_state(live, bringup_done, bringup_rc, have,
-                                             have && snap.ready != 0);
+                                             have && snap.ready != 0, false);
             win->view()->set_placeholder(QString::fromUtf8(state_placeholder(ds)));
             win->set_state_line(ds, snap, fps.fps());
             return true;
@@ -655,8 +702,18 @@ struct pump {
             return true;
         }
 
+        /* Both the rate and the stall decision come from `seq` — the frames the
+         * engine processed — never from the frames painted.  A stalled source
+         * still returns FRAME (it re-renders the last one), so a paint-driven
+         * meter would report a healthy 25 fps over a frozen picture, which is
+         * the exact lie this is here to stop telling. */
+        const double t     = now_s();
+        const bool   ready = snap.ready != 0;
+        const bool   stalled = stall.observe(snap.seq, t, ready);
+        fps.update(snap.seq, t);
+
         const DevState ds = device_state(live, bringup_done, bringup_rc,
-                                        true, snap.ready != 0);
+                                        true, ready, stalled);
 
         if (!snap.ready) {
             /* The start-up filler decodes to a legitimate-looking 238.85 C
@@ -677,8 +734,7 @@ struct pump {
         win->view()->set_frame(snap, transformed(wrapped, snap.xform), pal);
         win->set_frame_status(snap, ds, fps.fps(), mode);
 
-        frames++;
-        fps.update(frames, now_s());
+        frames++;                        /* painted frames, for --frames/--png */
         return true;
     }
 
@@ -686,6 +742,23 @@ private:
     const std::chrono::steady_clock::time_point t_start_ =
         std::chrono::steady_clock::now();
 };
+
+/* ------------------------------------------------------------ retry policy */
+
+/* Seconds to wait before retry N+1, where N is the number of retries already
+ * made.  Negative means "stop trying".
+ *
+ * Pure, so --selftest pins it with no device — and the shape that matters
+ * (double to a cap, then give up) is exactly the part a camera would not make
+ * more testable.  0.5 s first, because a replug is often quick; 30 s at the
+ * top, so a device that is genuinely gone does not spin forever. */
+static double retry_delay_s(int attempt)
+{
+    static const double kBase = 0.5, kCap = 30.0;
+    if (attempt < 0 || attempt >= 8) return -1.0;    /* 8 tries, then stop */
+    const double d = kBase * (double)(1 << attempt); /* .5,1,2,4,8,16,30,30 */
+    return d > kCap ? kCap : d;
+}
 
 /* ------------------------------------------------------------- selftest
  *
@@ -954,12 +1027,12 @@ static int selftest(const opts &o)
             ok = dyt_session_process(fs_sess, &fi) == 0 &&
                  dyt_session_snapshot(fs_sess, &fs_snap, nullptr, 0) == 0 &&
                  fs_snap.ready == 0 &&
-                 device_state(true, true, 0, true, fs_snap.ready != 0)
+                 device_state(true, true, 0, true, fs_snap.ready != 0, false)
                      == DevState::WarmingUp;
             std::printf("  %-4s a filler frame is not a live frame "
                         "(ready %d, %s)\n", ok ? "ok" : "FAIL",
                         fs_snap.ready, state_label(device_state(true, true, 0,
-                        true, fs_snap.ready != 0)));
+                        true, fs_snap.ready != 0, false)));
             dyt_session_free(fs_sess);
         } else {
             std::printf("  FAIL out of memory\n");
@@ -971,7 +1044,7 @@ static int selftest(const opts &o)
     /* 14. A failed bring-up is a state, not a crash.  Pure function, so this
      * is the only way the state is reachable without a camera. */
     {
-        const DevState ds = device_state(true, true, -1, false, false);
+        const DevState ds = device_state(true, true, -1, false, false, false);
         const bool ok = ds == DevState::NoDevice;
         std::printf("  %-4s a failed bring-up is a state, not a crash (%s)\n",
                     ok ? "ok" : "FAIL", state_label(ds));
@@ -1063,6 +1136,82 @@ static int selftest(const opts &o)
                     (unsigned)t.cap.pid, t.cap.format_index, t.cap.height,
                     (double)t.cap.t_amb,
                     t.cap.output == DYT_OUTPUT_AD ? "AD" : "dual-half");
+        if (!ok)
+            fails++;
+    }
+
+    /* 19. The stall watchdog fires on a frozen counter, and only then.  The
+     * negatives matter as much as the positive: motion clears it, and a warm-up
+     * (ready == 0) is never a stall however long it lasts. */
+    {
+        StallWatch sw;
+        const bool a = !sw.observe(0, 0.0, true);   /* baseline */
+        const bool b = !sw.observe(0, 0.5, true);   /* frozen, under kStallS */
+        const bool c =  sw.observe(0, 2.0, true);   /* frozen, over kStallS */
+        const bool d = !sw.observe(1, 2.1, true);   /* moved: clears */
+        const bool e = !sw.observe(1, 4.0, false);  /* frozen but warming up */
+        const bool ok = a && b && c && d && e;
+        std::printf("  %-4s the stall watchdog fires on a freeze, not on "
+                    "motion or warm-up\n", ok ? "ok" : "FAIL");
+        if (!ok)
+            fails++;
+    }
+
+    /* 20. The state machine reaches NO SIGNAL, and a stall cannot mask the
+     * states above it — NO DEVICE and WARMING UP still win. */
+    {
+        const bool a = device_state(true, true, 0, true, true, true)
+                           == DevState::Stalled;
+        const bool b = device_state(true, true, 0, true, false, true)
+                           == DevState::WarmingUp;
+        const bool c = device_state(true, true, -1, false, false, true)
+                           == DevState::NoDevice;
+        const bool d = device_state(true, true, 0, true, true, false)
+                           == DevState::Live;
+        const bool e = device_state(false, true, 0, true, true, true)
+                           == DevState::Fixture;
+        const bool f = std::strcmp(state_label(DevState::Stalled),
+                                   "NO SIGNAL") == 0;
+        const bool ok = a && b && c && d && e && f;
+        std::printf("  %-4s a frozen stream is NO SIGNAL, and cannot mask the "
+                    "other states (%s)\n", ok ? "ok" : "FAIL",
+                    state_label(device_state(true, true, 0, true, true, true)));
+        if (!ok)
+            fails++;
+    }
+
+    /* 21. The fps meter reports 0.0 over a frozen counter, where a paint-driven
+     * meter reported the timer rate.  Assertion 12 pins the arithmetic; this
+     * pins the stall, which is the whole point of driving it from `seq`. */
+    {
+        FpsMeter fm;
+        fm.update(100, 0.0);
+        fm.update(125, 1.0);
+        const double moving = fm.fps();
+        fm.update(125, 1.04);
+        fm.update(125, 3.3);            /* frozen past the rebase window */
+        const double frozen = fm.fps();
+        const bool ok = moving == 25.0 && frozen == 0.0;
+        std::printf("  %-4s the fps meter reports 0.0 on a frozen counter "
+                    "(%.1f -> %.1f)\n", ok ? "ok" : "FAIL", moving, frozen);
+        if (!ok)
+            fails++;
+    }
+
+    /* 22. The retry backoff doubles to a cap and then gives up.  Pure, so the
+     * policy is pinned here rather than by watching a camera fail eight times. */
+    {
+        const bool ok = retry_delay_s(0) == 0.5 &&
+                        retry_delay_s(1) == 1.0 &&
+                        retry_delay_s(2) == 2.0 &&
+                        retry_delay_s(6) == 30.0 &&
+                        retry_delay_s(7) == 30.0 &&
+                        retry_delay_s(8) < 0.0 &&
+                        retry_delay_s(-1) < 0.0;
+        std::printf("  %-4s the retry backoff doubles to a cap, then gives up "
+                    "(%.1f, %.1f, ..., %.1f, %s)\n", ok ? "ok" : "FAIL",
+                    retry_delay_s(0), retry_delay_s(1), retry_delay_s(6),
+                    retry_delay_s(8) < 0.0 ? "stop" : "keep");
         if (!ok)
             fails++;
     }

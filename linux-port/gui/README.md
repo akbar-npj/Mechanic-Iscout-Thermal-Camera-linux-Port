@@ -50,6 +50,13 @@ and would change another front end's display and its pinned tests for no gain.
 
 The rate is shown only for the states that have painted frames — a `0.0 fps`
 beside `CONNECTING` would be a claim about a stream that is not running yet.
+`NO SIGNAL` is included on purpose: there the `0.0` *is* the evidence, and hiding
+it would leave a frozen picture looking healthy.
+
+The rate is measured from `seq` — the frames the engine processed — not from the
+frames painted. A stalled source still returns `FRAME` (it re-renders the last
+one), so a paint-driven meter reported a healthy 25 fps over a frozen image,
+which is the exact lie the `seq`-driven meter stops telling.
 
 ### The device state
 
@@ -65,11 +72,22 @@ takes internally, so it costs nothing.
 | `Connecting` | `--live`, bring-up still running | `connecting to camera…` | `CONNECTING` |
 | `NoDevice` | `--live`, bring-up failed | `no camera found (see stderr)` | `NO DEVICE` |
 | `WarmingUp` | `--live`, up, but no real frame yet | `warming up - waiting for live data…` | `WARMING UP` |
-| `Live` | `--live`, up, real frame | image | `LIVE  <fps> fps` |
+| `Live` | `--live`, up, frames advancing | image | `LIVE  <fps> fps` |
+| `Stalled` | `--live`, up, but `seq` frozen > 1.5 s | last frame held | `NO SIGNAL  0.0 fps` |
 
-`device_state()` is a pure function of five booleans, so every state is reachable
-in `--selftest` with no camera attached — which is the only way two of the five
-can be tested at all.
+`device_state()` is a pure function of six booleans, so every state is reachable
+in `--selftest` with no camera attached — which is the only way two of the six
+can be tested at all. `stalled` is checked last, so it can never mask
+`Connecting`/`NoDevice`/`WarmingUp`.
+
+**How a stall is found.** The only liveness signal the session offers is `seq`,
+the count of frames the engine has processed. A disconnect and a wedge are
+identical from there — libuvc handles `LIBUSB_TRANSFER_NO_DEVICE` silently, so
+the callback simply stops and `seq` freezes — which is why the state is named
+`Stalled` and labelled `NO SIGNAL` rather than for a cause it cannot know.
+`StallWatch` fires once `seq` has not moved for 1.5 s (~37 frame intervals at
+25 fps), and `ready` gates it, so a warm-up is never a stall however long it
+lasts. The last real frame stays on screen; the `0.0 fps` is the evidence.
 
 **The filler is never painted.** Before it has real data the device streams a flat
 `0x8000`, which in mode 1000 decodes to a legitimate-looking **238.85 C**
@@ -244,6 +262,10 @@ $ ./build/dytqt --selftest
   ok   the mirror is applied (zoom 2, flip_h, 6x2, ends #0000ff/#ff0000)
   ok   --live contradicts --fixture/--selftest, and is refused
   ok   the capture options reach dyt_capture_opts (1234:5678, fmt 3, h 256, t_amb 21.5, AD)
+  ok   the stall watchdog fires on a freeze, not on motion or warm-up
+  ok   a frozen stream is NO SIGNAL, and cannot mask the other states (NO SIGNAL)
+  ok   the fps meter reports 0.0 on a frozen counter (25.0 -> 0.0)
+  ok   the retry backoff doubles to a cap, then gives up (0.5, 1.0, ..., 30.0, stop)
 === ALL PASS ===
 ```
 
@@ -266,6 +288,13 @@ Assertions 17 and 18 cover the live path without a camera: 17 checks that
 that the capture options actually land in `dyt_capture_opts` — the kind of wiring
 that otherwise silently does nothing. Both are driven through the pure rule and
 `parse_args`, so no usage text is printed into `make check`'s output.
+
+Assertions 19–22 do the same for the error states, and they are the reason the
+stall logic is a pure function rather than inlined in the timer callback: 19
+drives `StallWatch` through a freeze, a recovery and a warm-up; 20 checks that a
+stall cannot mask `NO DEVICE` or `WARMING UP`; 21 pins that the `seq`-driven meter
+reads 0.0 on a frozen counter; 22 pins the backoff schedule. None of the four
+needs a camera, and none would be reachable any other way.
 
 ## Where the frames come from, and on which thread
 
