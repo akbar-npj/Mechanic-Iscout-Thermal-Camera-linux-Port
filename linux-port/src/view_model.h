@@ -311,6 +311,15 @@ int dyt_vm_write_still(dyt_session_t *s, const char *path, char *msg, size_t n);
 int dyt_vm_capture_name(char *out, size_t n, const char *dir, const char *ts,
                         const char *ext);
 
+/* Where material goes when the user has not said: `$XDG_PICTURES_DIR` when it
+ * names a real directory, else `$HOME` when it does, else ".".  A GUI launched
+ * from a menu has no meaningful working directory — inheriting the launcher's
+ * `.` is how a gallery ends up scanning somewhere the user never chose — so the
+ * front end asks this instead of defaulting to `.` itself.
+ *
+ * Writes at most `n` bytes.  Returns 0, or -1 on a bad argument. */
+int dyt_vm_default_capture_dir(char *out, size_t n);
+
 /* Bytes an unprivileged writer may still use on the filesystem holding `path`
  * (statvfs's f_bavail, not f_bfree — the root reserve is not available to us).
  * Returns -1 on a bad argument or when `path` cannot be examined. */
@@ -429,6 +438,11 @@ int dyt_vm_gallery_load(dyt_vm_gallery_t *g, const char *dir);
 /* Move the highlight by `delta`, wrapping at both ends.  Does nothing when the
  * list is empty. */
 void dyt_vm_gallery_move(dyt_vm_gallery_t *g, int delta);
+
+/* Highlight `idx` directly, which is what a mouse click needs and a delta
+ * cannot express.  Clamped to the list; does nothing when the list is empty,
+ * so `sel` can never be left pointing at nothing. */
+void dyt_vm_gallery_set_sel(dyt_vm_gallery_t *g, int idx);
 /* The highlighted entry, or NULL when there is none. */
 const dyt_vm_item_t *dyt_vm_gallery_sel(const dyt_vm_gallery_t *g);
 

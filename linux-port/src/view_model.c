@@ -710,6 +710,40 @@ int dyt_vm_capture_name(char *out, size_t n, const char *dir, const char *ts,
     return (need > 0 && (size_t)need < n) ? 0 : -1;
 }
 
+int dyt_vm_default_capture_dir(char *out, size_t n)
+{
+    static const char *const vars[] = { "XDG_PICTURES_DIR", "HOME" };
+    struct stat              st;
+
+    if (!out || n == 0)
+        return -1;
+
+    /* A candidate is used only when it names a directory that is really there:
+     * an XDG variable pointing at a path that was never created would send the
+     * stills somewhere the file dialog cannot show, which is worse than the
+     * fallback. */
+    for (size_t i = 0; i < sizeof vars / sizeof vars[0]; i++) {
+        const char *v = getenv(vars[i]);
+        int         need;
+
+        if (!v || !v[0])
+            continue;
+        if (stat(v, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+        need = snprintf(out, n, "%s", v);
+        if (need > 0 && (size_t)need < n)
+            return 0;
+    }
+
+    /* The working directory is what every caller defaulted to before this
+     * existed, so it stays the last resort rather than a failure. */
+    if (n < 2)
+        return -1;
+    out[0] = '.';
+    out[1] = '\0';
+    return 0;
+}
+
 long long dyt_vm_free_bytes(const char *path)
 {
     struct statvfs vfs;
@@ -989,6 +1023,20 @@ void dyt_vm_gallery_move(dyt_vm_gallery_t *g, int delta)
         g->sel = (int)(((long long)g->sel + delta) % g->n);
     if (g->sel < 0)
         g->sel += g->n;
+}
+
+void dyt_vm_gallery_set_sel(dyt_vm_gallery_t *g, int idx)
+{
+    if (!g || g->n <= 0) {
+        if (g)
+            g->sel = -1;
+        return;
+    }
+    if (idx < 0)
+        idx = 0;
+    if (idx >= g->n)
+        idx = g->n - 1;
+    g->sel = idx;
 }
 
 const dyt_vm_item_t *dyt_vm_gallery_sel(const dyt_vm_gallery_t *g)

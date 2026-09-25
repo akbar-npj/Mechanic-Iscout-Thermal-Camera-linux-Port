@@ -1099,6 +1099,52 @@ static void test_capture(void)
 
     dyt_vm_rec_label(0.0, 1, b, sizeof b);
     strcheck("cap: one frame is singular", b, "REC 0:00  1 frame");
+
+    /* The default capture directory.  HOME and XDG_PICTURES_DIR are set here
+     * so the result does not depend on whoever runs make check — a variable
+     * left over in the environment would otherwise decide the outcome. */
+    {
+        char  tmpl[] = "/tmp/dytvm-pics-XXXXXX";
+        char *pics   = mkdtemp(tmpl);
+        char *home   = getenv("HOME");
+        char  saved[512] = { 0 };
+
+        if (home)
+            snprintf(saved, sizeof saved, "%s", home);
+
+        if (pics) {
+            setenv("XDG_PICTURES_DIR", pics, 1);
+            intcheck("cap: the Pictures dir is used when it exists",
+                     dyt_vm_default_capture_dir(b, sizeof b), 0);
+            strcheck("cap: and it is the Pictures dir", b, pics);
+
+            /* A variable naming something that is not there is skipped rather
+             * than used: it would send captures somewhere unopenable. */
+            setenv("XDG_PICTURES_DIR", "/nonexistent-dir-xyz/pics", 1);
+            setenv("HOME", pics, 1);
+            dyt_vm_default_capture_dir(b, sizeof b);
+            strcheck("cap: a missing Pictures dir falls back to HOME", b, pics);
+
+            unsetenv("XDG_PICTURES_DIR");
+            dyt_vm_default_capture_dir(b, sizeof b);
+            strcheck("cap: with no XDG variable HOME is used", b, pics);
+
+            setenv("HOME", "/nonexistent-dir-xyz/home", 1);
+            dyt_vm_default_capture_dir(b, sizeof b);
+            strcheck("cap: with neither, the working directory", b, ".");
+
+            rmdir(pics);
+        }
+
+        unsetenv("XDG_PICTURES_DIR");
+        if (saved[0])
+            setenv("HOME", saved, 1);
+
+        intcheck("cap: a NULL buffer is refused",
+                 dyt_vm_default_capture_dir(NULL, 16), -1);
+        intcheck("cap: a zero-size buffer is refused",
+                 dyt_vm_default_capture_dir(b, 0), -1);
+    }
 }
 
 /* A session frame with a raw payload, so a still can be written from it. */
@@ -1350,6 +1396,27 @@ static void test_gallery(void)
         intcheck("gal: a rescan keeps the selection", g.sel, 1);
         strcheck("gal: still on the same file",
                  dyt_vm_gallery_sel(&g)->name, "dyt_20260101-000001.mp4");
+
+        /* A click picks a row outright, which a delta cannot express. */
+        dyt_vm_gallery_set_sel(&g, 2);
+        intcheck("gal: a click selects that row", g.sel, 2);
+        strcheck("gal: and _sel agrees with it",
+                 dyt_vm_gallery_sel(&g)->name, "dyt_20260101-000000.dyt.jpg");
+
+        dyt_vm_gallery_set_sel(&g, -5);
+        intcheck("gal: a click before the start clamps", g.sel, 0);
+        dyt_vm_gallery_set_sel(&g, 99);
+        intcheck("gal: a click past the end clamps", g.sel, 2);
+
+        dyt_vm_gallery_set_sel(NULL, 0);            /* must not crash */
+
+        {
+            dyt_vm_gallery_t e;
+            dyt_vm_gallery_init(&e);
+            dyt_vm_gallery_set_sel(&e, 3);
+            intcheck("gal: a click on an empty list leaves no highlight",
+                     e.sel, -1);
+        }
 
         /* The label of an empty list says so rather than showing 0/0. */
         {
