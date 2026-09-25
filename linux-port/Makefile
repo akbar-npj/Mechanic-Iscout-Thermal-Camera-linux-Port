@@ -178,7 +178,7 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/alarm.o $(BUILD)/session.o $(BUILD)/params.o \
             $(BUILD)/visible.o $(BUILD)/fusion.o $(BUILD)/session_capture.o \
             $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
-            $(BUILD)/mnn.o $(BUILD)/view_model.o
+            $(BUILD)/mnn.o $(BUILD)/view_model.o $(BUILD)/frame_ready.o
 
 TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/calib_test $(BUILD)/pipeline_test $(BUILD)/palette_test \
@@ -186,7 +186,8 @@ TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/alarm_test $(BUILD)/session_test $(BUILD)/params_test \
          $(BUILD)/visible_test $(BUILD)/fusion_test $(BUILD)/jpeg_test \
          $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test \
-         $(BUILD)/view_model_test
+         $(BUILD)/view_model_test $(BUILD)/frame_ready_test \
+         $(BUILD)/poll_model_test
 TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
 # capture_demo and probe talk to the device directly through libusb — only
 # buildable with it.  capture_demo's prereq on $(UVC_LIB) is what pulls the
@@ -214,10 +215,17 @@ ifdef HAVE_QT6
 TOOLS += $(BUILD)/dytqt
 endif
 
-# libuvc is linked into dytrec and dytqt only when it was actually built.
-DYTREC_UVC :=
+# libuvc, for the targets that can actually reach the capture layer.
+#
+# It is present only when libusb is: without it src/capture.c compiles to its
+# declining stubs (capture.c:790) and nothing references the vendored archive.
+# Three targets need it for three different reasons — dytrec and dytqt link
+# the live frame source, and poll_model_test calls the session_capture adapter,
+# which references dyt_capture_plane_geometry/last_raw and so drags capture.o
+# in on the host's libusb build.
+UVC_LINK :=
 ifdef HAVE_LIBUSB
-DYTREC_UVC := $(UVC_LIB)
+UVC_LINK := $(UVC_LIB)
 endif
 
 # Frozen vendor ground truth, produced by tools/thermometry_diff/run.sh
@@ -317,6 +325,14 @@ $(BUILD)/session_test: src/session_test.c $(LIB) | $(BUILD)
 $(BUILD)/view_model_test: src/view_model_test.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
+# frame_ready_test pins the coalescing wakeup: that N pings with nobody
+# listening arm exactly one wakeup, that the timed wait rides CLOCK_MONOTONIC
+# and does not expire early, that a blocking wait is actually woken, and that
+# the arm/consume bookkeeping stays exact when a producer outruns a consumer.
+# No hardware, no toolkit.
+$(BUILD)/frame_ready_test: src/frame_ready_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
 # params_test pins the device's stored-parameter encodings against the
 # literals in MechaniscoutPcap/4.pcapng and the live read-back.  No hardware.
 $(BUILD)/params_test: src/params_test.c $(LIB) | $(BUILD)
@@ -391,19 +407,33 @@ $(BUILD)/dytview: tools/dytview.cpp $(LIB) $(UVC_LIB) | $(BUILD)
 $(BUILD)/frame_source.o: tools/frame_source.c tools/frame_source.h $(FLAG_STAMP) | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/dytrec: tools/dytrec.cpp $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) $(LDLIBS) $(CV_LIBS) -o $@
+# The live hand-off, end to end: session_capture.c's adapter on the producer
+# thread and frame_source.c's live path on the consumer, which is exactly the
+# two-thread shape the Qt6 app will have.  It uses no wakeup primitive on
+# purpose — it pins what the session's existing lock already guarantees, so
+# the coalescing wakeup stays an optimisation rather than a load-bearing
+# assumption.
+#
+# It lives in tools/ beside frame_source.c because it links frame_source.o,
+# and a src/ test must not depend on a tools/ object (src/ is the library;
+# tools/ consumes it).  It needs no hardware, but it does link libuvc on a
+# host with libusb — see the $(UVC_LINK) comment above.
+$(BUILD)/poll_model_test: tools/poll_model_test.c $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) -o $@
+
+$(BUILD)/dytrec: tools/dytrec.cpp $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $< $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(CV_LIBS) -o $@
 
 # The Qt6 GUI shell.  It links the same two pieces as dytrec — the port library
 # and the frame source — plus Qt6 Widgets.  The frame source is the seam that
 # keeps the app testable: pointed at a fixture it is device-free, pointed at
 # libuvc it is the live camera, and the GUI code does not change between them.
-# $(DYTREC_UVC) is empty when libusb is absent, exactly as for dytrec.
+# $(UVC_LINK) is empty when libusb is absent, exactly as for dytrec.
 #
 # -Itools is explicit because dytrec.cpp sits beside frame_source.h and finds
 # it relatively, whereas gui/dytqt.cpp does not.
-$(BUILD)/dytqt: gui/dytqt.cpp $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) -Itools $< $(BUILD)/frame_source.o $(LIB) $(DYTREC_UVC) $(LDLIBS) $(QT6_LIBS) -o $@
+$(BUILD)/dytqt: gui/dytqt.cpp $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(QT6_CFLAGS) -Itools $< $(BUILD)/frame_source.o $(LIB) $(UVC_LINK) $(LDLIBS) $(QT6_LIBS) -o $@
 
 # isotest bypasses libuvc to test each streaming altsetting directly — see the
 # header comment in tools/isotest.c.  Read-only.
@@ -432,6 +462,8 @@ check: all
 	@$(BUILD)/alarm_test
 	@$(BUILD)/session_test
 	@$(BUILD)/view_model_test
+	@$(BUILD)/frame_ready_test
+	@$(BUILD)/poll_model_test
 	@$(BUILD)/params_test
 	@$(BUILD)/visible_test testdata/mode1000_256x384_default.raw
 	@$(BUILD)/fusion_test
