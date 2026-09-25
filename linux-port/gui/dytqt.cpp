@@ -1,30 +1,21 @@
 /*
- * dytqt.cpp — Qt6 Widgets spike for the DYT thermal camera.
+ * dytqt.cpp — the Qt6 Widgets front end for the DYT thermal camera.
  *
- * This is the *spike* for the GUI, not the GUI.  Its job is to settle four
- * questions with evidence rather than opinion, so that the real front-end
- * (tasks #86 onward) is built on something measured:
+ * The window is a *shell*: every pixel it draws and every string it shows comes
+ * from libdyt.  This file owns layout and paint, and nothing else — the same
+ * rule tools/dytview.cpp follows, and the reason the two front ends cannot
+ * drift apart.
  *
- *   1. Does the engine's rendered RGB frame reach a widget without inventing
- *      a conversion for it?  (QImage over the engine's own buffer.)
- *   2. Is 25 fps reachable from a QTimer without the frame path stalling?
- *   3. Does the view model's status line drop straight into a Qt widget?
- *      That is the entire reason src/view_model.{h,c} exists, so it is worth
- *      proving before a window is designed around it.
- *   4. Can the whole thing be verified with no display and no device?
- *
- * It replays a frozen fixture through the device-free pipeline
- * (tools/frame_source.c), so it needs no camera — and `--selftest` runs the
- * same path headless and asserts on it, which is what makes this a check
- * rather than a screenshot.
- *
- * Everything drawn comes from libdyt.  This file owns layout and paint, and
- * nothing else — the same rule dytview.cpp follows.
+ * Task #83 proved the shape with a spike; this is the window itself.  It runs
+ * against a frozen fixture (the default, and what `--selftest` drives) or the
+ * device, and it shows the device's start-up filler honestly instead of
+ * painting a 238.85 C "scene" — see DevState below.
  *
  * build:  via the Makefile (needs Qt6 Widgets; see gui/README.md)
  * run:    ./build/dytqt [--fixture PATH] [--palette N] [--zoom N]
  *         ./build/dytqt --selftest
  */
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -35,10 +26,10 @@
 #include <QApplication>
 #include <QColor>
 #include <QImage>
-#include <QLabel>
 #include <QPainter>
 #include <QPixmap>
 #include <QSize>
+#include <QString>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -54,6 +45,9 @@ static const int kBarW   = 22;   /* colour-bar width, px */
 static const int kBarGap = 14;   /* image -> bar gap */
 static const int kLabelW  = 96;  /* room for the bar's labels */
 static const int kPad     = 8;
+
+static const int kLineH   = 16;  /* one status line */
+static const int kStripPad = 4;  /* the strip's own margin */
 
 /* ---------------------------------------------------------------- options */
 
@@ -157,11 +151,160 @@ static dyt_session_t *setup_session(const opts &o)
     return sess;
 }
 
+/* -------------------------------------------------------------- frame rate */
+
+/* Painted frames per second over a short trailing window.
+ *
+ * The baseline is rebased once the window would span more than kWindowS, so a
+ * stall reports the *new* rate instead of being averaged away by a long run of
+ * earlier samples.  Deliberately not a moving average: the number on screen
+ * should be the rate now, not a smoothed memory of it. */
+class FpsMeter {
+public:
+    void update(long long frames, double t)
+    {
+        if (!have_) {
+            have_ = true;
+            f0_   = frames;
+            t0_   = t;
+            return;
+        }
+        if (t - t0_ > kWindowS) {      /* rebase: forget the old baseline */
+            f0_    = frames;
+            t0_    = t;
+            have2_ = false;
+            return;
+        }
+        f1_    = frames;
+        t1_    = t;
+        have2_ = true;
+    }
+
+    double fps() const
+    {
+        if (!have2_)
+            return 0.0;
+        const double dt = t1_ - t0_;
+        return dt > 0.0 ? (double)(f1_ - f0_) / dt : 0.0;
+    }
+
+private:
+    static constexpr double kWindowS = 2.0;
+    bool      have_ = false, have2_ = false;
+    long long f0_ = 0, f1_ = 0;
+    double    t0_ = 0.0, t1_ = 0.0;
+};
+
+/* ---------------------------------------------------------- device state
+ *
+ * next_live() returns WAIT both before the first frame *and* for the whole
+ * start-up filler (frame_source.c:271), so the source alone cannot tell
+ * "not connected yet" from "connected, still warming up".  The state is
+ * therefore decided from the session's own `seq`/`ready`, which is the same
+ * scalars-only snapshot next_live() takes internally and costs nothing.
+ *
+ * Kept a pure function of five booleans so every state is reachable in
+ * `--selftest` with no device attached — which is the only way two of these
+ * five can ever be tested at all. */
+enum class DevState { Fixture, Connecting, NoDevice, WarmingUp, Live };
+
+static DevState device_state(bool live, bool bringup_done, int bringup_rc,
+                             bool snap_ok, bool snap_ready)
+{
+    if (!live)              return DevState::Fixture;
+    if (!bringup_done)      return DevState::Connecting;
+    if (bringup_rc != 0)    return DevState::NoDevice;
+    if (!snap_ok || !snap_ready) return DevState::WarmingUp;
+    return DevState::Live;
+}
+
+static const char *state_label(DevState s)
+{
+    switch (s) {
+    case DevState::Fixture:    return "FIXTURE";
+    case DevState::Connecting: return "CONNECTING";
+    case DevState::NoDevice:   return "NO DEVICE";
+    case DevState::WarmingUp:  return "WARMING UP";
+    case DevState::Live:       return "LIVE";
+    }
+    return "?";
+}
+
+/* What the canvas says when it has nothing real to paint. */
+static const char *state_placeholder(DevState s)
+{
+    switch (s) {
+    case DevState::Connecting: return "connecting to camera…";
+    case DevState::NoDevice:   return "no camera found (see stderr)";
+    case DevState::WarmingUp:  return "warming up - waiting for live data…";
+    default:                   return "waiting for a frame";
+    }
+}
+
+/* The third status line, and the front end's own.
+ *
+ * The two lines above it are the view model's, verbatim; this one carries the
+ * two things the view model has no business naming — the frame rate and the
+ * device state — plus the range mode, which is formatted by the engine
+ * (dyt_range_mode_name) but deliberately *not* folded into
+ * dyt_vm_status_line().  That shared line is already ~378 px of a 404 px
+ * window at zoom 1, and dytview draws it into a strip only as wide as the
+ * image, where it is already clipped; extending it would clip further and
+ * would change another front end's display for no gain.  See gui/README.md.
+ *
+ * The rate is only shown for the two states that have painted frames: a
+ * "0.0 fps" beside CONNECTING would be a claim about a stream that is not
+ * running yet. */
+static QString state_line(DevState s, const dyt_snapshot_t &snap, double fps)
+{
+    QString out = QStringLiteral("range %1   |   %2")
+                      .arg(QString::fromUtf8(dyt_range_mode_name(snap.range_mode)),
+                           QString::fromUtf8(state_label(s)));
+    if (s == DevState::Fixture || s == DevState::Live)
+        out += QStringLiteral("  %1 fps").arg(fps, 0, 'f', 1);
+    return out;
+}
+
+/* ------------------------------------------------------------ the transform
+ *
+ * dyt_view_transform_map() states the contract (display.h:146): "the output is
+ * the source magnified by `zoom` and then mirrored".  Transcribing it in that
+ * order is what keeps this a direct expression of the contract the pointer
+ * mapping inverts — and that is the property that matters, because a front end
+ * that scaled or mirrored differently would put a click on the wrong pixel.
+ *
+ * (The two orders happen to *agree* for uniform integer magnification:
+ * mirroring a z-times block-magnified image and magnifying a mirrored source
+ * both send output pixel ox to source n-1-ox/z.  So this is not a fix for odd
+ * zoom; it is refusing to depend on that coincidence.  Assertion 16 pins the
+ * mirror actually happening.)
+ *
+ * Qt::FastTransformation is mandatory rather than a performance choice: it is
+ * Qt's nearest-neighbour, matching map()'s integer division and the OpenCV
+ * viewer's cv::INTER_NEAREST.  Smooth scaling here would put the Qt window's
+ * pixels somewhere the shared pointer mapping does not agree with. */
+static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
+{
+    /* Both branches must own their pixels: `src` wraps the engine's buffer,
+     * which is only valid until the next dyt_frame_source_next(). */
+    QImage out = (t.zoom > 1)
+        ? src.scaled(src.width() * t.zoom, src.height() * t.zoom,
+                     Qt::IgnoreAspectRatio, Qt::FastTransformation)
+        : src.copy();
+
+    Qt::Orientations ori;
+    if (t.flip_h) ori |= Qt::Horizontal;
+    if (t.flip_v) ori |= Qt::Vertical;
+    if (ori)
+        out = out.flipped(ori);        /* Qt 6; mirrored() is deprecated */
+
+    return out;
+}
+
 /* ------------------------------------------------------------- the canvas */
 
 /* Paints the engine's frame.  The only class here that knows about pixels:
- * everything above it deals in the session and the view model, so the real
- * front-end can replace this without touching the frame path. */
+ * everything above it deals in the session and the view model. */
 class FrameView : public QWidget {
 public:
     explicit FrameView(QWidget *parent = nullptr) : QWidget(parent)
@@ -178,9 +321,21 @@ public:
         /* No resize() here: the widget is laid out by MainWindow, which sizes
          * it from sizeHint().  Resizing a layout-managed widget is a no-op on
          * the next layout pass, and doing it made it look as though the canvas
-         * sized itself — which is how the clipped-canvas bug stayed hidden. */
+         * sized itself — which is how the clipped-canvas bug stayed hidden.
+         *
+         * updateGeometry() is not optional, though: the first frame is the
+         * first time the sensor's size is known, and with zoom applied the
+         * hint changes with it. */
+        updateGeometry();
         update();
     }
+
+    /* Ignored once a frame has been painted, so a live stall keeps showing the
+     * last real frame instead of flickering back to the placeholder. */
+    void set_placeholder(const QString &s) { placeholder_ = s; update(); }
+
+    bool  has_frame() const { return !img_.isNull(); }
+    QSize imageSize() const { return img_.size(); }
 
     QSize sizeHint() const override
     {
@@ -197,7 +352,7 @@ protected:
 
         if (img_.isNull()) {
             p.setPen(QColor(200, 200, 200));
-            p.drawText(rect(), Qt::AlignCenter, "waiting for a frame");
+            p.drawText(rect(), Qt::AlignCenter, placeholder_);
             return;
         }
 
@@ -239,47 +394,154 @@ private:
     dyt_snapshot_t snap_{};
     QImage         img_;
     dyt_palette_t  pal_{};
+    QString        placeholder_ = QStringLiteral("waiting for a frame");
 };
 
-/* The window: the canvas plus a status strip.  The strip is a plain QLabel
- * fed by dyt_vm_status_line(), which is the integration this spike exists to
- * prove. */
+/* --------------------------------------------------------------- the strip */
+
+/* The status strip: three left-aligned lines on one background.
+ *
+ * A custom widget rather than three QLabels, because it maps one-to-one onto
+ * the OpenCV viewer's immediate-mode strip and avoids three stylesheets
+ * fighting over a shared background.  Lines 1 and 2 are the view model's
+ * strings verbatim; line 3 is the front end's (state_line above). */
+class StatusStrip : public QWidget {
+public:
+    explicit StatusStrip(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setAutoFillBackground(true);
+        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    }
+
+    void set_lines(const QString &a, const QString &b, const QString &c)
+    {
+        line_[0] = a;
+        line_[1] = b;
+        line_[2] = c;
+        updateGeometry();
+        update();
+    }
+
+    const QString &line(int i) const { return line_[i]; }
+
+    QSize sizeHint() const override
+    {
+        int w = 0;
+        for (int i = 0; i < 3; i++)
+            w = std::max(w, fontMetrics().horizontalAdvance(line_[i]));
+        return QSize(w + 2 * kStripPad, 3 * kLineH + 2 * kStripPad);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(16, 16, 16));
+
+        static const QColor pen[3] = { QColor(0xdc, 0xdc, 0xdc),
+                                       QColor(0xbe, 0xd2, 0xff),
+                                       QColor(0x9a, 0xa4, 0xb4) };
+        const int ascent = fontMetrics().ascent();
+        for (int i = 0; i < 3; i++) {
+            p.setPen(pen[i]);
+            p.drawText(kStripPad, kStripPad + i * kLineH + ascent, line_[i]);
+        }
+    }
+
+private:
+    QString line_[3];
+};
+
+/* --------------------------------------------------------------- the window */
+
 class MainWindow : public QWidget {
 public:
     explicit MainWindow(QWidget *parent = nullptr) : QWidget(parent)
     {
-        view_   = new FrameView(this);
-        status_ = new QLabel(this);
-        status_->setTextFormat(Qt::PlainText);
-        status_->setStyleSheet(
-            "color:#dcdcdc; background:#101010; padding:3px;");
+        view_  = new FrameView(this);
+        strip_ = new StatusStrip(this);
 
         auto *lay = new QVBoxLayout(this);
         lay->setContentsMargins(0, 0, 0, 0);
         lay->setSpacing(0);
         lay->addWidget(view_, 1);
-        lay->addWidget(status_, 0);
+        lay->addWidget(strip_, 0);
 
-        setWindowTitle("dytqt — Qt6 Widgets spike");
+        setWindowTitle("dytqt — DYT thermal camera");
     }
 
-    FrameView *view() const { return view_; }
-    void set_status(const QString &s) { status_->setText(s); }
+    FrameView   *view()  const { return view_; }
+    StatusStrip *strip() const { return strip_; }
+
+    /* Size the window to the canvas it has to show.  Called once before the
+     * window is shown, and again whenever the canvas changes size.
+     *
+     * This has to be asked for explicitly.  A top-level window follows its
+     * layout's sizeHint only until someone calls resize()/adjustSize() on it;
+     * after that Qt treats the geometry as the user's choice and leaves it
+     * alone.  Without this the window would stay sized for the *pre-frame*
+     * placeholder (a 256x192 default) while the canvas grew to the sensor's
+     * real, zoomed size — silently clipping the image and the colour bar's
+     * bottom label.  Assertion 7 in --selftest is what pins that.
+     *
+     * resize(), deliberately not adjustSize(): adjustSize() clamps the result
+     * to two thirds of the screen, so a 512x384 canvas on the offscreen
+     * platform's 800x600 screen came out 533x400 — clipped, which is the very
+     * failure this is here to prevent, and it would do the same on any display
+     * smaller than 1.5x the canvas.  An image window that is larger than the
+     * screen is the lesser evil; a silently cropped one is not.
+     *
+     * Keyed off the canvas hint so it fires once when the first frame arrives
+     * and again only if the zoom changes — not on every frame, which would
+     * fight a user who resized the window by hand. */
+    void fit_to_view()
+    {
+        const QSize want = view_->sizeHint();
+        if (want == fitted_)
+            return;
+        fitted_ = want;
+        resize(sizeHint());
+    }
+
+    /* A painted frame: all three lines. */
+    void set_frame_status(const dyt_snapshot_t &snap, DevState st, double fps,
+                          dyt_mode_t mode, const char *msg = nullptr)
+    {
+        char a[256], b[256];
+        dyt_vm_status_line(&snap, mode, a, sizeof a);
+        dyt_vm_readout_line(&snap, msg, b, sizeof b);
+        strip_->set_lines(QString::fromUtf8(a), QString::fromUtf8(b),
+                          state_line(st, snap, fps));
+        fit_to_view();
+    }
+
+    /* No frame to paint — the placeholder is up, so lines 1 and 2 keep
+     * whatever they last said and only the state line moves. */
+    void set_state_line(DevState st, const dyt_snapshot_t &snap, double fps)
+    {
+        strip_->set_lines(strip_->line(0), strip_->line(1),
+                          state_line(st, snap, fps));
+    }
 
 private:
-    FrameView *view_   = nullptr;
-    QLabel    *status_ = nullptr;
+    FrameView   *view_  = nullptr;
+    StatusStrip *strip_ = nullptr;
+    QSize        fitted_{};
 };
 
 /* ------------------------------------------------------------ the pump
  *
  * One timer at the requested rate; each tick pulls a frame from the source,
- * hands the pixels to the canvas and the text to the status label.
+ * hands the pixels to the canvas and the text to the status strip.
  *
- * NOTE for task #85: this is deliberately the *fixture* path, where the frame
- * is produced on the GUI thread.  When the source is the device, the frame
- * arrives on libuvc's callback thread and this must become a queued signal
- * rather than a direct call — which is the whole of that task.
+ * Threading.  This runs on the GUI thread and only ever reads the session
+ * through its own lock (dyt_session_snapshot, via dyt_vm_grab), so no widget
+ * is ever touched from the capture callback thread.  That is why the poll
+ * model in session.h needs no queued signal here: a live frame is installed by
+ * the adapter (session_capture.c) on libuvc's callback thread, and this side
+ * picks up the latest one.  src/frame_ready.c exists to *wake* a poller on
+ * demand instead of polling on a timer — an optimisation, not a correctness
+ * requirement, and not wired in yet.
  */
 struct pump {
     dyt_frame_source_t *fs   = nullptr;
@@ -287,11 +549,25 @@ struct pump {
     MainWindow         *win  = nullptr;
     dyt_palette_t       pal{};
     dyt_vm_scratch_t    scr  = DYT_VM_SCRATCH_INIT;
+    dyt_mode_t          mode = DYT_MODE_1000;
+
+    /* Live only; the fixture path leaves them at their defaults, and
+     * device_state() ignores them entirely when `live` is false. */
+    bool live         = false;
+    bool bringup_done = false;
+    int  bringup_rc   = 0;
 
     long long ticks  = 0;   /* timer callbacks */
     long long frames = 0;   /* frames actually painted */
     int       fails  = 0;
     double    worst_ms = 0.0;  /* slowest single step, for the fps headroom claim */
+    FpsMeter  fps;
+
+    double now_s() const
+    {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t_start_).count();
+    }
 
     bool step()
     {
@@ -302,12 +578,11 @@ struct pump {
 
         const dyt_fs_status_t st = dyt_frame_source_next(fs, &rgb, &w, &h);
         if (st == DYT_FS_END)
-            return false;
-        if (st != DYT_FS_FRAME || !rgb) {
-            if (st == DYT_FS_ERROR)
-                fails++;
-            return true;                 /* WAIT is normal */
-        }
+            return false;                 /* the fixture's budget is spent */
+        if (st == DYT_FS_ERROR)
+            fails++;
+        if (st != DYT_FS_FRAME || !rgb)
+            return true;                  /* WAIT is normal, and so is ERROR */
 
         dyt_snapshot_t snap;
         if (!dyt_vm_grab(sess, &snap, &scr)) {
@@ -315,20 +590,36 @@ struct pump {
             return true;
         }
 
-        /* The engine's buffer is tightly packed RGB, so QImage wraps it with
-         * no conversion.  It is only valid until the next next(), so the
-         * widget takes a copy — the one copy in this path, and the one a real
-         * front-end avoids by painting inside the tick. */
-        const QImage wrapped(rgb, w, h, w * 3, QImage::Format_RGB888);
-        win->view()->set_frame(snap, wrapped.copy(), pal);
+        const DevState ds = device_state(live, bringup_done, bringup_rc,
+                                        true, snap.ready != 0);
 
-        char status[256];
-        dyt_vm_status_line(&snap, DYT_MODE_1000, status, sizeof status);
-        win->set_status(QString::fromUtf8(status));
+        if (!snap.ready) {
+            /* The start-up filler decodes to a legitimate-looking 238.85 C
+             * (display.h), so painting it would show a real-looking scene
+             * that is not one and would collapse the colour scale onto it.
+             * Hold the placeholder instead.  On the live path this is
+             * defensive — next_live() already filters it — and on the fixture
+             * path it cannot happen at all; it is the hook --selftest drives. */
+            win->view()->set_placeholder(QString::fromUtf8(state_placeholder(ds)));
+            win->set_state_line(ds, snap, fps.fps());
+            return true;                  /* deliberately not a painted frame */
+        }
+
+        /* The engine's buffer is tightly packed RGB, so QImage wraps it with
+         * no conversion.  transformed() owns what it returns, because the
+         * source buffer dies on the next next(). */
+        const QImage wrapped(rgb, w, h, w * 3, QImage::Format_RGB888);
+        win->view()->set_frame(snap, transformed(wrapped, snap.xform), pal);
+        win->set_frame_status(snap, ds, fps.fps(), mode);
 
         frames++;
+        fps.update(frames, now_s());
         return true;
     }
+
+private:
+    const std::chrono::steady_clock::time_point t_start_ =
+        std::chrono::steady_clock::now();
 };
 
 /* ------------------------------------------------------------- selftest
@@ -336,7 +627,7 @@ struct pump {
  * The offline check.  It runs the same path the window does, under
  * QT_QPA_PLATFORM=offscreen, and asserts on the result rather than leaving a
  * human to look at a window: the fixture really converted (not the ~238.85 C
- * start-up filler), the geometry is the sensor's, the status line is
+ * start-up filler), the geometry is the sensor's, all three status lines are
  * populated, and the canvas actually painted more than one colour.
  */
 static int selftest(const opts &o)
@@ -370,7 +661,7 @@ static int selftest(const opts &o)
         return 1;
     }
 
-    win.adjustSize();
+    win.fit_to_view();
     win.show();
     QApplication::processEvents();
 
@@ -407,7 +698,7 @@ static int selftest(const opts &o)
     }
 
     /* 3. The geometry is the sensor's. */
-    dyt_snapshot_t snap;
+    dyt_snapshot_t snap{};
     int sw = 0, sh = 0;
     if (dyt_session_snapshot(sess, &snap, nullptr, 0) == 0) {
         sw = snap.width;
@@ -440,7 +731,7 @@ static int selftest(const opts &o)
             fails++;
     }
 
-    /* 5. The status line is populated, and is the view model's. */
+    /* 5. The first status line is populated, and is the view model's. */
     {
         char status[256];
         dyt_vm_status_line(&snap, DYT_MODE_1000, status, sizeof status);
@@ -506,6 +797,165 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 8. The strip carries three populated lines, and the first two are the
+     * view model's, unaltered. */
+    {
+        const QString l1 = win.strip()->line(0);
+        const QString l2 = win.strip()->line(1);
+        const QString l3 = win.strip()->line(2);
+        const bool ok = l1.contains("mode 1000") &&
+                        l2.startsWith("tool: none") &&
+                        !l3.isEmpty();
+        std::printf("  %-4s the strip has three populated lines\n",
+                    ok ? "ok" : "FAIL");
+        if (!ok)
+            fails++;
+        std::printf("        line 1: %s\n", l1.toUtf8().constData());
+        std::printf("        line 2: %s\n", l2.toUtf8().constData());
+        std::printf("        line 3: %s\n", l3.toUtf8().constData());
+    }
+
+    /* 9. Line 3 names the source.  It is checked as a *label* and not as an
+     * fps value because this loop paces nothing — assertion 12 pins the
+     * arithmetic instead. */
+    {
+        const QString l3 = win.strip()->line(2);
+        const bool ok = l3.contains("FIXTURE");
+        std::printf("  %-4s line 3 names the source (\"%s\")\n",
+                    ok ? "ok" : "FAIL", l3.toUtf8().constData());
+        if (!ok)
+            fails++;
+    }
+
+    /* 10. The range mode reaches the snapshot, and comes back.  Toggling twice
+     * leaves the session exactly as it was found, so this cannot perturb the
+     * strip the assertions above read. */
+    {
+        dyt_snapshot_t s2{}, s3{};
+        dyt_session_toggle_range(sess);
+        const bool got_fixed = dyt_session_snapshot(sess, &s2, nullptr, 0) == 0 &&
+                               s2.range_mode == DYT_RANGE_FIXED;
+        dyt_session_toggle_range(sess);
+        const bool back_auto = dyt_session_snapshot(sess, &s3, nullptr, 0) == 0 &&
+                               s3.range_mode == DYT_RANGE_AUTO;
+        const bool ok = snap.range_mode == DYT_RANGE_AUTO && got_fixed && back_auto;
+        std::printf("  %-4s the range mode reaches the snapshot (%s -> %s -> %s)\n",
+                    ok ? "ok" : "FAIL",
+                    dyt_range_mode_name(snap.range_mode),
+                    dyt_range_mode_name(s2.range_mode),
+                    dyt_range_mode_name(s3.range_mode));
+        if (!ok)
+            fails++;
+    }
+
+    /* 11. The engine names the modes, so no front end has to re-spell them. */
+    {
+        const char *a = dyt_range_mode_name(DYT_RANGE_AUTO);
+        const char *f = dyt_range_mode_name(DYT_RANGE_FIXED);
+        const bool ok = std::strcmp(a, "auto") == 0 &&
+                        std::strcmp(f, "fixed") == 0;
+        std::printf("  %-4s the engine names the range modes (\"%s\", \"%s\")\n",
+                    ok ? "ok" : "FAIL", a, f);
+        if (!ok)
+            fails++;
+    }
+
+    /* 12. The fps meter is exact: the first sample is only a baseline, so the
+     * rate comes from the second alone — 25 frames in 1.0 s. */
+    {
+        FpsMeter fm;
+        fm.update(0, 0.0);
+        fm.update(25, 1.0);
+        const bool ok = fm.fps() == 25.0;
+        std::printf("  %-4s the fps meter is exact (%.1f fps)\n",
+                    ok ? "ok" : "FAIL", fm.fps());
+        if (!ok)
+            fails++;
+    }
+
+    /* 13. A filler frame is not a live frame.  This is the real filler rule
+     * (display.h), reached with no device and no timing: a throwaway session
+     * fed a flat plane of the start-up value reports not-ready, and the state
+     * machine calls that WARMING UP rather than LIVE. */
+    {
+        dyt_session_t *fs_sess = dyt_session_create();
+        bool ok = false;
+        if (fs_sess) {
+            std::vector<float> filler((size_t)256 * 192, DYT_FILLER_C);
+            dyt_frame_info_t fi{ filler.data(), 256, 192 };
+            dyt_snapshot_t fs_snap{};
+            ok = dyt_session_process(fs_sess, &fi) == 0 &&
+                 dyt_session_snapshot(fs_sess, &fs_snap, nullptr, 0) == 0 &&
+                 fs_snap.ready == 0 &&
+                 device_state(true, true, 0, true, fs_snap.ready != 0)
+                     == DevState::WarmingUp;
+            std::printf("  %-4s a filler frame is not a live frame "
+                        "(ready %d, %s)\n", ok ? "ok" : "FAIL",
+                        fs_snap.ready, state_label(device_state(true, true, 0,
+                        true, fs_snap.ready != 0)));
+            dyt_session_free(fs_sess);
+        } else {
+            std::printf("  FAIL out of memory\n");
+        }
+        if (!ok)
+            fails++;
+    }
+
+    /* 14. A failed bring-up is a state, not a crash.  Pure function, so this
+     * is the only way the state is reachable without a camera. */
+    {
+        const DevState ds = device_state(true, true, -1, false, false);
+        const bool ok = ds == DevState::NoDevice;
+        std::printf("  %-4s a failed bring-up is a state, not a crash (%s)\n",
+                    ok ? "ok" : "FAIL", state_label(ds));
+        if (!ok)
+            fails++;
+    }
+
+    /* 15. Zoom is applied to the frame, and the layout follows it.  z > 1 is
+     * part of the assertion on purpose: at zoom 1 the relation below would
+     * hold for an untransformed frame too, and would prove nothing. */
+    {
+        const int   z    = snap.xform.zoom;
+        const QSize is   = win.view()->imageSize();
+        const QSize hint = win.view()->sizeHint();
+        const bool  ok   = z > 1 && is == QSize(256 * z, 192 * z) &&
+                           hint.height() >= is.height();
+        std::printf("  %-4s zoom %d is applied to the frame (%dx%d, hint %dx%d)\n",
+                    ok ? "ok" : "FAIL", z, is.width(), is.height(),
+                    hint.width(), hint.height());
+        if (!ok)
+            fails++;
+    }
+
+    /* 16. The mirror is applied, in the sense dyt_view_transform_map() inverts.
+     * Driven directly, because the window has no way to reach it yet: no key
+     * or option sets the flip until the interaction task, and the fixture
+     * opens unmirrored.  A 3x1 source with a distinct pixel at each end, at
+     * zoom 2 with flip_h, must come out 6 wide with the ends swapped. */
+    {
+        QImage src(3, 1, QImage::Format_RGB888);
+        src.setPixelColor(0, 0, QColor(255, 0, 0));
+        src.setPixelColor(1, 0, QColor(0, 255, 0));
+        src.setPixelColor(2, 0, QColor(0, 0, 255));
+
+        dyt_view_transform_t t{};
+        t.zoom   = 2;
+        t.flip_h = 1;
+        const QImage out = transformed(src, t);
+
+        const bool ok = out.width() == 6 && out.height() == 2 &&
+                        out.pixelColor(0, 0) == QColor(0, 0, 255) &&
+                        out.pixelColor(5, 0) == QColor(255, 0, 0);
+        std::printf("  %-4s the mirror is applied (zoom %d, flip_h, "
+                    "%dx%d, ends %s/%s)\n", ok ? "ok" : "FAIL", t.zoom,
+                    out.width(), out.height(),
+                    out.pixelColor(0, 0).name().toUtf8().constData(),
+                    out.pixelColor(5, 0).name().toUtf8().constData());
+        if (!ok)
+            fails++;
+    }
+
     dyt_frame_source_close(fs);
     dyt_session_free(sess);
 
@@ -540,7 +990,7 @@ static int run_gui(const opts &o, QApplication &app)
         return 1;
     }
 
-    win.adjustSize();
+    win.fit_to_view();
     win.show();
 
     QTimer timer;
