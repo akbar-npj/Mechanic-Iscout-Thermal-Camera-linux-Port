@@ -18,16 +18,33 @@ binary and the packages stay **`dytqt`**, which is why `Exec=`, `Icon=`,
 
 ## The window
 
+The shell follows the vendor's Windows app (`ThermalAnalysisSystem.exe`; RE Docs
+07, and the manual rendered at `/tmp/pdfx/w-08.png`): a **dark theme**, a **left
+icon rail**, a centre column with the canvas and its status bar, and (in a later
+step) a **right tabbed control panel**. The theme is one stylesheet
+(`kDarkQss`), applied in `run_gui` only — never to `--selftest`, whose geometry
+assertions are calibrated against the default look.
+
 ```
 MainWindow : QWidget
-└── QVBoxLayout (margins 0, spacing 0)
-    ├── QMenuBar    (stretch 0)   File / View / Measure / Device / Help
-    ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide
-    ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery
-    ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
-    │   └── GalleryPanel          the saved-items list, an overlay child widget
-    └── StatusStrip (stretch 0)   three left-aligned lines
+└── QHBoxLayout (margins 0, spacing 0)
+    ├── IconRail    (stretch 0)   left rail: Palette / Mark / Rotate / Compare /
+    │                             Reset, then Tutorials / Contact / Setting
+    └── centre column (stretch 1, QVBoxLayout)
+        ├── QMenuBar    (stretch 0)   File / View / Measure / Device / Help  (retiring)
+        ├── QToolBar    (stretch 0)   view row: full screen, panel, range, flips, guide (retiring)
+        ├── QToolBar    (stretch 0)   tool row: tools, alarm, isotherm, still, clip, gallery (retiring)
+        ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
+        │   └── GalleryPanel          the saved-items list, an overlay child widget
+        └── StatusStrip (stretch 0)   three left-aligned lines
 ```
+
+The menu bar and the two toolbar rows are still present while the rail and the
+right panel grow to carry every action they expose; they are retired once they
+do. Every rail button runs the same `handle_key` the keyboard does, so the rail
+is a second route to the same actions — never a second set — and every rail
+button is `Qt::NoFocus`, because a focused button would swallow the keys before
+`keyPressEvent` sees them (assertion 53b pins it).
 
 `FrameView` is the only class that knows about pixels, and `StatusStrip` the only
 one that knows about text layout. Everything above them deals in the session and
@@ -41,6 +58,14 @@ known — fit rather than be cropped. It uses `resize()`, not `adjustSize()`:
 platform's 800×600 screen produced a 533×400 window for a 660×400 canvas, and
 `--selftest`'s assertion 7 caught it. A window larger than the screen is the
 lesser evil; a silently cropped image is not.
+
+`fit_to_view()` flushes the posted `LayoutRequest` events (and activates the
+layout) before reading `sizeHint()`. The canvas's `updateGeometry()` only
+invalidates its *immediate* parent's layout and posts an event; the outer
+layout's cached hint for the centre column is not recomputed until that event
+runs. Without the flush the window would be sized from the *previous* layout —
+invisible while the chrome is small, and it clipped the canvas the moment the
+icon rail's fixed width made the chrome non-trivial (assertion 7 again).
 
 ### Menus and the toolbar
 
@@ -814,6 +839,7 @@ $ ./build/dytqt --selftest
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
   ok   the Help item opens the guide (1)
   ok   neither bar can take the keyboard (menubar no focus, 2 toolbar row(s), 0 that would)
+  ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))

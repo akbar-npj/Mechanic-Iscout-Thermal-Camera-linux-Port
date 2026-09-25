@@ -38,7 +38,9 @@
 #include <QDialog>
 #include <QEventLoop>
 #include <QFileDialog>
+#include <QFrame>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QImage>
 #include <QKeyEvent>
 #include <QLabel>
@@ -48,7 +50,9 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPixmap>
+#include <QPolygon>
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -98,6 +102,51 @@ static const int kPad     = 8;
 
 static const int kLineH   = 16;  /* one status line */
 static const int kStripPad = 4;  /* the strip's own margin */
+
+/* ------------------------------------------------------------------ theme
+ *
+ * The Windows counterpart (ThermalAnalysisSystem.exe; RE Docs 07 and the manual
+ * rendered at /tmp/pdfx/w-08.png) is a dark blue-grey shell with a cyan canvas
+ * border and white text.  One stylesheet reproduces it; the colour names below
+ * are the ones the manual's screenshot reads as, so a future reader can match
+ * them against the reference without grepping for hex. */
+static const char kDarkQss[] =
+    "QWidget { background: #1e1e1e; color: #e6e6e6; }"
+    "QMenuBar, QToolBar, QTabWidget::pane, QGroupBox, QFrame { "
+        "background: #2b2b2b; }"
+    "QGroupBox { border: 1px solid #3a3a3a; border-radius: 2px; "
+        "margin-top: 10px; padding-top: 6px; }"
+    "QGroupBox::title { subcontrol-origin: margin; left: 8px; "
+        "color: #9aa0a6; }"
+    "QTabBar::tab { background: #2b2b2b; color: #9aa0a6; "
+        "padding: 6px 14px; border: 1px solid #3a3a3a; "
+        "border-bottom: none; border-top-left-radius: 2px; "
+        "border-top-right-radius: 2px; }"
+    "QTabBar::tab:selected { background: #1e1e1e; color: #e6e6e6; "
+        "border-color: #00b4d8; }"
+    "QTabWidget::pane { border: 1px solid #3a3a3a; }"
+    "QPushButton { background: #2b2b2b; color: #e6e6e6; border: 1px solid "
+        "#3a3a3a; padding: 4px 10px; }"
+    "QPushButton:checked, QPushButton:pressed { background: #003644; "
+        "border-color: #00b4d8; }"
+    "QPushButton#rail { border: none; border-radius: 0; text-align: center; "
+        "padding: 6px 2px; font-size: 9px; }"
+    "QPushButton#rail:checked { background: #003644; }"
+    "QLineEdit, QSpinBox, QDoubleSpinBox { background: #2b2b2b; color: #e6e6e6; "
+        "border: 1px solid #3a3a3a; padding: 2px; }"
+    "QListWidget { background: #1e1e1e; color: #e6e6e6; border: 1px solid "
+        "#3a3a3a; }"
+    "QScrollBar:vertical { background: #1e1e1e; width: 10px; }"
+    "QScrollBar::handle:vertical { background: #3a3a3a; border-radius: 4px; }"
+    "QStatusBar { background: #2b2b2b; color: #9aa0a6; }"
+    "QFrame[frameShape=\"6\"] { border: 1px solid #00b4d8; }"  /* canvas border */
+    ;
+
+/* The rail's fixed width — narrow enough that the canvas keeps the room, wide
+ * enough for a stacked 24-px icon and a 9-pt label ("Tutorials" is the longest
+ * at ~45 px).  The Windows rail is a slim vertical strip; this matches it
+ * without crowding the picture. */
+static const int kRailW = 72;
 
 /* ---------------------------------------------------------------- options */
 
@@ -2077,6 +2126,224 @@ private:
     QString       dir_;
 };
 
+/* ----------------------------------------------------------- the icon rail
+ *
+ * The Windows counterpart's left rail (manual p.5, /tmp/pdfx/w-08.png) is a
+ * slim vertical strip of stacked icon+label buttons.  This is its Qt analogue.
+ *
+ * Every button is `Qt::NoFocus` for the same reason the menu bar and toolbar
+ * rows were (and still are, while those exist): a focused button swallows the
+ * keys before `keyPressEvent` sees them, which would silently break every
+ * binding the moment someone clicked the rail.  `checkable` buttons mirror a
+ * QAction's toggle so `handle_key` can drive them and `sync_actions()` can set
+ * their state.  Each button's `clicked` runs the same `handle_key` the keyboard
+ * does, so the rail is a second route to the same actions — never a second set.
+ *
+ * The eight icons are QPainter-drawn vectors: the package ships no icon assets,
+ * and a hand-drawn glyph is the closest a no-asset build can come to the
+ * Windows rail's look.  Each is a small delegate painted into a 24x24 pixmap.
+ */
+class MainWindow;   /* forward: IconRail reports clicks to the window */
+class IconRail : public QWidget {
+public:
+    enum RailItem {
+        Palette = 0, Mark, Rotate, Compare, ResetImage,
+        Tutorials, ContactUs, Setting,
+        N_RailItems
+    };
+
+    explicit IconRail(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setFixedWidth(kRailW);
+        auto *lay = new QVBoxLayout(this);
+        lay->setContentsMargins(0, kPad, 0, kPad);
+        lay->setSpacing(6);
+
+        /* The top group — palette, mark, rotate, compare, reset. */
+        for (int i = 0; i < ResetImage + 1; i++)
+            lay->addWidget(make_button((RailItem)i));
+        lay->addStretch(1);
+        /* The bottom group — tutorials, contact, setting. */
+        for (int i = Tutorials; i < N_RailItems; i++)
+            lay->addWidget(make_button((RailItem)i));
+    }
+
+    /* A click on `item`.  Set by MainWindow, which owns the session and the
+     * one handle_key dispatch — the same callback split every other control in
+     * this file uses (on_help_, on_still_, …), and what keeps IconRail from
+     * needing MainWindow's complete definition here. */
+    std::function<void(RailItem)> on_action;
+
+    /* A button the front end can re-parent into a popup (Palette) or drive
+     * the same way a QAction would.  Returns nullptr for an out-of-range item. */
+    QPushButton *button(RailItem i) const
+    {
+        if (i < 0 || i >= N_RailItems)
+            return nullptr;
+        return btn_[i];
+    }
+
+    /* The icons, painted into 24x24 device-pixel pixmaps.  Each is a delegate
+     * so the painting stays in one place and the button just sets the pixmap. */
+    static void paint_icon(QPainter &p, RailItem i, const QRect &r)
+    {
+        p.setRenderHint(QPainter::Antialiasing, true);
+        const QColor cyan(QStringLiteral("#00b4d8"));
+        const QColor white(QStringLiteral("#e6e6e6"));
+        QPen pen(cyan, 1.4);
+        p.setPen(pen);
+        p.setBrush(Qt::NoBrush);
+        const int cx = r.center().x(), cy = r.center().y();
+
+        switch (i) {
+        case Palette: {
+            /* a colour wheel: six wedges in the palette's accent hues. */
+            const QColor hues[] = {
+                QColor(QStringLiteral("#e6194b")),
+                QColor(QStringLiteral("#f58231")),
+                QColor(QStringLiteral("#ffe119")),
+                QColor(QStringLiteral("#3cb44b")),
+                QColor(QStringLiteral("#00b4d8")),
+                QColor(QStringLiteral("#911eb4")) };
+            const int R = std::min(r.width(), r.height()) / 2 - 2;
+            QRectF circ(cx - R, cy - R, 2 * R, 2 * R);
+            for (int k = 0; k < 6; k++) {
+                p.setBrush(hues[k]);
+                p.setPen(Qt::NoPen);
+                p.drawPie(circ, 60 * k * 16, 60 * 16);
+            }
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(white, 1.0));
+            p.drawEllipse(circ);
+            break;
+        }
+        case Mark:
+            /* a thermometer + a plus: the measurement "mark" glyph. */
+            p.drawRoundedRect(cx - 3, cy - 9, 6, 14, 3, 3);
+            p.setBrush(cyan);
+            p.drawEllipse(QRectF(cx - 5, cy + 3, 10, 10));
+            p.setBrush(Qt::NoBrush);
+            p.drawLine(cx + 6, cy - 8, cx + 11, cy - 8);
+            p.drawLine(cx + 8, cy - 10, cx + 8, cy - 6);
+            break;
+        case Rotate: {
+            /* a circular arrow, the rotate glyph. */
+            const int R = 8;
+            QRectF circ(cx - R, cy - R, 2 * R, 2 * R);
+            p.drawArc(circ, 30 * 16, 270 * 16);
+            /* arrowhead at the open end. */
+            QTransform old = p.transform();
+            p.translate(cx + R - 1, cy + 4);
+            p.rotate(120);
+            p.setBrush(cyan);
+                QPolygon tri; tri << QPoint(0, 0) << QPoint(-5, -3)
+                                  << QPoint(-5, 3);
+                p.drawPolygon(tri);
+            p.setBrush(Qt::NoBrush);
+            p.setTransform(old);
+            break;
+        }
+        case Compare: {
+            /* two opposing arrows — the compare glyph. */
+            p.drawLine(cx - 9, cy - 4, cx + 9, cy - 4);
+            p.drawLine(cx + 9, cy - 4, cx + 5, cy - 7);
+            p.drawLine(cx + 9, cy - 4, cx + 5, cy - 1);
+            p.drawLine(cx - 9, cy + 4, cx + 9, cy + 4);
+            p.drawLine(cx - 9, cy + 4, cx - 5, cy + 1);
+            p.drawLine(cx - 9, cy + 4, cx - 5, cy + 7);
+            break;
+        }
+        case ResetImage: {
+            /* a circular arrow with a tail — the reset glyph. */
+            const int R = 8;
+            QRectF circ(cx - R, cy - R, 2 * R, 2 * R);
+            p.drawArc(circ, 45 * 16, 250 * 16);
+            QTransform old = p.transform();
+            p.translate(cx + R - 1, cy - 4);
+            p.rotate(-30);
+            p.setBrush(cyan);
+                QPolygon tri; tri << QPoint(0, 0) << QPoint(-5, -3)
+                                  << QPoint(-5, 3);
+                p.drawPolygon(tri);
+            p.setBrush(Qt::NoBrush);
+            p.setTransform(old);
+            break;
+        }
+        case Tutorials:
+            /* an open book. */
+            p.drawRect(cx - 9, cy - 6, 18, 12);
+            p.drawLine(cx, cy - 6, cx, cy + 6);
+            p.drawLine(cx - 7, cy - 2, cx - 2, cy - 2);
+            p.drawLine(cx - 7, cy + 1, cx - 2, cy + 1);
+            p.drawLine(cx + 2, cy - 2, cx + 7, cy - 2);
+            p.drawLine(cx + 2, cy + 1, cx + 7, cy + 1);
+            break;
+        case ContactUs:
+            /* an envelope. */
+            p.drawRect(cx - 9, cy - 6, 18, 12);
+            p.drawLine(cx - 9, cy - 6, cx, cy + 2);
+            p.drawLine(cx + 9, cy - 6, cx, cy + 2);
+            break;
+        case Setting: {
+            /* a gear — the setting glyph. */
+            const int R = 9, r = 5, teeth = 8;
+            QPainterPath gear;
+            for (int k = 0; k < teeth * 2; k++) {
+                const double a = (k / 2.0) * 2 * M_PI / teeth;
+                const int rad = (k % 2 == 0) ? R : r;
+                const QPointF pt(cx + rad * std::cos(a),
+                                 cy + rad * std::sin(a));
+                if (k == 0) gear.moveTo(pt); else gear.lineTo(pt);
+            }
+            gear.closeSubpath();
+            p.drawPath(gear);
+            p.setBrush(QColor(QStringLiteral("#1e1e1e")));
+            p.drawEllipse(QRectF(cx - 3, cy - 3, 6, 6));
+            p.setBrush(Qt::NoBrush);
+            break;
+        }
+        case N_RailItems: break;
+        }
+    }
+
+private:
+    QPushButton *make_button(RailItem i)
+    {
+        static const char *const kLabels[N_RailItems] = {
+            "Palette", "Mark", "Rotate", "Compare", "Reset",
+            "Tutorials", "Contact", "Setting" };
+        auto *b = new QPushButton(this);
+        b->setObjectName(QStringLiteral("rail"));
+        b->setFocusPolicy(Qt::NoFocus);   /* see the class comment */
+        b->setCheckable(true);
+        b->setText(QString::fromUtf8(kLabels[i]));
+        b->setIconSize(QSize(24, 24));
+        b->setMinimumHeight(48);
+        /* Paint the icon into a pixmap once — the glyph never changes. */
+        QPixmap pm(24, 24);
+        pm.fill(Qt::transparent);
+        pm.fill(QColor(QStringLiteral("#2b2b2b")));
+        {   QPainter p(&pm); p.setRenderHint(QPainter::Antialiasing, true);
+            paint_icon(p, i, QRect(0, 0, 24, 24)); }
+        b->setIcon(QIcon(pm));
+        b->setIconSize(QSize(24, 24));
+        /* A QPushButton shows the icon above the text by default when both are
+         * set; no setToolButtonStyle (that is a QToolButton API).  The label is
+         * kept short so the 64-px rail fits it on one line. */
+        /* Report the click; MainWindow decides what it means.  Every rail item
+         * is wired this way from the start, so a button is never a silent
+         * no-op — the handler is what grows, step by step. */
+        b->connect(b, &QPushButton::clicked, [this, i]() {
+            if (on_action)
+                on_action((RailItem)i);
+        });
+        btn_[i] = b;
+        return b;
+    }
+
+    QPushButton *btn_[N_RailItems] = {};
+};
+
 /* --------------------------------------------------------------- the window */
 
 class MainWindow : public QWidget {
@@ -2086,25 +2353,40 @@ public:
         view_  = new FrameView(this);
         strip_ = new StatusStrip(this);
 
-        /* The chrome is built before the layout that holds it, and before the
-         * first fit_to_view(): the window is sized from its layout's hint, so
-         * the bars have to be in the layout by then or the canvas would be
-         * given a window sized as though they were not there.
+        /* The shell is the three-column Windows layout: a left icon rail, a
+         * centre column holding the canvas and its status bar, and a right
+         * tabbed control panel.  Only the rail lands here; the panel is a
+         * QTabWidget that arrives with the Troubleshoot tab in a later step, so
+         * the window stays small enough for the offscreen test screen (800x800)
+         * to show the whole canvas — the pixel assertions are calibrated to an
+         * uncropped canvas, and 660 px of canvas + 260 px of panel does not fit.
+         * The menu bar and two toolbar rows still live in the centre column for
+         * now; they are retired once the rail and panel carry every action.
          *
          * MainWindow stays a plain QWidget rather than becoming a QMainWindow.
          * QMainWindow::sizeHint() does not account for its menu and tool bar
          * heights, so fit_to_view()'s resize(sizeHint()) would size the window
          * for the central widget alone and let the bars steal rows from the
-         * canvas — clipping the picture.  As rows of a QVBoxLayout they count
-         * towards QWidget::sizeHint() automatically. */
-        auto *lay = new QVBoxLayout(this);
+         * canvas — clipping the picture.  As rows of the centre column's
+         * QVBoxLayout they count towards QWidget::sizeHint() automatically, and
+         * the outer QHBoxLayout that holds rail | centre is itself a row of
+         * that same QWidget::sizeHint(). */
+        rail_  = new IconRail(this);
+        auto *centre = new QWidget(this);
+        auto *clay = new QVBoxLayout(centre);
+        clay->setContentsMargins(0, 0, 0, 0);
+        clay->setSpacing(0);
+        clay->addWidget(build_menus(), 0);
+        clay->addWidget(toolbar_row(true), 0);
+        clay->addWidget(toolbar_row(false), 0);
+        clay->addWidget(view_, 1);
+        clay->addWidget(strip_, 0);
+
+        auto *lay = new QHBoxLayout(this);
         lay->setContentsMargins(0, 0, 0, 0);
         lay->setSpacing(0);
-        lay->addWidget(build_menus(), 0);
-        lay->addWidget(toolbar_row(true), 0);
-        lay->addWidget(toolbar_row(false), 0);
-        lay->addWidget(view_, 1);
-        lay->addWidget(strip_, 0);
+        lay->addWidget(rail_, 0);
+        lay->addWidget(centre, 1);
 
         setWindowTitle(kAppName);
         /* So 'R' reaches keyPressEvent rather than being dropped. */
@@ -2128,6 +2410,8 @@ public:
         };
         gal_panel_->hide();
     }
+
+    IconRail *rail() const { return rail_; }
 
     FrameView   *view()  const { return view_; }
     StatusStrip *strip() const { return strip_; }
@@ -2353,6 +2637,18 @@ public:
         if (want == fitted_)
             return;
         fitted_ = want;
+        /* The window's hint can lag the view's fresh one by one event-loop
+         * turn.  The canvas's updateGeometry() only invalidates its *immediate*
+         * parent's layout and *posts* a LayoutRequest; the outer layout's
+         * cached hint for the centre column is not recomputed until that event
+         * runs.  Reading sizeHint() without flushing would size the window from
+         * the previous layout — invisible while the chrome is small, and it
+         * clips the canvas as soon as it is not (the icon rail's fixed width is
+         * what exposed it).  Flush the posted requests so sizeHint() below is
+         * the one that holds this canvas. */
+        QApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+        if (QLayout *l = layout())
+            l->activate();
         resize(sizeHint());
     }
 
@@ -2889,6 +3185,7 @@ private:
 
     FrameView   *view_  = nullptr;
     StatusStrip *strip_ = nullptr;
+    IconRail    *rail_  = nullptr;   /* the left icon rail, a child of this */
     dyt_session_t *sess_ = nullptr;      /* borrowed */
     /* The clip playing on the canvas, if any.  Borrowed from the pump, which
      * advances it — the same pattern as sess_: the window reads and steers the
@@ -5222,6 +5519,29 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 53b. The icon rail cannot take the keyboard either, for the same reason
+     * as 53: a focused rail button swallows the keys, including an armed
+     * parameter ladder.  Checked by walking the rail's own buttons rather than
+     * trusting the constructor, so a rail button added later without the policy
+     * fails here instead of silently breaking the keyboard. */
+    {
+        IconRail *rail = win.rail();
+        const QList<QPushButton *> btns =
+            rail ? rail->findChildren<QPushButton *>()
+                 : QList<QPushButton *>();
+        int bad = 0;
+        for (QPushButton *b : btns)
+            if (b->focusPolicy() != Qt::NoFocus)
+                bad++;
+        const bool ok = rail && btns.size() == (int)IconRail::N_RailItems
+                        && bad == 0;
+        std::printf("  %-4s the icon rail cannot take the keyboard "
+                    "(%d button(s), %d that would)\n",
+                    ok ? "ok" : "FAIL", (int)btns.size(), bad);
+        if (!ok)
+            fails++;
+    }
+
     /* 56. No toolbar row is overflowing.  Qt hides the buttons that do not fit
      * behind an extension arrow, which would put the on-screen controls the
      * toolbar exists to provide back out of sight — the very thing the split
@@ -5755,6 +6075,13 @@ static std::string about_text(bool have_model)
 
 static int run_gui(const opts &o_in, QApplication &app)
 {
+    /* The dark shell, applied to the real run only — never to --selftest.  The
+     * stylesheet changes widget metrics (padding, borders), and the selftest's
+     * geometry assertions (fit-to-view, toolbar overflow) were calibrated
+     * against the default look; restyling the test would move its goalposts.
+     * The theme is presentation, so the test deliberately measures without it. */
+    app.setStyleSheet(QString::fromUtf8(kDarkQss));
+
     /* A saved preference fills in only what the command line did not name, so
      * an explicit flag always wins. */
     opts o = o_in;
