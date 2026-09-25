@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dytjpeg.h"       /* the still container the gallery opens */
 #include "frame_source.h"
 #include "thermometry.h"   /* LUT_N */
 #include "visible.h"
@@ -100,61 +101,51 @@ static uint8_t *read_file(const char *path, size_t *size_out)
 
 /* ------------------------------------------------------------------- fixture */
 
-dyt_frame_source_t *dyt_frame_source_open_fixture(
-    dyt_session_t *sess, const char *path, int width, dyt_mode_t mode,
-    dyt_plane_t plane, float t_amb, int sensor_mode, int fix_mode,
-    long long limit)
+/* Build a source over a payload already in memory, taking ownership of `raw`
+ * (freed here on failure, and by dyt_frame_source_close() otherwise).  Both
+ * openers below hand it a malloc'd buffer and stop worrying about it.
+ *
+ * `label` names the source in a diagnostic ("<path>"), because the geometry
+ * mismatch message is the only clue a caller gets about which file was wrong. */
+static dyt_frame_source_t *open_payload(dyt_session_t *sess, uint16_t *raw,
+                                        size_t n_samples, int width,
+                                        dyt_mode_t mode, dyt_plane_t plane,
+                                        float t_amb, int sensor_mode,
+                                        int fix_mode, long long limit,
+                                        const char *label)
 {
     dyt_frame_source_t *fs;
-    uint8_t            *file;
-    size_t              bytes;
     int                 rc;
 
-    if (!sess || !path || width <= 0) {
-        fprintf(stderr, "frame_source: bad fixture arguments\n");
-        return NULL;
-    }
-
-    file = read_file(path, &bytes);
-    if (!file)
-        return NULL;
-
-    /* The payload is little-endian uint16 and must be a whole number of rows,
-     * so a truncated or mis-sized file fails here rather than converting
-     * garbage. */
-    if (bytes == 0 || bytes % 2 || bytes % ((size_t)width * 2)) {
-        fprintf(stderr, "frame_source: %s is %zu bytes — not a whole number "
-                        "of %d-pixel uint16 rows\n", path, bytes, width);
-        free(file);
+    if (!sess || !raw || width <= 0 || n_samples == 0) {
+        free(raw);
         return NULL;
     }
 
     fs = calloc(1, sizeof *fs);
     if (!fs) {
-        free(file);
+        free(raw);
         return NULL;
     }
 
-    fs->sess    = sess;
+    fs->sess       = sess;
     fs->is_fixture = 1;
-    fs->limit   = limit;
-    fs->width   = width;
-    fs->raw     = (uint16_t *)file;
-    fs->n_samples = bytes / 2;
+    fs->limit      = limit;
+    fs->width      = width;
+    fs->raw        = raw;
+    fs->n_samples  = n_samples;
 
     fs->lut = malloc(LUT_N * sizeof(float));
-    if (!fs->lut) {
-        free(fs->raw);
-        free(fs);
-        return NULL;
-    }
+    if (!fs->lut)
+        goto fail;
     dyt_pipeline_init(&fs->pipe, mode, plane, t_amb, sensor_mode, fix_mode,
                       fs->lut);
 
     rc = dyt_pipeline_resolve(&fs->pipe, width, fs->n_samples);
     if (rc != 0) {
         fprintf(stderr, "frame_source: %s does not resolve as %dpx mode %#x "
-                        "plane %s (%zu samples)\n", path, width, (unsigned)mode,
+                        "plane %s (%zu samples)\n", label, width,
+                (unsigned)mode,
                 plane == DYT_PLANE_BOTTOM_HALF ? "bottom-half" : "full",
                 fs->n_samples);
         goto fail;
@@ -191,6 +182,86 @@ fail:
     free(fs->raw);
     free(fs);
     return NULL;
+}
+
+dyt_frame_source_t *dyt_frame_source_open_fixture(
+    dyt_session_t *sess, const char *path, int width, dyt_mode_t mode,
+    dyt_plane_t plane, float t_amb, int sensor_mode, int fix_mode,
+    long long limit)
+{
+    uint8_t *file;
+    size_t   bytes;
+
+    if (!sess || !path || width <= 0) {
+        fprintf(stderr, "frame_source: bad fixture arguments\n");
+        return NULL;
+    }
+
+    file = read_file(path, &bytes);
+    if (!file)
+        return NULL;
+
+    /* The payload is little-endian uint16 and must be a whole number of rows,
+     * so a truncated or mis-sized file fails here rather than converting
+     * garbage. */
+    if (bytes == 0 || bytes % 2 || bytes % ((size_t)width * 2)) {
+        fprintf(stderr, "frame_source: %s is %zu bytes — not a whole number "
+                        "of %d-pixel uint16 rows\n", path, bytes, width);
+        free(file);
+        return NULL;
+    }
+
+    return open_payload(sess, (uint16_t *)file, bytes / 2, width, mode, plane,
+                        t_amb, sensor_mode, fix_mode, limit, path);
+}
+
+/* A saved still, opened as a frame source so the gallery can show it through
+ * the same pipeline as a live frame rather than a second render path.
+ *
+ * The container's own geometry is used when it has one.  A vendor still has
+ * none, so `fallback_width` (the width the app is configured with) is used
+ * instead — the payload's row count follows from its length, exactly as it does
+ * for a fixture file.  The payload is replayed, not consumed: a still is one
+ * frame shown for as long as the caller looks at it. */
+dyt_frame_source_t *dyt_frame_source_open_still(
+    dyt_session_t *sess, const char *path, int fallback_width, dyt_mode_t mode,
+    dyt_plane_t plane, float t_amb, int sensor_mode, int fix_mode)
+{
+    uint8_t *blob = NULL, *raw = NULL;
+    size_t   bl = 0, rl = 0;
+    int      width = 0, ar = 0, tr = 0;
+    unsigned fl = 0;
+
+    if (!sess || !path) {
+        fprintf(stderr, "frame_source: bad still arguments\n");
+        return NULL;
+    }
+
+    if (dyt_dyt_read(path, &blob, &bl, &raw, &rl, NULL, NULL) != 0) {
+        fprintf(stderr, "frame_source: %s is not a DYT still\n", path);
+        return NULL;
+    }
+
+    /* A vendor blob has no geometry record; then the width is the caller's. */
+    if (dyt_dyt_blob_geometry(blob, bl, &width, &ar, &tr, &fl) != 1 ||
+        width <= 0)
+        width = fallback_width;
+    free(blob);
+
+    if (width <= 0) {
+        fprintf(stderr, "frame_source: %s records no width and none was given\n",
+                path);
+        free(raw);
+        return NULL;
+    }
+    if (rl == 0 || rl % 2) {
+        fprintf(stderr, "frame_source: %s carries no thermal payload\n", path);
+        free(raw);
+        return NULL;
+    }
+
+    return open_payload(sess, (uint16_t *)raw, rl / 2, width, mode, plane,
+                        t_amb, sensor_mode, fix_mode, 0, path);
 }
 
 /* ---------------------------------------------------------------------- live */

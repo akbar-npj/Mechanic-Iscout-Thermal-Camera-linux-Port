@@ -19,6 +19,11 @@
  * (session_capture.c) is already filling the session from libuvc's callback
  * thread, so `next()` only has to render the session's latest state.
  *
+ * A saved still is a third source (the gallery's): it opens a `.dyt.jpg`
+ * container, recovers its raw payload, and replays it through the *same*
+ * pipeline as the fixture — so a still on screen was rendered exactly the way a
+ * live frame is, not by a second path that could disagree.
+ *
  * Frames come out as RGB (what `dyt_session_render_rgb()` produces), not BGR —
  * the recorder, which is the only OpenCV-aware layer, does that swap.
  *
@@ -77,6 +82,23 @@ dyt_frame_source_t *dyt_frame_source_open_fixture(
  * `sess` must outlive the source; the capture handle and adapter are owned by
  * the caller (see session_capture.h for the wiring order). */
 dyt_frame_source_t *dyt_frame_source_open_live(dyt_session_t *sess);
+
+/* Open a saved still (a `.dyt.jpg` container) as a frame source, so the gallery
+ * shows it through the same pipeline as a live frame instead of a second render
+ * path.  The payload is replayed rather than consumed: a still is one frame
+ * shown for as long as the caller looks at it.
+ *
+ * The container's recorded geometry supplies the width when it has one.  A
+ * container the vendor wrote has no geometry record, so `fallback_width` (the
+ * width the app is configured with) is used and the row count follows from the
+ * payload's length, exactly as it does for a fixture file.
+ *
+ * Returns NULL on a bad argument, a file that is not a DYT still, or a payload
+ * that does not resolve — including a vendor still with no width to fall back
+ * on. */
+dyt_frame_source_t *dyt_frame_source_open_still(
+    dyt_session_t *sess, const char *path, int fallback_width, dyt_mode_t mode,
+    dyt_plane_t plane, float t_amb, int sensor_mode, int fix_mode);
 
 /* Produce the next frame.
  *

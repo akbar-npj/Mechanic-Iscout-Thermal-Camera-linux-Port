@@ -317,6 +317,70 @@ int dyt_vm_elapsed(double seconds, char *out, size_t n);
  * or -1 on a bad argument. */
 int dyt_vm_rec_label(double seconds, long long frames, char *out, size_t n);
 
+/* ---------------------------------------------------------------- gallery
+ *
+ * A gallery is a directory of the material the port saved.  Listing it and
+ * describing one entry is filesystem and container work with no toolkit and no
+ * device, so it lives here and is pinned in `make check`.
+ *
+ * What is deliberately *not* here: decoding the JPEG (the front end's toolkit
+ * does that) and re-rendering the thermal frame (the frame source runs the
+ * pipeline, because that needs the thermometry the container does not carry).
+ * What this decides is which files are worth offering and what each one holds.
+ */
+
+#define DYT_VM_NAME_CAP 256
+#define DYT_VM_PATH_CAP 1024
+
+typedef enum {
+    DYT_VM_ITEM_NONE  = 0,
+    DYT_VM_ITEM_STILL = 1,   /* a `.dyt.jpg` container */
+    DYT_VM_ITEM_CLIP  = 2    /* an `.mp4` clip */
+} dyt_vm_item_kind_t;
+
+typedef struct {
+    char               name[DYT_VM_NAME_CAP];   /* file name, no directory */
+    char               path[DYT_VM_PATH_CAP];   /* as scanned */
+    long long          mtime;                   /* seconds since the epoch */
+    long long          bytes;
+    dyt_vm_item_kind_t kind;
+} dyt_vm_item_t;
+
+/* Classify a file name by its extension: `.dyt.jpg` is a still, `.mp4` is a
+ * clip, anything else (including NULL) is NONE.  The extension match is
+ * case-insensitive; the name has to be longer than the extension, so `.mp4`
+ * itself is not a clip. */
+dyt_vm_item_kind_t dyt_vm_item_kind(const char *name);
+
+/* Scan `dir` (NULL or "" means ".") for stills and clips and fill up to `cap`
+ * entries of `out`, newest first — ties broken by name, so the order is stable
+ * across runs and filesystems.
+ *
+ * Returns the number of matching entries *found* — which may exceed `cap`, so a
+ * caller can tell it was truncated — or -1 on a bad argument or an unreadable
+ * directory.  A `cap` of 0 counts without writing, so a caller can size its
+ * buffer with one call and fill it with the next. */
+int dyt_vm_scan(const char *dir, dyt_vm_item_t *out, int cap);
+
+/* What a saved still turned out to hold. */
+typedef struct {
+    int       have_thermal;   /* the container recorded the thermal geometry */
+    int       width;          /* thermal plane width, 0 when unknown */
+    int       active_rows;    /* thermal plane height, 0 when unknown */
+    int       total_rows;     /* payload rows, including any visible half */
+    unsigned  flags;          /* DYT_DYT_FLAG_* */
+    int       n_samples;      /* raw payload samples */
+    long long raw_bytes;
+    long long jpeg_bytes;     /* the embedded image, for a viewer to decode */
+} dyt_vm_still_info_t;
+
+/* Read a still's container and describe it.  A container the vendor wrote is
+ * described too, with `have_thermal` 0 and the geometry fields zeroed: it is a
+ * valid still whose JPEG can be shown, just not re-rendered thermally.
+ *
+ * Returns 0 on success, or -1 when the file is not a DYT container. */
+int dyt_vm_still_info(const char *path, dyt_vm_still_info_t *info);
+
 /* -------------------------------------------------------------- utilities */
 
 /* The directory the running executable lives in, or "" when it cannot be

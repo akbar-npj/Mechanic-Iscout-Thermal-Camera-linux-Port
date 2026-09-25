@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -724,6 +726,158 @@ int dyt_vm_rec_label(double seconds, long long frames, char *out, size_t n)
 
     return snprintf(out, n, "REC %s  %lld frame%s", t, frames,
                     frames == 1 ? "" : "s");
+}
+
+/* ---------------------------------------------------------------- gallery */
+
+/* Case-insensitive equality, for an extension match. */
+static int ci_eq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++) {
+        int ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+        if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+        if (ca != cb)
+            return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+dyt_vm_item_kind_t dyt_vm_item_kind(const char *name)
+{
+    size_t l;
+
+    if (!name)
+        return DYT_VM_ITEM_NONE;
+    l = strlen(name);
+
+    /* `.dyt.jpg` is longer than `.mp4`, and neither is a suffix of the other,
+     * so the order here does not matter — but the `>` not `>=` does: a file
+     * named exactly ".mp4" has no name and is not one of ours. */
+    if (l > 4 && ci_eq(name + l - 4, ".mp4"))
+        return DYT_VM_ITEM_CLIP;
+    if (l > 8 && ci_eq(name + l - 8, ".dyt.jpg"))
+        return DYT_VM_ITEM_STILL;
+
+    return DYT_VM_ITEM_NONE;
+}
+
+/* Newest first, then by name, so the order is stable. */
+static int item_before(const dyt_vm_item_t *a, const dyt_vm_item_t *b)
+{
+    if (a->mtime != b->mtime)
+        return a->mtime > b->mtime;
+    return strcmp(a->name, b->name) < 0;
+}
+
+static void item_sort(dyt_vm_item_t *v, int n)
+{
+    int i;
+
+    /* Insertion sort: a gallery is tens of files, not thousands, and this
+     * keeps the comparison in one place instead of a qsort trampoline. */
+    for (i = 1; i < n; i++) {
+        dyt_vm_item_t key = v[i];
+        int           j   = i - 1;
+        while (j >= 0 && item_before(&key, &v[j])) {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = key;
+    }
+}
+
+int dyt_vm_scan(const char *dir, dyt_vm_item_t *out, int cap)
+{
+    const char  *d = (dir && dir[0]) ? dir : ".";
+    DIR         *dp;
+    dyt_vm_item_t *v = NULL;
+    int          n = 0, cap_v = 0, i, rc = -1;
+
+    if (cap < 0 || (cap > 0 && !out))
+        return -1;
+
+    dp = opendir(d);
+    if (!dp)
+        return -1;
+
+    for (struct dirent *e; (e = readdir(dp)) != NULL;) {
+        dyt_vm_item_kind_t kind = dyt_vm_item_kind(e->d_name);
+        struct stat        st;
+        char               full[DYT_VM_PATH_CAP];
+        int                need;
+
+        if (kind == DYT_VM_ITEM_NONE)
+            continue;
+        if (snprintf(full, sizeof full, "%s/%s", d, e->d_name) >=
+                (int)sizeof full)
+            continue;                       /* a name too long to address */
+        if (stat(full, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;                       /* a directory named *.mp4, etc. */
+
+        if (n == cap_v) {
+            int            ncap = cap_v ? cap_v * 2 : 16;
+            dyt_vm_item_t *grow = realloc(v, (size_t)ncap * sizeof *grow);
+            if (!grow)
+                goto done;
+            v      = grow;
+            cap_v  = ncap;
+        }
+        need = snprintf(v[n].name, sizeof v[n].name, "%s", e->d_name);
+        if (need <= 0 || need >= (int)sizeof v[n].name)
+            continue;                       /* cannot name it: skip, not fail */
+        snprintf(v[n].path, sizeof v[n].path, "%s", full);
+        v[n].mtime = (long long)st.st_mtime;
+        v[n].bytes = (long long)st.st_size;
+        v[n].kind  = kind;
+        n++;
+    }
+
+    item_sort(v, n);
+
+    for (i = 0; i < n && i < cap; i++)
+        out[i] = v[i];
+    rc = n;                                 /* found, not merely written */
+
+done:
+    closedir(dp);
+    free(v);
+    return rc;
+}
+
+int dyt_vm_still_info(const char *path, dyt_vm_still_info_t *info)
+{
+    uint8_t *blob = NULL, *raw = NULL, *jpg = NULL;
+    size_t   bl = 0, rl = 0, jl = 0;
+    int      w = 0, ar = 0, tr = 0;
+    unsigned fl = 0;
+    int      rc;
+
+    if (!path || !info)
+        return -1;
+
+    memset(info, 0, sizeof *info);
+
+    if (dyt_dyt_read(path, &blob, &bl, &raw, &rl, &jpg, &jl) != 0)
+        return -1;
+
+    info->raw_bytes  = (long long)rl;
+    info->n_samples  = (int)(rl / 2);
+    info->jpeg_bytes = (long long)jl;
+
+    if (dyt_dyt_blob_geometry(blob, bl, &w, &ar, &tr, &fl) == 1) {
+        info->have_thermal = 1;
+        info->width        = w;
+        info->active_rows  = ar;
+        info->total_rows   = tr;
+        info->flags        = fl;
+    }
+
+    rc = 0;
+    free(blob);
+    free(raw);
+    free(jpg);
+    return rc;
 }
 
 /* -------------------------------------------------------------- utilities */

@@ -2686,7 +2686,56 @@ static int selftest(const opts &o)
             }
         }
 
-        /* 38. The clip state machine: start, feed, stop — and the indicator
+        /* 38. The gallery scan finds the still, and opening it as a frame
+         * source re-renders the same scene the fixture showed — through the
+         * live pipeline, not a second path.  The temperature check is what
+         * makes it meaningful: the filler decodes to ~238.85 C. */
+        {
+            dyt_vm_item_t items[4];
+            int           found = dyt_vm_scan(d.c_str(), items, 4);
+            int           still_at = -1;
+            for (int i = 0; i < found; i++)
+                if (items[i].kind == DYT_VM_ITEM_STILL)
+                    still_at = i;
+
+            dyt_session_t      *gs = dyt_session_create();
+            dyt_frame_source_t *sf = nullptr;
+            const uint8_t      *grgb = nullptr;
+            int                 gw = 0, gh = 0;
+            dyt_fs_status_t     st = DYT_FS_ERROR;
+            float               temps[256 * 192];
+            int                 ntemps = 0;
+            float               lo = 1e9f, hi = -1e9f;
+
+            if (gs && still_at >= 0)
+                sf = dyt_frame_source_open_still(
+                    gs, items[still_at].path, 256, DYT_MODE_1000,
+                    DYT_PLANE_BOTTOM_HALF, 25.0f, 0, 0);
+            if (sf)
+                st = dyt_frame_source_next(sf, &grgb, &gw, &gh);
+            if (sf && st == DYT_FS_FRAME) {
+                ntemps = dyt_frame_source_temps(sf, temps, 256 * 192);
+                for (int i = 0; i < ntemps; i++) {
+                    if (temps[i] < lo) lo = temps[i];
+                    if (temps[i] > hi) hi = temps[i];
+                }
+            }
+
+            const bool ok = found >= 1 && still_at >= 0 && sf && grgb &&
+                            st == DYT_FS_FRAME && gw == 256 && gh == 192 &&
+                            ntemps == 256 * 192 && hi > 20.0f && hi < 60.0f;
+            std::printf("  %-4s the gallery opens a saved still "
+                        "(scan %d, still %d, frame %dx%d, temps %.2f..%.2f C)\n",
+                        ok ? "ok" : "FAIL", found, still_at, gw, gh,
+                        ntemps ? lo : 0.0f, ntemps ? hi : 0.0f);
+            if (!ok)
+                fails++;
+
+            dyt_frame_source_close(sf);
+            dyt_session_free(gs);
+        }
+
+        /* 39. The clip state machine: start, feed, stop — and the indicator
          * tracks it.  Needs OpenCV, which is the point of the gate. */
         {
             dyt_snapshot_t snap;
@@ -2746,7 +2795,7 @@ static int selftest(const opts &o)
             }
         }
 
-        /* 39. The disk guard refuses a directory it cannot examine, and says
+        /* 40. The disk guard refuses a directory it cannot examine, and says
          * which one. */
         {
             CaptureCtl  c;
@@ -2780,7 +2829,7 @@ static int selftest(const opts &o)
             rmdir(dir);
     }
 
-    /* 40. The capture keys reach the front end.  's' and 'v' are new bindings
+    /* 41. The capture keys reach the front end.  's' and 'v' are new bindings
      * and must not have been swallowed by the measurement set. */
     {
         int stills = 0, toggles = 0;

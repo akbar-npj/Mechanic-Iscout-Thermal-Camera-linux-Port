@@ -19,7 +19,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <utime.h>
 
+#include "dytjpeg.h"
 #include "session.h"
 #include "view_model.h"
 
@@ -772,6 +775,181 @@ static void test_capture(void)
     strcheck("cap: one frame is singular", b, "REC 0:00  1 frame");
 }
 
+/* A session frame with a raw payload, so a still can be written from it. */
+static void feed_raw(dyt_session_t *s, float *img, uint16_t *raw,
+                     int w, int h)
+{
+    int i;
+
+    for (i = 0; i < w * h; i++)
+        raw[i] = (uint16_t)(1000 + i);
+    feed(s, img, w, h);
+    dyt_session_process_raw(s, raw, w * h, w, h);
+}
+
+static void test_gallery(void)
+{
+    char      tmpl[] = "/tmp/dytvm-gallery-XXXXXX";
+    char     *dir = mkdtemp(tmpl);
+    char      still[DYT_VM_PATH_CAP], clip[DYT_VM_PATH_CAP];
+    char      decoy[DYT_VM_PATH_CAP], vendor[DYT_VM_PATH_CAP];
+    char      msg[256] = { 0 };
+    dyt_vm_item_t items[8];
+    dyt_vm_still_info_t info;
+    int       n;
+
+    printf("\n-- gallery: classify, scan, describe a still --\n");
+
+    intcheck("gal: a still is a still",
+             dyt_vm_item_kind("dyt_20260925-120000.dyt.jpg"),
+             DYT_VM_ITEM_STILL);
+    intcheck("gal: a clip is a clip",
+             dyt_vm_item_kind("dyt_20260925-120000.mp4"), DYT_VM_ITEM_CLIP);
+    intcheck("gal: the extension match is case-insensitive",
+             dyt_vm_item_kind("dyt_20260925-120000.MP4"), DYT_VM_ITEM_CLIP);
+    intcheck("gal: a plain JPEG is not a still",
+             dyt_vm_item_kind("photo.jpg"), DYT_VM_ITEM_NONE);
+    intcheck("gal: a PNG is not ours",
+             dyt_vm_item_kind("dyt_20260925-120000.png"), DYT_VM_ITEM_NONE);
+    intcheck("gal: a bare extension is not a name",
+             dyt_vm_item_kind(".mp4"), DYT_VM_ITEM_NONE);
+    intcheck("gal: NULL is nothing", dyt_vm_item_kind(NULL), DYT_VM_ITEM_NONE);
+
+    if (!dir) {
+        fail("gal: a temporary directory", "mkdtemp");
+        return;
+    }
+
+    snprintf(still, sizeof still, "%s/dyt_20260101-000000.dyt.jpg", dir);
+    snprintf(clip, sizeof clip, "%s/dyt_20260101-000001.mp4", dir);
+    snprintf(decoy, sizeof decoy, "%s/notes.txt", dir);
+    snprintf(vendor, sizeof vendor, "%s/dyt_20260101-000002.dyt.jpg", dir);
+
+    /* A real still, from a real session frame. */
+    {
+        dyt_session_t *s = dyt_session_create();
+        float          img[16 * 16];
+        uint16_t       raw[16 * 16];
+
+        if (!s) {
+            fail("gal: session", "out of memory");
+            return;
+        }
+        feed_raw(s, img, raw, 16, 16);
+        intcheck("gal: the still writes",
+                 dyt_vm_write_still(s, still, msg, sizeof msg), 0);
+        dyt_session_free(s);
+    }
+
+    /* A clip and a decoy, so the scan has something to leave out. */
+    {
+        FILE *f = fopen(clip, "wb");
+        if (f) { fputs("not really an mp4", f); fclose(f); }
+        f = fopen(decoy, "wb");
+        if (f) { fputs("ignore me", f); fclose(f); }
+    }
+
+    /* A vendor blob: the still's own JPEG and payload, with the extension
+     * dropped.  It is a valid still that cannot be re-rendered thermally. */
+    {
+        uint8_t *blob = NULL, *raw = NULL, *jpg = NULL;
+        size_t   bl = 0, rl = 0, jl = 0;
+
+        if (dyt_dyt_read(still, &blob, &bl, &raw, &rl, &jpg, &jl) == 0) {
+            uint8_t vb[DYT_DYT_HDR_FIXED];
+
+            memcpy(vb, blob, sizeof vb);
+            vb[DYT_DYT_OFF_SIZE]     = (uint8_t)(DYT_DYT_HDR_FIXED & 0xFF);
+            vb[DYT_DYT_OFF_SIZE + 1] = (uint8_t)(DYT_DYT_HDR_FIXED >> 8);
+            intcheck("gal: the vendor container writes",
+                     dyt_dyt_write(vendor, jpg, jl, vb, sizeof vb, raw, rl), 0);
+        } else {
+            fail("gal: read the still back", "dyt_dyt_read");
+        }
+        free(blob); free(raw); free(jpg);
+    }
+
+    /* Ordering: pin the times so the test does not depend on how fast the
+     * writes above ran (a tie would fall back to the name, which is a
+     * different assertion). */
+    {
+        struct utimbuf t;
+        t.actime = t.modtime = 1000; utime(still, &t);
+        t.actime = t.modtime = 2000; utime(clip, &t);
+        t.actime = t.modtime = 3000; utime(vendor, &t);
+    }
+
+    /* Ordering: the vendor still is written last, so it is the newest. */
+    n = dyt_vm_scan(dir, NULL, 0);
+    intcheck("gal: the scan counts without writing", n, 3);
+
+    n = dyt_vm_scan(dir, items, 8);
+    intcheck("gal: the scan finds all three", n, 3);
+    if (n == 3) {
+        intcheck("gal: newest first", items[0].kind, DYT_VM_ITEM_STILL);
+        strcheck("gal: and it is the vendor still",
+                 items[0].name, "dyt_20260101-000002.dyt.jpg");
+        intcheck("gal: the clip is in there",
+                 items[1].kind, DYT_VM_ITEM_CLIP);
+        intcheck("gal: so is the first still",
+                 items[2].kind, DYT_VM_ITEM_STILL);
+        strcheck("gal: the decoy is left out", items[1].name,
+                 "dyt_20260101-000001.mp4");
+        if (items[2].bytes > 1000 && items[2].mtime > 0)
+            ok("gal: an entry carries its size and time");
+        else
+            fail("gal: an entry carries its size and time", "0");
+    }
+
+    /* Truncation is reported, not hidden. */
+    n = dyt_vm_scan(dir, items, 1);
+    intcheck("gal: a small cap reports the total", n, 3);
+    strcheck("gal: and writes the newest", items[0].name,
+             "dyt_20260101-000002.dyt.jpg");
+
+    intcheck("gal: a negative cap is refused", dyt_vm_scan(dir, items, -1), -1);
+    intcheck("gal: an unreadable directory is refused",
+             dyt_vm_scan("/nonexistent-dir-xyz/sub", items, 8), -1);
+
+    /* Describe the still. */
+    intcheck("gal: the still is described",
+             dyt_vm_still_info(still, &info), 0);
+    intcheck("gal: it has thermal geometry", info.have_thermal, 1);
+    intcheck("gal: the width", info.width, 16);
+    intcheck("gal: the active rows", info.active_rows, 16);
+    intcheck("gal: the total rows", info.total_rows, 16);
+    intcheck("gal: the sample count", info.n_samples, 16 * 16);
+    intcheck("gal: the raw byte count", (int)info.raw_bytes, 16 * 16 * 2);
+    if (info.jpeg_bytes > 0)
+        ok("gal: and the embedded JPEG has bytes");
+    else
+        fail("gal: and the embedded JPEG has bytes", "0");
+
+    /* The vendor still is a still with no geometry: showable, not renderable. */
+    intcheck("gal: the vendor still is described",
+             dyt_vm_still_info(vendor, &info), 0);
+    intcheck("gal: but it has no thermal geometry", info.have_thermal, 0);
+    intcheck("gal: and no width is invented", info.width, 0);
+    intcheck("gal: the payload is still reported", info.n_samples, 16 * 16);
+    if (info.jpeg_bytes > 0)
+        ok("gal: and its JPEG is still there");
+    else
+        fail("gal: and its JPEG is still there", "0");
+
+    intcheck("gal: a clip is not a still",
+             dyt_vm_still_info(clip, &info), -1);
+    intcheck("gal: a missing file is refused",
+             dyt_vm_still_info("/nonexistent-dir-xyz/x.dyt.jpg", &info), -1);
+    intcheck("gal: a NULL path is refused", dyt_vm_still_info(NULL, &info), -1);
+    intcheck("gal: a NULL info is refused", dyt_vm_still_info(still, NULL), -1);
+
+    remove(still);
+    remove(clip);
+    remove(decoy);
+    remove(vendor);
+    rmdir(dir);
+}
+
 int main(void)
 {
     printf("=== view_model_test ===\n");
@@ -789,6 +967,7 @@ int main(void)
     test_alarm_band();
     test_utilities();
     test_capture();
+    test_gallery();
     printf("=== %s ===\n", fails ? "FAIL" : "ALL PASS");
     return fails ? 1 : 0;
 }
