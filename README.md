@@ -93,3 +93,14 @@ output, and the reference material kept beside the repo for cross-checking
 (`Thermal-Camera-Redux/`, and `MechaniscoutPcap/` — 1.1 GB of USB captures). This
 repository tracks *work only* — 9.6 MB across 245 files. See `.gitignore`, which documents
 each rule.
+
+## License
+
+GPL-3.0 — see `LICENSE`.
+
+The vendored components in `linux-port/third_party/` keep their own terms: `libuvc` is BSD
+(`LICENSE.txt`) and `stb` is dual MIT / public domain (`LICENSE`). MNN is not vendored — the
+recipe in `linux-port/third_party/README.md` fetches and builds it — and is Apache-2.0.
+
+The vendor's own binaries, and everything derived from them, are not distributed here; see
+`.gitignore`.
