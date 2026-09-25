@@ -161,10 +161,19 @@ static const char kDarkQss[] =
  * without crowding the picture. */
 static const int kRailW = 72;
 
-/* The right panel's width.  The Windows panel is a narrow column of grouped
- * controls; wide enough for the longest label ("Highlight High TEMP. Area") at
- * the panel font, narrow enough that it does not take the canvas's room. */
-static const int kPanelW = 224;
+/* The right panel's width.
+ *
+ * Sized for the tab bar, not for the rows: the Windows panel carries four
+ * horizontal tabs (Troubleshoot | 3D Analysis | Comparison | Circuit Design)
+ * and ours carries those plus Super Resolution, and a QTabWidget whose tabs do
+ * not fit hides the overflow behind scroll arrows — a control the user cannot
+ * reach.  Measured, with the tab style above: one tab wants 80 px, two 155,
+ * three 231, four 316, five 415.  Five plus the pane's 2-px border is 417, so
+ * 440 leaves ~5% for a different platform's font metrics.
+ *
+ * The vendor's own panel is ~400 px by the same measure, so this is close to
+ * the reference rather than a departure from it. */
+static const int kPanelW = 440;
 
 /* ---------------------------------------------------------------- options */
 

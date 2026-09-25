@@ -102,19 +102,23 @@ silently ineffective. Assertion 53c pins the radios, the status line and the
 
 A `QTabWidget` whose tabs do not fit hides the overflow behind scroll arrows —
 the same "control the user cannot reach" failure assertion 56 guards against for
-the toolbar, and a live risk here because the panel is a fixed 224 px while the
-tab count only grows. The tab style therefore carries `font-size: 9px` (matching
-the rail and the panel rows), which brings the two tabs to 179 px of the 222
-available; without it they overflowed. Assertion 53d measures that fit — and is
-the one assertion here that runs **themed**, because the fit is a property of the
-stylesheet's padding and font size and the selftest is unthemed on purpose. The
-stylesheet is restored immediately so the geometry assertions after it still see
-the unthemed metrics they were calibrated against.
+the toolbar, and a live risk here because the tab count only grows. The tab style
+therefore carries `font-size: 9px` (matching the rail and the panel rows), and
+assertion 53d measures the fit — it is the one assertion here that runs
+**themed**, because the fit is a property of the stylesheet's padding and font
+size and the selftest is unthemed on purpose. The stylesheet is restored
+immediately so the geometry assertions after it still see the unthemed metrics
+they were calibrated against.
 
-> The vendor's panel is much wider than our 224 px — roughly 400 px, enough for
-> its four horizontal tabs (`Troubleshoot | 3D Analysis | Comparison | Circuit
-> Design`). Widening the column is the change that has to happen before the
-> remaining tabs land; at 224 px even a third tab would overflow.
+The column is sized for the **tab bar**, not for the rows: the Windows panel
+carries four horizontal tabs and ours carries those plus Super Resolution, so
+`kPanelW` is 440 px. Measured with the tab style above, one tab wants 80 px, two
+155, three 231, four 316, five 415 — five plus the pane's 2-px border is 417, so
+440 leaves about 5% for a different platform's font metrics. The vendor's own
+panel is ~400 px by the same measure, so this is close to the reference rather
+than a departure from it. (It was 224 px, sized for a single Troubleshoot tab;
+that overflowed as soon as the second tab landed — the two wanted 239 px of the
+222 available — and assertion 53d is what caught it.)
 
 ### The rail's dialogs
 
@@ -908,7 +912,7 @@ $ ./build/dytqt --selftest
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (660x533, 64 distinct colours)
+  ok   the canvas painted (1172x533, 64 distinct colours)
   ok   the canvas is not clipped (660x400, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
@@ -955,7 +959,7 @@ $ ./build/dytqt --selftest
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 956x533 yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x533 yes)
   ok   a menu action reaches the session like its key (palette 0 -> 2)
   ok   a panel button reaches the session like its key (line yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
@@ -964,7 +968,7 @@ $ ./build/dytqt --selftest
   ok   neither bar can take the keyboard (menubar no focus, 2 toolbar row(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
-  ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 222)
+  ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   no toolbar row hides its buttons behind the overflow arrow (2 row(s) checked, 0 overflowing)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
