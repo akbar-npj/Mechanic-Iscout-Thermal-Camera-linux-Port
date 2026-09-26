@@ -128,6 +128,8 @@ static const int kPad     = 8;
 
 static const int kLineH   = 16;  /* one status line */
 static const int kStripPad = 4;  /* the strip's own margin */
+static const int kDotW    = 9;   /* the connection dot's diameter */
+static const int kDotGap  = 6;   /* dot -> line 3's text */
 
 /* ------------------------------------------------------------------ theme
  *
@@ -707,6 +709,31 @@ static const char *state_placeholder(DevState s)
     case DevState::Stalled:    return "no signal - last frame held";
     default:                   return "waiting for a frame";
     }
+}
+
+/* The connection dot's colour, one per state.  The Windows app's status bar
+ * carries a green dot before its "Camera connected" word, and the port's is the
+ * same idea with the states it actually has:
+ *
+ *   green  Live      — up and streaming
+ *   amber  Connecting / WarmingUp / Stalled — up but not delivering (or not
+ *          yet), so the dot says "not healthy" without claiming "not there"
+ *   red    NoDevice  — the device is not there at all
+ *   grey   Fixture   — no device is expected; a replay is not a connection
+ *
+ * The grey matters: painting the fixture path green would claim a camera that
+ * is not attached, which is exactly the lie the state word already avoids. */
+static QColor conn_colour(DevState s)
+{
+    switch (s) {
+    case DevState::Live:       return QColor(0x2e, 0xcc, 0x40);  /* green */
+    case DevState::Connecting:
+    case DevState::WarmingUp:
+    case DevState::Stalled:    return QColor(0xe0, 0xa0, 0x20);  /* amber */
+    case DevState::NoDevice:   return QColor(0xd0, 0x30, 0x30);  /* red */
+    case DevState::Fixture:    break;
+    }
+    return QColor(0x70, 0x78, 0x88);                             /* grey */
 }
 
 /* The third status line, and the front end's own.
@@ -2216,11 +2243,36 @@ public:
 
     const QString &playback_label() const { return play_; }
 
+    /* The connection dot, at the left of the third line and coloured by the
+     * device state (conn_colour).  A dot rather than a word because line 3
+     * already names the state; the dot is what makes it readable at a glance,
+     * and it is what the Windows app's status bar carries before its
+     * "Camera connected".  Kept separate from set_lines() so a caller cannot
+     * set the state word without the dot that qualifies it. */
+    void set_conn(DevState st)
+    {
+        conn_      = st;
+        have_conn_ = true;
+        update();
+    }
+
+    /* For the selftest: the colour the dot is painted in, or an invalid colour
+     * before any state has been set.  Exposed rather than read back from a
+     * grab because a 9-px circle in a 1172-px window is a needle, and the
+     * interesting failure (the wrong state reaching the strip) is not a
+     * painting bug. */
+    QColor conn_dot_colour() const
+    {
+        return have_conn_ ? conn_colour(conn_) : QColor();
+    }
+    bool conn_dot_shown() const { return have_conn_; }
+
     QSize sizeHint() const override
     {
         int w = 0;
         for (int i = 0; i < 3; i++)
-            w = std::max(w, fontMetrics().horizontalAdvance(line_[i]));
+            w = std::max(w, fontMetrics().horizontalAdvance(line_[i]) +
+                                (i == 2 && have_conn_ ? kDotW + kDotGap : 0));
         return QSize(w + 2 * kStripPad, 3 * kLineH + 2 * kStripPad);
     }
 
@@ -2251,12 +2303,26 @@ protected:
             rec_.isEmpty()      ? 0 : 12 + fontMetrics().horizontalAdvance(rec_),
         };
 
+        /* The third line is indented past the connection dot, so its text
+         * cannot sit under it. */
+        const int left[3] = { 0, 0, have_conn_ ? kDotW + kDotGap : 0 };
+
         for (int i = 0; i < 3; i++) {
             p.setPen(pen[i]);
-            const int avail = width() - 2 * kStripPad - inset[i];
-            p.drawText(kStripPad, kStripPad + i * kLineH + ascent,
+            const int avail = width() - 2 * kStripPad - inset[i] - left[i];
+            p.drawText(kStripPad + left[i], kStripPad + i * kLineH + ascent,
                        fontMetrics().elidedText(line_[i], Qt::ElideRight,
                                                 std::max(0, avail)));
+        }
+
+        /* The connection dot: a filled circle on the third line's centre, in
+         * the state's colour.  Drawn after the text so it cannot be covered by
+         * it, though the inset above already keeps them apart. */
+        if (have_conn_) {
+            p.setPen(Qt::NoPen);
+            p.setBrush(conn_colour(conn_));
+            const int cy = kStripPad + 2 * kLineH + kLineH / 2;
+            p.drawEllipse(QRect(kStripPad, cy - kDotW / 2, kDotW, kDotW));
         }
 
         /* The alarm is the one thing worth shouting about. */
@@ -2304,6 +2370,11 @@ private:
     QString play_;
     bool    alarm_on_ = false;
     dyt_alarm_state_t alarm_ = DYT_ALARM_NONE;
+    /* The connection dot.  `have_conn_` is false until a state arrives, so the
+     * strip built before the first frame has no dot rather than a grey one
+     * that would read as a state. */
+    DevState conn_      = DevState::Fixture;
+    bool     have_conn_ = false;
 };
 
 /* ------------------------------------------------------------- the gallery */
@@ -5332,6 +5403,7 @@ public:
         strip_->set_lines(QString::fromUtf8(a), QString::fromUtf8(b),
                           viewing() ? viewing_label_
                                     : state_line(st, snap, fps, serial()));
+        strip_->set_conn(st);
         strip_->set_alarm(snap.alarm_on != 0, snap.alarm);
         snap_ = snap;               /* for the action lambdas */
         fit_to_view();
@@ -5345,6 +5417,7 @@ public:
         strip_->set_lines(strip_->line(0), strip_->line(1),
                           viewing() ? viewing_label_
                                     : state_line(st, snap, fps, serial()));
+        strip_->set_conn(st);
         /* The panel's Super Resolution page is session state, not frame state,
          * so it stays right while the canvas is still a placeholder — which is
          * exactly when a user wondering why the radios are dead needs it. */
@@ -9521,6 +9594,51 @@ static int selftest(const opts &o)
                     "(absent %s, shown %s, agrees %s)\n",
                     ok ? "ok" : "FAIL", absent_ok ? "yes" : "NO",
                     shown_ok ? "yes" : "NO", agree_ok ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 63. The connection dot.  The Windows app's status bar carries a green dot
+     * before its "Camera connected"; the port's third line carries the same dot
+     * with the states it actually has.  Two risks: the colour does not
+     * distinguish the states (so the dot is decoration), and the dot is never
+     * actually painted — a colour function that nothing calls would pass a
+     * colour-only check.  So each state's colour is asserted *and* the dot is
+     * found in a grab of the strip.  The fixture case is the one that matters
+     * most: green there would claim a camera that is not attached, which is the
+     * lie the state word already refuses to tell. */
+    {
+        StatusStrip *strip = win.strip();
+        struct Case { DevState st; QColor want; } cases[] = {
+            { DevState::Live,       QColor(0x2e, 0xcc, 0x40) },
+            { DevState::Stalled,    QColor(0xe0, 0xa0, 0x20) },
+            { DevState::Connecting, QColor(0xe0, 0xa0, 0x20) },
+            { DevState::WarmingUp,  QColor(0xe0, 0xa0, 0x20) },
+            { DevState::NoDevice,   QColor(0xd0, 0x30, 0x30) },
+            { DevState::Fixture,    QColor(0x70, 0x78, 0x88) },
+        };
+
+        bool colour_ok = strip && strip->conn_dot_shown();
+        bool painted_ok = strip != nullptr;
+        const int cy = kStripPad + 2 * kLineH + kLineH / 2;
+        for (const Case &c : cases) {
+            if (!strip)
+                break;
+            strip->set_conn(c.st);
+            colour_ok = colour_ok && strip->conn_dot_colour() == c.want;
+            const QImage im =
+                strip->grab().toImage().convertToFormat(QImage::Format_RGB32);
+            painted_ok = painted_ok && cy < im.height() &&
+                         im.pixel(kStripPad + kDotW / 2, cy) == c.want.rgb();
+        }
+        /* Leave the strip on the state the run is actually in. */
+        if (strip)
+            strip->set_conn(DevState::Fixture);
+
+        const bool ok = colour_ok && painted_ok;
+        std::printf("  %-4s the connection dot names the state in colour "
+                    "(colour %s, painted %s)\n", ok ? "ok" : "FAIL",
+                    colour_ok ? "yes" : "NO", painted_ok ? "yes" : "NO");
         if (!ok)
             fails++;
     }

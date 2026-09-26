@@ -527,7 +527,7 @@ or a super-resolved frame) while it was up. Assertion 49 pins the round trip.
 |---|---|---|
 | 1 | `dyt_vm_status_line()`, verbatim | `mode 1000 \| fusion ir \| 01-iron-red.dat 1/28 \| C \| x2- \| 25 frames` |
 | 2 | `dyt_vm_readout_line()`, verbatim | `tool: none (p point, l line, b box, n clear)` |
-| 3 | the front end's own | `range auto   \|   LIVE   Camera SN: CA09DDC00212  25.0 fps` |
+| 3 | the front end's own | `● range auto   \|   LIVE   Camera SN: CA09DDC00212  25.0 fps` |
 
 Line 3 carries the things the view model has no business naming — the range
 mode, the device state, the camera's serial and the frame rate. The mode is
@@ -537,6 +537,19 @@ folded into `dyt_vm_status_line()`. That shared line is already ~378 px of a
 wide as the *image* (256 px at zoom 1), where it is already clipped; extending it
 would clip further, and would change another front end's display and its pinned
 tests for no gain.
+
+The **connection dot** at the left of line 3 is the Windows app's own indicator
+(its status bar carries a green dot before the words "Camera connected"),
+coloured by the device state: **green** when the camera is up and streaming,
+**amber** while it is coming up or has gone quiet (`Connecting` / `WarmingUp` /
+`Stalled` — the dot says "not healthy" without claiming "not there"), **red**
+for `NoDevice`, and **grey** on the fixture path, where no camera is expected at
+all. The grey matters: green there would claim a camera that is not attached,
+which is the lie the state word already refuses to tell. `set_conn()` is separate
+from `set_lines()` so a caller cannot set the state word without the dot that
+qualifies it; line 3's text is inset past it so the two cannot overlap.
+Assertion 63 asserts each state's colour *and* finds the dot in a grab of the
+strip — a colour function nothing calls would pass a colour-only check.
 
 The serial segment — `Camera SN: <serial>`, the pair the Windows app's own
 status bar carries — is the **module** serial `dyt_sn_str()` produces, not the
@@ -1278,6 +1291,7 @@ $ ./build/dytqt --selftest
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
   ok   the Circuit Design tab overlays a layout and aligns it (tab yes, clamp yes, push yes, hold yes, paint yes, move yes, rot yes)
   ok   the status line names the camera's serial (absent yes, shown yes, agrees yes)
+  ok   the connection dot names the state in colour (colour yes, painted yes)
 === ALL PASS ===
 ```
 
