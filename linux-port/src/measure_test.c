@@ -394,6 +394,83 @@ static void test_polygon(void)
     }
 }
 
+/* --- the polygon's fit to its box --------------------------------------- */
+
+/* The polygon tool is a drag: the user pulls out a box and the shape is a
+ * pentagon fitted to it.  This is the fit itself; the session's job is only to
+ * call it with p0/p1, which session_test pins. */
+static void test_polygon_fit(void)
+{
+    dyt_point_t v[DYT_POLYGON_SIDES];
+
+    /* A 7x3 box: top-centre, then round clockwise. */
+    dyt_polygon_fit_box(0, 0, 6, 2, v);
+    intcheck("fit: top-centre x", v[0].x, 3);
+    intcheck("fit: top-centre y", v[0].y, 0);
+    intcheck("fit: upper-right x", v[1].x, 6);
+    intcheck("fit: upper-right y", v[1].y, 1);
+    intcheck("fit: lower-right x", v[2].x, 5);
+    intcheck("fit: lower-right y", v[2].y, 2);
+    intcheck("fit: lower-left x", v[3].x, 1);
+    intcheck("fit: lower-left y", v[3].y, 2);
+    intcheck("fit: upper-left x", v[4].x, 0);
+    intcheck("fit: upper-left y", v[4].y, 1);
+
+    /* Either corner may be the one the drag started on. */
+    {
+        dyt_point_t w[DYT_POLYGON_SIDES];
+        int i, same = 1;
+        dyt_polygon_fit_box(6, 2, 0, 0, w);
+        for (i = 0; i < DYT_POLYGON_SIDES; i++)
+            if (w[i].x != v[i].x || w[i].y != v[i].y) same = 0;
+        intcheck("fit: either corner may be the top-left", same, 1);
+    }
+
+    /* A square box, where a regular pentagon would fit exactly. */
+    dyt_polygon_fit_box(0, 0, 4, 4, v);
+    intcheck("fit: square top x", v[0].x, 2);
+    intcheck("fit: square top y", v[0].y, 0);
+    intcheck("fit: square right x", v[1].x, 4);
+    intcheck("fit: square right y", v[1].y, 2);
+    intcheck("fit: square lower-right x", v[2].x, 3);
+    intcheck("fit: square bottom y", v[2].y, 4);
+    intcheck("fit: square left x", v[4].x, 0);
+    intcheck("fit: square left y", v[4].y, 2);
+
+    /* The shape is *stretched* to the box, not fitted as a regular pentagon:
+     * a very wide box still touches all four of its sides, which is what makes
+     * the shape follow the rectangle the user dragged. */
+    {
+        int lo_x, hi_x, lo_y, hi_y, i;
+        dyt_polygon_fit_box(2, 3, 40, 6, v);      /* 39 x 4, a very wide box */
+        lo_x = hi_x = v[0].x;
+        lo_y = hi_y = v[0].y;
+        for (i = 1; i < DYT_POLYGON_SIDES; i++) {
+            if (v[i].x < lo_x) lo_x = v[i].x;
+            if (v[i].x > hi_x) hi_x = v[i].x;
+            if (v[i].y < lo_y) lo_y = v[i].y;
+            if (v[i].y > hi_y) hi_y = v[i].y;
+        }
+        intcheck("fit: a wide box is touched on the left", lo_x, 2);
+        intcheck("fit: and on the right", hi_x, 40);
+        intcheck("fit: and at the top", lo_y, 3);
+        intcheck("fit: and at the bottom", hi_y, 6);
+    }
+
+    /* A degenerate box collapses to a point rather than dividing by zero. */
+    {
+        int i, same = 1;
+        dyt_polygon_fit_box(5, 5, 5, 5, v);
+        for (i = 0; i < DYT_POLYGON_SIDES; i++)
+            if (v[i].x != 5 || v[i].y != 5) same = 0;
+        intcheck("fit: a point box is a point", same, 1);
+    }
+
+    /* A NULL list is ignored, not written through. */
+    dyt_polygon_fit_box(0, 0, 4, 4, NULL);
+    intcheck("fit: a NULL list does not crash", 1, 1);
+}
+
 /* --- isotherm / area check ---------------------------------------------- */
 
 static void test_isotherm(void)
@@ -449,6 +526,7 @@ int main(void)
     test_roi();
     test_line();
     test_polygon();
+    test_polygon_fit();
     test_isotherm();
 
     if (fails) {

@@ -589,114 +589,255 @@ static void test_measurement(void)
     intcheck("line: empty when the tool is not LINE",
              dyt_session_profile(s, prof, 64), 0);
 
-    /* Polygon ROI.  The triangle (0,0) (4,0) (0,4) covers 10 pixels of the
-     * ramp; measure_test pins the same geometry, so this is the session
-     * plumbing around it, not a second opinion on the arithmetic. */
+    /* Moving and resizing a placed box is exercised in test_roi_edit(), on a
+     * frame big enough for the vendor's 5-pixel floor to mean something — this
+     * fixture is 8x4, and a floor larger than the frame is exactly the case
+     * that used to push an edge out of bounds. */
+
+    /* Polygon ROI.  The tool is a *drag*, like the box: the five vertices are
+     * derived from p0/p1 rather than clicked (measure_test pins the fit
+     * itself), so what is checked here is the plumbing — the snapshot carries
+     * the derived outline and the region measures through it. */
     {
-        dyt_point_t tri[3];
-        tri[0].x = 0; tri[0].y = 0;
-        tri[1].x = 4; tri[1].y = 0;
-        tri[2].x = 0; tri[2].y = 4;
+        int placed_n;
 
         dyt_session_set_tool(s, DYT_TOOL_POLYGON);
+        /* The tools share one pair of points, as the box does, so a tool
+         * switch keeps whatever was placed before it.  Start from empty. */
+        dyt_session_clear_points(s);
         dyt_session_snapshot(s, &snap, NULL, 0);
         intcheck("poly: tool reported", (int)snap.tool, DYT_TOOL_POLYGON);
-        intcheck("poly: an empty outline has no reading", snap.roi_ok, 0);
+        intcheck("poly: nothing placed has no reading", snap.roi_ok, 0);
         intcheck("poly: and no vertices", snap.poly_n, 0);
 
-        /* Two vertices are still not a region. */
-        intcheck("poly: first vertex taken",
-                 dyt_session_polygon_add(s, 0, 0), 0);
-        intcheck("poly: second vertex taken",
-                 dyt_session_polygon_add(s, 4, 0), 0);
+        /* The box the drag names is the only geometry stored. */
+        dyt_session_set_point(s, 0, 0, 0);
+        dyt_session_set_point(s, 1, 6, 2);
         dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: two vertices is not a region", snap.roi_ok, 0);
-        intcheck("poly: vertices reported", snap.poly_n, 2);
-        intcheck("poly: vertex 1 x", snap.poly[1].x, 4);
-        intcheck("poly: vertex 1 y", snap.poly[1].y, 0);
+        placed_n = snap.roi.n;
+        intcheck("poly: a placed box has five sides", snap.poly_n,
+                 DYT_POLYGON_SIDES);
+        intcheck("poly: and measures", snap.roi_ok, 1);
+        intcheck("poly: with pixels in it", placed_n > 0, 1);
 
-        /* The third completes it, and the reading is live from then on. */
-        intcheck("poly: third vertex taken",
-                 dyt_session_polygon_add(s, 0, 4), 0);
-        dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: ok once it has three", snap.roi_ok, 1);
-        intcheck("poly: n == 10", snap.roi.n, 10);
-        floatcheck("poly: min == 10", snap.roi.min, 10.0f, 1e-5f);
-        floatcheck("poly: max == 34", snap.roi.max, 34.0f, 1e-5f);
-        floatcheck("poly: mean == 19", snap.roi.mean, 19.0f, 1e-5f);
-        floatcheck("poly: median == 18.5", snap.roi.median, 18.5f, 1e-5f);
-
-        /* Undo takes the vertex back and reopens the outline. */
-        intcheck("poly: undo leaves two", dyt_session_polygon_undo(s), 2);
-        dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: undone is not a region", snap.roi_ok, 0);
-        intcheck("poly: the vertices came with it", snap.poly_n, 2);
-
-        /* Closing needs three vertices; with fewer it does nothing. */
-        dyt_session_set_polygon_closed(s, 1);
-        dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: too few to close", snap.poly_closed, 0);
-
-        dyt_session_set_polygon_pts(s, tri, 3);
-        dyt_session_set_polygon_closed(s, 1);
-        dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: closed reported", snap.poly_closed, 1);
-        intcheck("poly: closed still measures", snap.roi.n, 10);
-
-        /* A click after closing starts a new outline instead of extending the
-         * finished one. */
-        intcheck("poly: a click after closing is taken",
-                 dyt_session_polygon_add(s, 7, 3), 0);
-        dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: and starts a new outline", snap.poly_n, 1);
-        intcheck("poly: which is reopened", snap.poly_closed, 0);
-        intcheck("poly: the new outline has no reading", snap.roi_ok, 0);
-
-        /* A full outline is refused, not recycled: the shape is not lost. */
-        {
-            dyt_point_t many[DYT_POLYGON_MAX_VTX];
-            int i;
-            for (i = 0; i < DYT_POLYGON_MAX_VTX; i++) {
-                many[i].x = i % 8;
-                many[i].y = (i / 8) % 4;
-            }
-            dyt_session_set_polygon_pts(s, many, DYT_POLYGON_MAX_VTX);
-            dyt_session_snapshot(s, &snap, NULL, 0);
-            intcheck("poly: max vertices accepted", snap.poly_n,
-                     DYT_POLYGON_MAX_VTX);
-            intcheck("poly: one more is refused",
-                     dyt_session_polygon_add(s, 0, 0), -1);
-            dyt_session_snapshot(s, &snap, NULL, 0);
-            intcheck("poly: and the outline is intact", snap.poly_n,
-                     DYT_POLYGON_MAX_VTX);
-        }
-
-        /* An overlong or NULL list is refused rather than truncated, so a
-         * refused set cannot move the boundary. */
-        dyt_session_set_polygon_pts(s, tri, 3);
-        dyt_session_set_polygon_pts(s, tri, DYT_POLYGON_MAX_VTX + 1);
-        dyt_session_set_polygon_pts(s, NULL, 3);
-        dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: bad lists leave the outline alone", snap.poly_n, 3);
+        /* The vertices are the pentagon fitted to that box: top-centre on the
+         * top edge, and the extremes on the other three sides. */
+        intcheck("poly: top vertex x", snap.poly[0].x, 3);
+        intcheck("poly: top vertex y", snap.poly[0].y, 0);
+        intcheck("poly: right vertex x", snap.poly[1].x, 6);
+        intcheck("poly: right vertex y", snap.poly[1].y, 1);
+        intcheck("poly: bottom-right x", snap.poly[2].x, 5);
+        intcheck("poly: bottom-right y", snap.poly[2].y, 2);
+        intcheck("poly: bottom-left x", snap.poly[3].x, 1);
+        intcheck("poly: bottom-left y", snap.poly[3].y, 2);
+        intcheck("poly: left vertex x", snap.poly[4].x, 0);
+        intcheck("poly: left vertex y", snap.poly[4].y, 1);
 
         /* A NaN inside the outline is skipped, not counted. */
-        ramp[0] = NAN;                           /* was the minimum, 10 */
+        ramp[1 * 8 + 4] = NAN;                  /* (4,1), inside the pentagon */
         dyt_session_process(s, &fi);
         dyt_session_snapshot(s, &snap, NULL, 0);
-        intcheck("poly: NaN skipped", snap.roi.n, 9);
-        floatcheck("poly: NaN cannot be the min", snap.roi.min, 11.0f, 1e-5f);
-        ramp[0] = 10.0f;
+        intcheck("poly: NaN skipped", snap.roi.n, placed_n - 1);
+        ramp[1 * 8 + 4] = 10.0f + 1 * 8 + 4;
         dyt_session_process(s, &fi);
+
+        /* Either corner may be the one the drag started on. */
+        dyt_session_set_point(s, 0, 6, 2);
+        dyt_session_set_point(s, 1, 0, 0);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: the box normalises", snap.poly[0].x, 3);
+        intcheck("poly: and the shape is the same", snap.poly[4].x, 0);
+        intcheck("poly: with the same reading", snap.roi.n, placed_n);
+
+        /* The pentagon is moved and resized by its bounding box, because that
+         * is all it is stored as. */
+        intcheck("poly: it can be moved",
+                 dyt_session_roi_move_to(s, 1, 1), 0);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: the box moved", snap.p0.x, 1);
+        intcheck("poly: and the shape came with it", snap.poly[4].x, 1);
+        intcheck("poly: still five sides", snap.poly_n, DYT_POLYGON_SIDES);
+        intcheck("poly: and still measures", snap.roi_ok, 1);
+
+        /* The same eight handles, and the same floor, as the box: the polygon
+         * has no resize rules of its own. */
+        intcheck("poly: a handle takes",
+                 dyt_session_roi_stretch(s, 3, 7, 0), 0);
+        dyt_session_snapshot(s, &snap, NULL, 0);
+        intcheck("poly: the right edge moved", snap.p1.x, 7);
+        intcheck("poly: the left edge did not", snap.p0.x, 1);
+        intcheck("poly: and the shape followed", snap.poly[4].x, 1);
     }
 
     /* Clearing the points leaves the tool selected but unplaced — and takes
-     * the polygon with them, because a front end has one clear action. */
+     * whatever shape they described with them, because a front end has one
+     * clear action. */
     dyt_session_clear_points(s);
     dyt_session_snapshot(s, &snap, NULL, 0);
     intcheck("clear: p0 unset", snap.p0.x, -1);
     intcheck("clear: p1 unset", snap.p1.x, -1);
-    intcheck("clear: the polygon went too", snap.poly_n, 0);
-    intcheck("clear: and is reopened", snap.poly_closed, 0);
+    intcheck("clear: the shape went too", snap.poly_n, 0);
+
+    dyt_session_free(s);
+}
+
+/* --- moving and resizing a placed region -------------------------------- */
+
+/* The vendor's own model, and the port's: a drag on the body moves the whole
+ * region (`SelsectShape`, :10599), a drag on one of eight handles moves the
+ * edges that handle touches (`stretchShape`, :10642), and the dragged edge
+ * stops five raw pixels short of the region's own far edge (`SelsectShape`'s
+ * `max_p.X - 5`).  The frame here is 16x12 — big enough for that floor to mean
+ * something, which the 8x4 fixture in test_measurement() is not. */
+static void test_roi_edit(void)
+{
+    dyt_session_t *s = dyt_session_create();
+    dyt_snapshot_t snap;
+    float px[16 * 12];
+    dyt_frame_info_t fi = { px, 16, 12 };
+    int i;
+
+    printf("-- roi edit --\n");
+
+    if (!s) {
+        fail("roi edit create", "NULL");
+        return;
+    }
+    for (i = 0; i < 16 * 12; i++)
+        px[i] = 10.0f + (float)i;
+    dyt_session_process(s, &fi);
+
+    dyt_session_set_tool(s, DYT_TOOL_BOX);
+
+    /* A move is *absolute*: the region's top-left lands on the point. */
+    dyt_session_set_point(s, 0, 4, 3);
+    dyt_session_set_point(s, 1, 9, 8);
+    intcheck("roi: move takes", dyt_session_roi_move_to(s, 6, 2), 0);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: moved p0.x", snap.p0.x, 6);
+    intcheck("roi: moved p0.y", snap.p0.y, 2);
+    intcheck("roi: moved p1.x", snap.p1.x, 11);
+    intcheck("roi: moved p1.y", snap.p1.y, 7);
+    intcheck("roi: and still measures", snap.roi_ok, 1);
+    intcheck("roi: 6x6 == 36 px", snap.roi.n, 36);
+
+    /* The *region* is clamped, not the corner: a box pushed past an edge stops
+     * with its far side on the edge instead of being cropped, which would
+     * change the reading without the user seeing it. */
+    dyt_session_roi_move_to(s, 1000, 1000);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: clamped at the right edge", snap.p1.x, 15);
+    intcheck("roi: and the bottom", snap.p1.y, 11);
+    intcheck("roi: keeping its width", snap.p1.x - snap.p0.x, 5);
+    intcheck("roi: and its height", snap.p1.y - snap.p0.y, 5);
+    dyt_session_roi_move_to(s, -1000, -1000);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: clamped at the left edge", snap.p0.x, 0);
+    intcheck("roi: and the top", snap.p0.y, 0);
+    intcheck("roi: still 6x6", snap.roi.n, 36);
+
+    /* Each handle moves only the edges it touches.  Handle 3 is the
+     * right-middle: the left edge and *both* horizontals stay put — including
+     * when the region is shorter than the floor, which is exactly the case a
+     * floor run on every axis would corrupt. */
+    dyt_session_set_point(s, 0, 0, 0);
+    dyt_session_set_point(s, 1, 8, 2);
+    intcheck("roi: handle 3 takes",
+             dyt_session_roi_stretch(s, 3, 4, 999), 0);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: the right edge moved", snap.p1.x, 5);
+    intcheck("roi: the left edge did not", snap.p0.x, 0);
+    intcheck("roi: nor the top", snap.p0.y, 0);
+    intcheck("roi: nor the bottom", snap.p1.y, 2);
+
+    /* Handle 1 is the top-middle: the verticals and the bottom are fixed. */
+    dyt_session_set_point(s, 0, 0, 0);
+    dyt_session_set_point(s, 1, 8, 10);
+    intcheck("roi: handle 1 takes",
+             dyt_session_roi_stretch(s, 1, 999, 4), 0);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: the top edge moved", snap.p0.y, 4);
+    intcheck("roi: the right edge did not", snap.p1.x, 8);
+    intcheck("roi: nor the left", snap.p0.x, 0);
+    intcheck("roi: nor the bottom", snap.p1.y, 10);
+
+    /* The floor: the dragged edge stops DYT_ROI_MIN short of the region's own
+     * far edge, so the two never cross and the region is never inverted. */
+    dyt_session_set_point(s, 0, 0, 0);
+    dyt_session_set_point(s, 1, 8, 10);
+    dyt_session_roi_stretch(s, 3, 2, 0);           /* right-middle, dragged in */
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: the right edge stops at the floor",
+             snap.p1.x - snap.p0.x, DYT_ROI_MIN);
+    dyt_session_set_point(s, 0, 0, 0);
+    dyt_session_set_point(s, 1, 8, 10);
+    dyt_session_roi_stretch(s, 7, 7, 0);           /* left-middle, dragged in */
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: the left edge stops at the floor too",
+             snap.p1.x - snap.p0.x, DYT_ROI_MIN);
+    intcheck("roi: and the far edge did not move", snap.p1.x, 8);
+
+    /* The floor cannot push an edge out of the frame: the result is clamped,
+     * and the far edge is what gives way when the two cannot both be met. */
+    dyt_session_set_point(s, 0, 12, 0);
+    dyt_session_set_point(s, 1, 14, 4);
+    dyt_session_roi_stretch(s, 3, 999, 0);         /* right-middle, dragged out */
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: the right edge stops at the frame", snap.p1.x, 15);
+    intcheck("roi: leaving the far edge alone", snap.p0.x, 12);
+    intcheck("roi: and a measurable region", snap.roi_ok, 1);
+
+    dyt_session_set_point(s, 0, 13, 0);
+    dyt_session_set_point(s, 1, 15, 4);
+    dyt_session_roi_stretch(s, 7, 14, 0);          /* left-middle, dragged out */
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("roi: the left edge stops at the floor, not the frame",
+             snap.p0.x, 10);
+    intcheck("roi: and the right edge stayed", snap.p1.x, 15);
+
+    /* A frame smaller than the floor cannot honour it, and must not push an
+     * edge out of bounds to try: the floor is clamped to the frame.  This is
+     * the case that corrupted the region before — a 4x3 frame is narrower and
+     * shorter than DYT_ROI_MIN, so the unclamped floor left p0.y negative,
+     * which then read as "no region" and disabled the whole drag. */
+    {
+        dyt_session_t *t = dyt_session_create();
+        float tiny[4 * 3];
+        dyt_frame_info_t tfi = { tiny, 4, 3 };
+
+        for (i = 0; i < 4 * 3; i++)
+            tiny[i] = 10.0f + (float)i;
+        dyt_session_process(t, &tfi);
+        dyt_session_set_tool(t, DYT_TOOL_BOX);
+        dyt_session_set_point(t, 0, 0, 0);
+        dyt_session_set_point(t, 1, 3, 2);
+
+        dyt_session_roi_stretch(t, 3, 1, 0);       /* right-middle, dragged in */
+        dyt_session_snapshot(t, &snap, NULL, 0);
+        intcheck("roi: a tiny frame still clamps the floor", snap.p1.x, 3);
+        intcheck("roi: and keeps the region in frame", snap.p0.x, 0);
+        intcheck("roi: and measurable", snap.roi_ok, 1);
+
+        dyt_session_roi_stretch(t, 1, 0, 2);       /* top-middle, dragged down */
+        dyt_session_snapshot(t, &snap, NULL, 0);
+        intcheck("roi: no negative corner", snap.p0.y, 0);
+        intcheck("roi: and the bottom is still the frame's", snap.p1.y, 2);
+        intcheck("roi: still measurable", snap.roi_ok, 1);
+
+        dyt_session_free(t);
+    }
+
+    /* A handle out of range, and a region that is not there, are refused
+     * rather than guessed at. */
+    intcheck("roi: a handle past the end is refused",
+             dyt_session_roi_stretch(s, DYT_ROI_HANDLES, 1, 1), -1);
+    intcheck("roi: a negative handle is refused",
+             dyt_session_roi_stretch(s, -1, 1, 1), -1);
+    dyt_session_set_tool(s, DYT_TOOL_POINT);
+    intcheck("roi: no box, no move",
+             dyt_session_roi_move_to(s, 1, 1), -1);
+    intcheck("roi: no box, no stretch",
+             dyt_session_roi_stretch(s, 0, 1, 1), -1);
 
     dyt_session_free(s);
 }
@@ -1240,6 +1381,7 @@ int main(void)
     test_palettes();
     test_settings();
     test_measurement();
+    test_roi_edit();
     test_alarm();
     test_fusion();
     test_raw_payload();

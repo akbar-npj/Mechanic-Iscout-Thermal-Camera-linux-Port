@@ -174,18 +174,43 @@ snapshot in `sync()`, never from the button's own toggle, for the same reason
 `sync_actions()` does it: a key the session refused must not leave a button lit.
 No control takes focus, for the reason above.
 
-**Polygon** is placed a click at a time rather than by dragging, which is the one
-place the tools differ: each click adds a vertex, Enter or the right button
-finishes the outline, and Backspace takes a vertex back. The region is measured
-from the third vertex on, so there is no "commit" step, and the outline is drawn
-with a rubber band from the last vertex to the pointer while it is still open.
-The fill is `dyt_measure_polygon()` — an even-odd scanline, so a concave polygon
-fills correctly and the winding direction does not matter — and it is the box
-tool's convention extended, not a second one: the outline `(x0,y0) (x1+1,y0)
+Both area tools — the Rectangle and the Polygon — are placed the same way and
+share one editing model, which is the vendor's own (`SelsectShape` `:10599` for a
+move, `stretchShape` `:10642` for a resize): a drag on the body moves the whole
+region, a drag on one of eight handles — four corners and four edge midpoints,
+`M_isContain` `:13324` — resizes it, and a press outside starts a fresh one. The
+handles are drawn as five-pixel accent squares rather than the vendor's corner
+brackets and edge ticks, because at that size it is *where* the mark is, not its
+shape, that says "drag me". The geometry stays in the session
+(`dyt_session_roi_move_to()` / `dyt_session_roi_stretch()`), so the reading
+follows the drag exactly as a fresh placement does and the clamp rules exist once
+instead of in each front end. The move clamps the *region*, not the grabbed
+corner, so a region pushed past an edge stops with its far side on the edge
+rather than being silently cropped; the resize applies the vendor's five-pixel
+floor (`SelsectShape`'s `max_p.X - 5`) only to the axes the handle actually
+moves, so a right-middle drag cannot quietly change the region's height — and
+clamps the result back into the frame, which the vendor's own version does not.
+The *hit test* is the front end's, because it is in canvas coordinates: the
+OpenCV viewer has no handle layer at all, so editing is the Qt window's, and a
+second front end would add only the hit test and the drawing.
+
+**Polygon** is a drag tool too, not a click-by-click outline: a press sets the
+first corner, the drag the second, and the shape is a five-sided figure fitted to
+that box (`dyt_polygon_fit_box()`). The vertices are *derived* from `p0`/`p1` on
+every snapshot rather than stored, so a moved or resized polygon is simply a
+moved or resized box, and the two tools cannot drift apart. The fit stretches a
+regular pentagon to the box independently on each axis, so the shape touches all
+four sides whatever the aspect ratio; a *regular* pentagon would have to leave
+slack on the longer axis, and then it would not follow the rectangle the user
+dragged. The fill is `dyt_measure_polygon()` — an even-odd scanline, so a concave
+polygon fills correctly and the winding direction does not matter — and it is the
+box tool's convention extended, not a second one: the outline `(x0,y0) (x1+1,y0)
 (x1+1,y1+1) (x0,y1+1)` covers exactly the pixels the box `(x0,y0)-(x1,y1)` does
 (`measure_test` pins the two against each other). Assertion 24b drives the whole
-gesture through the widget and counts the mark colour on the canvas, so the
-outline is required to be *painted* and not merely stored.
+gesture through the widget — drag it out, move it by the body, clear it — and
+counts the mark colour on the canvas, so the outline is required to be *painted*
+and not merely stored, and requires the pentagon to follow the box it is fitted
+to.
 
 **Analysis** is the reference's second group, and its two rows are one chart
 with two presentations rather than two data sources. The manual never describes
@@ -874,11 +899,9 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 | key | effect |
 |---|---|
 | `p` / `l` / `b` / `o` | point / line / box / polygon |
-| `n` | no tool, and forget the placed points and the polygon outline |
+| `n` | no tool, and forget the placed points and the shape they described |
 | `T` / `w` | Mark: arm the text tool / the arrow tool (a second press puts it away) |
 | Ctrl+Z / Ctrl+Y / Ctrl+R | Mark: undo / redo / reset |
-| Enter / right button | finish the polygon outline |
-| Backspace | take back the last polygon vertex |
 | `c` | chart analysis: annotate the line's profile (picks up the line tool) |
 | `a` | arm the alarm, or disarm it if already armed |
 | `i` | toggle the isotherm |
@@ -1483,8 +1506,8 @@ $ ./build/dytqt --selftest
   ok   the fps meter reports 0.0 on a frozen counter (25.0 -> 0.0)
   ok   the retry backoff doubles to a cap, then gives up (0.5, 1.0, ..., 30.0, stop)
   ok   the tool keys reach the session (line/point/box/clear all route)
-  ok   the mouse places and drags through the widget (20,15 -> 45,35)
-  ok   the polygon is placed a click at a time, and its outline is painted (3 clicks, closed, undone, right-button yes, 276 mark px then 0)
+  ok   the mouse places, drags, moves and resizes a box through the widget (20,15 -> 26,19, then the right edge 51 -> 61)
+  ok   the polygon is dragged out like the box, fitted to it and moved with it (5 sides, moved yes, 179 mark px then 0)
   ok   the Analysis chart plots the line's profile and marks its peak (peak bin 1 of hot x 1, chart analysis, picks line yes, marker 0 px then 20)
   ok   the alarm key arms at the threshold field's value, then disarms (-20.0..70.0)
   ok   the isotherm key toggles the overlay
@@ -1575,24 +1598,35 @@ needs a camera, and none would be reachable any other way.
 
 Assertions 23–27 drive the measurement UI through the **real widgets**, with
 synthesized `QMouseEvent`s and `QKeyEvent`s delivered by `QApplication::sendEvent`
-— the tool keys, a press/drag/release placing a box, the alarm arming the derived
-band and disarming, the isotherm toggling, and the strip reporting the
-measurement. The expected source pixel comes from `dyt_view_transform_map()`
-itself, so they pin the *routing* (that a widget coordinate reaches
-`dyt_vm_tool_mouse()` with the right `dst` size) rather than the transform, which
-assertions 16 and 16b already cover. The measurement overlay's *painting* is
-deliberately not asserted for the box and the line: a pixel check on a drawn
-rectangle is brittle, so it was verified by eye from a fixture render instead.
+— the tool keys, a press/drag/release placing a box and then *editing* it (a drag
+on the body moves it, a drag on the right-middle handle moves that edge alone),
+the alarm arming the derived band and disarming, the isotherm toggling, and the
+strip reporting the measurement. The expected source pixel comes from
+`dyt_view_transform_map()` itself, so they pin the *routing* (that a widget
+coordinate reaches `dyt_vm_tool_mouse()` with the right `dst` size) rather than
+the transform, which assertions 16 and 16b already cover. The measurement
+overlay's *painting* is deliberately not asserted for the box and the line: a
+pixel check on a drawn rectangle is brittle, so it was verified by eye from a
+fixture render instead.
+
+Both the box and the polygon read the widget's own snapshot to hit-test their
+handles, and only a frame tick refreshes it — so those assertions call
+`resnap()` after the placement, taking the same read the tick would. That is not
+a test-only convenience: it is why the drag handlers call `resnap()` themselves,
+so an edit is never a frame behind while it is happening.
 
 **24b** is the polygon, and it is the one that does assert a measurement
-overlay's painting — by *counting* the mark colour with the outline placed and
+overlay's painting — by *counting* the mark colour with the shape placed and
 again after `n`, so what is compared is the difference the outline makes rather
 than an edge pixel that a one-pixel shift would move. The colour bar is drawn
 from a palette that contains pure yellow, which is why the difference is counted
-rather than the total. It also drives the whole gesture through the widget:
-three clicks, Enter to finish the outline, Backspace to take a vertex back, and
-the right button to finish it — including that the right button does *nothing*
-to a two-vertex outline, which is not yet a region.
+rather than the total. It drives the whole gesture through the widget: the same
+press-drag-release the box uses, a check that the five vertices are *fitted to
+the box the drag named* (top vertex on the top edge at the horizontal centre, the
+extremes on the other three sides), a drag on the body that must move the box
+**and** carry the pentagon with it, and the clear. That last pair is the point of
+deriving the vertices: a shape that only echoed stored ones would pass the first
+check and fail the second.
 
 **24c** is the chart, and it pins two different things. The *data*: the line is
 drawn along the row the frame's own hot pixel is in and right across the image,

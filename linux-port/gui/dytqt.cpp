@@ -850,14 +850,11 @@ static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
  *
  * These are the reference viewer's bindings: one key per tool ("o" is the
  * polygon), "n" also forgetting the placed points, "a" arming the derived band
- * or disarming, "i" toggling the isotherm.  The polygon adds two gestures of
- * its own — Enter closes the outline and Backspace undoes a vertex — which are
- * answered only while the polygon tool is up, so neither steals a key from
- * anywhere else.  The view keys (palette, unit, range, flip, zoom, fusion) are
- * deliberately not here; they are later tasks.  The runtime-parameter ladder is
- * a sibling (FrameView::param_key), because its keys are case-sensitive and
- * this function's are not.  The letters are free of the device keys: retry is
- * lowercase "r" and the panel toggle is "d". */
+ * or disarming, "i" toggling the isotherm.  The view keys (palette, unit, range,
+ * flip, zoom, fusion) are deliberately not here; they are later tasks.  The
+ * runtime-parameter ladder is a sibling (FrameView::param_key), because its keys
+ * are case-sensitive and this function's are not.  The letters are free of the
+ * device keys: retry is lowercase "r" and the panel toggle is "d". */
 static int apply_measure_key(dyt_session_t *sess, int key, float alarm_setpoint)
 {
     dyt_snapshot_t s;
@@ -903,26 +900,6 @@ static int apply_measure_key(dyt_session_t *sess, int key, float alarm_setpoint)
         return 1;
     case 'i':
         dyt_session_set_isotherm(sess, !s.iso_on);
-        return 1;
-    }
-
-    /* The polygon's own gestures.  Enter finishes the outline so the next
-     * click starts a new one; Backspace takes the last vertex back, which is
-     * the only way to correct a misclick without losing the whole shape.
-     *
-     * Both are ours only while the polygon tool is up.  Enter belongs to the
-     * gallery otherwise, and Backspace must fall through to Qt rather than be
-     * swallowed, so this answers 0 for every other tool. */
-    if (key == 13 || key == Qt::Key_Return || key == Qt::Key_Enter ||
-        key == 8 || key == Qt::Key_Backspace) {
-        if (dyt_session_snapshot(sess, &s, nullptr, 0) != 0)
-            return 0;                  /* no frame: not a key we own */
-        if (s.tool != DYT_TOOL_POLYGON)
-            return 0;
-        if (key == 8 || key == Qt::Key_Backspace)
-            dyt_session_polygon_undo(sess);
-        else
-            dyt_session_set_polygon_closed(sess, 1);
         return 1;
     }
 
@@ -1448,10 +1425,12 @@ public:
     }
     float alarm_setpoint() const { return alarm_setpoint_; }
 
-    /* Re-read the scalars — and the polygon outline — so an overlay change
-     * shows at once rather than at the next tick.  The measurements are
-     * recomputed with it, so this is for one-off gestures (a key, a
-     * right-click), not for a drag. */
+    /* Re-read the scalars — and the derived polygon outline — so an overlay
+     * change shows at once rather than at the next tick.  The measurements are
+     * recomputed with it, which is why it is called from the one-off gestures
+     * (a key, a bar drag) and from the ROI drag, where the shape being edited
+     * has to be re-read to be drawn — but never from a plain pointer move, which
+     * would run a ROI median per mouse event. */
     void resnap()
     {
         if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0) {
@@ -2251,23 +2230,145 @@ public:
                       (int)std::lround(org.y() + s * cp.y()));
     }
 
+    /* A source pixel's position in canvas coordinates — the drawing
+     * transform, without the clamping draw_content's local `proj` does, because
+     * a handle is only grabbable where it is actually drawn. */
+    bool source_to_canvas(int sx, int sy, QPoint &out) const
+    {
+        if (img_.isNull() || snap_.width <= 0 || snap_.height <= 0)
+            return false;
+        int ox = 0, oy = 0;
+        if (dyt_view_transform_project(&snap_.xform, snap_.width, snap_.height,
+                                       img_.width(), img_.height(),
+                                       sx, sy, &ox, &oy) != 0)
+            return false;
+        out = QPoint(kPad + ox, kPad + oy);
+        return true;
+    }
+
+    /* The source pixel a widget position names, *clamped* into the frame.
+     * widget_to_source() refuses a point outside the picture, which is right
+     * for a click that places something and wrong for a drag: a region dragged
+     * past the edge has to keep feeding the session so it can stop at the
+     * edge, and the session's own clamp is what decides where that is. */
+    bool widget_to_source_clamped(const QPointF &pos, int *sx, int *sy) const
+    {
+        if (img_.isNull() || snap_.width <= 0 || snap_.height <= 0 ||
+            !sx || !sy)
+            return false;
+        const double  s   = display_scale();
+        const QPointF org = display_origin();
+        const int lx = (int)std::floor((pos.x() - org.x()) / s - kPad);
+        const int ly = (int)std::floor((pos.y() - org.y()) / s - kPad);
+        if (dyt_view_transform_map(&snap_.xform, snap_.width, snap_.height,
+                                   img_.width(), img_.height(), lx, ly,
+                                   sx, sy) != 0)
+            return false;
+        *sx = std::max(0, std::min(snap_.width - 1, *sx));
+        *sy = std::max(0, std::min(snap_.height - 1, *sy));
+        return true;
+    }
+
+    /* ---- the placed region's handles -----------------------------------
+     *
+     * The vendor's own arrangement: `M_isContain` gives a rectangle eight
+     * handles — the four corners and the four edge midpoints (:13324-13388) —
+     * a drag on one resizes it (`stretchShape`, :10642) and a drag on the body
+     * moves it (`SelsectShape`, :10599).  The port draws them whenever a region
+     * exists and the tool that made it is up, rather than only once a hover has
+     * selected it: there is one region here, not the vendor's array of shapes,
+     * so "selected" would be a state with nothing to tell it apart from.
+     *
+     * A press on a handle resizes, a press inside the body moves, and a press
+     * anywhere else places a new region — the vendor's rule too, where a shape
+     * is only restarted from empty space.
+     */
+    static const int kRoiGrab   = DYT_ROI_HANDLES;   /* the body, in roi_drag_ */
+    static const int kRoiGrabPx = 6;   /* the vendor's own 6-px grab box */
+    static const int kRoiNoHandle = -100000;   /* a handle that projects nowhere */
+
+    /* Whether there is a region to draw handles for.  Both area tools place
+     * one, and for the polygon the handles are its bounding box — the thing a
+     * drag actually moves. */
+    bool roi_shown() const
+    {
+        return (snap_.tool == DYT_TOOL_BOX || snap_.tool == DYT_TOOL_POLYGON) &&
+               !img_.isNull() &&
+               snap_.p0.x >= 0 && snap_.p0.y >= 0 &&
+               snap_.p1.x >= 0 && snap_.p1.y >= 0;
+    }
+
+    /* The eight handles in canvas coordinates, in the vendor's order. */
+    void roi_handles(QPoint out[DYT_ROI_HANDLES]) const
+    {
+        const int x0 = std::min(snap_.p0.x, snap_.p1.x);
+        const int y0 = std::min(snap_.p0.y, snap_.p1.y);
+        const int x1 = std::max(snap_.p0.x, snap_.p1.x);
+        const int y1 = std::max(snap_.p0.y, snap_.p1.y);
+        const int mx = x0 + (x1 - x0) / 2, my = y0 + (y1 - y0) / 2;
+        const int hx[DYT_ROI_HANDLES] = { x0, mx, x1, x1, x1, mx, x0, x0 };
+        const int hy[DYT_ROI_HANDLES] = { y0, y0, y0, my, y1, y1, y1, my };
+        for (int i = 0; i < DYT_ROI_HANDLES; i++)
+            if (!source_to_canvas(hx[i], hy[i], out[i]))
+                out[i] = QPoint(kRoiNoHandle, kRoiNoHandle);
+    }
+
+    /* What is under `wp`: -1 nothing, 0..7 a handle, kRoiGrab the body.  The
+     * test is in canvas coordinates, because that is where the handles are
+     * drawn — the grab box is a distance the user can see, so it has to be the
+     * same number of *screen* pixels whatever the display scale. */
+    int roi_grab_at(const QPointF &wp) const
+    {
+        if (!roi_shown())
+            return -1;
+
+        const double  s   = display_scale();
+        const QPointF org = display_origin();
+        const QPointF cp((wp.x() - org.x()) / s, (wp.y() - org.y()) / s);
+
+        QPoint hs[DYT_ROI_HANDLES];
+        roi_handles(hs);
+        for (int i = 0; i < DYT_ROI_HANDLES; i++)
+            if (hs[i].x() != kRoiNoHandle &&
+                std::abs(cp.x() - hs[i].x()) <= kRoiGrabPx &&
+                std::abs(cp.y() - hs[i].y()) <= kRoiGrabPx)
+                return i;
+
+        QPoint a, b;
+        if (source_to_canvas(snap_.p0.x, snap_.p0.y, a) &&
+            source_to_canvas(snap_.p1.x, snap_.p1.y, b) &&
+            QRect(QPoint(std::min(a.x(), b.x()), std::min(a.y(), b.y())),
+                  QPoint(std::max(a.x(), b.x()), std::max(a.y(), b.y())))
+                .contains(cp.toPoint()))
+            return kRoiGrab;
+
+        return -1;
+    }
+
+    /* The eight handles, drawn in the canvas's accent.  Squares rather than the
+     * vendor's corner brackets and edge ticks (:13813-13837): at five pixels
+     * across it is *where* the mark is, not its shape, that says "drag me", and
+     * a square is the one mark that reads the same at every scale. */
+    void draw_roi_handles(QPainter &p)
+    {
+        QPoint hs[DYT_ROI_HANDLES];
+        roi_handles(hs);
+        p.setBrush(QColor(QStringLiteral("#00b4d8")));
+        p.setPen(QPen(QColor(0, 0, 0), 1));
+        for (int i = 0; i < DYT_ROI_HANDLES; i++) {
+            if (hs[i].x() == kRoiNoHandle)
+                continue;
+            p.drawRect(QRect(hs[i].x() - 2, hs[i].y() - 2, 5, 5));
+        }
+        p.setBrush(Qt::NoBrush);
+    }
+
 protected:
     void mousePressEvent(QMouseEvent *e) override
     {
-        /* The polygon's finish gesture.  Only the polygon has one, so every
-         * other tool keeps the right button free — and an unhandled
-         * right-click is passed on, which is what lets a future context menu
-         * exist without this having to change. */
-        if (e->button() == Qt::RightButton) {
-            if (snap_.tool == DYT_TOOL_POLYGON) {
-                dyt_session_set_polygon_closed(sess_, 1);
-                resnap();
-                e->accept();
-                return;
-            }
-            e->ignore();
-            return;
-        }
+        /* Every tool here is placed with the left button, so the right one is
+         * passed on unhandled — which is what lets a future context menu exist
+         * without this having to change. */
         if (e->button() != Qt::LeftButton) {
             e->ignore();
             return;
@@ -2331,6 +2432,26 @@ protected:
             e->accept();
             return;
         }
+        /* The placed region's handles, before the tool places anything new: a
+         * press on a handle resizes, a press inside the body moves, and only a
+         * press outside it starts a fresh region — the vendor's own rule.  The
+         * grab records where the pointer was *in source pixels* and where the
+         * region's top-left was, because a move is then an absolute call
+         * (`roi_move_to`) and a clamped move cannot leave the region lagging
+         * behind the pointer. */
+        const int grab = roi_grab_at(e->position());
+        if (grab >= 0) {
+            int sx = 0, sy = 0;
+            if (widget_to_source_clamped(e->position(), &sx, &sy)) {
+                roi_drag_    = grab;
+                roi_grab_sx_ = sx;
+                roi_grab_sy_ = sy;
+                roi_grab_x0_ = std::min(snap_.p0.x, snap_.p1.x);
+                roi_grab_y0_ = std::min(snap_.p0.y, snap_.p1.y);
+                e->accept();
+                return;
+            }
+        }
         pointer(DYT_VM_MOUSE_DOWN, e->position());
         e->accept();
     }
@@ -2339,6 +2460,23 @@ protected:
     {
         if (bar_drag_ >= 0) {
             bar_drag_apply(e->pos());
+            e->accept();
+            return;
+        }
+        /* A region being moved or resized.  The session is what clamps, so an
+         * off-picture pointer still feeds it: that is how the region stops at
+         * the edge rather than the drag stalling short of it. */
+        if (roi_drag_ >= 0) {
+            int sx = 0, sy = 0;
+            if (widget_to_source_clamped(e->position(), &sx, &sy)) {
+                if (roi_drag_ == kRoiGrab)
+                    dyt_session_roi_move_to(sess_,
+                                            roi_grab_x0_ + (sx - roi_grab_sx_),
+                                            roi_grab_y0_ + (sy - roi_grab_sy_));
+                else
+                    dyt_session_roi_stretch(sess_, roi_drag_, sx, sy);
+                resnap();
+            }
             e->accept();
             return;
         }
@@ -2366,6 +2504,14 @@ protected:
         }
         if (bar_drag_ >= 0) {
             bar_drag_ = -1;
+            e->accept();
+            return;
+        }
+        /* A region drag ends where it is.  There is nothing to commit: every
+         * move already wrote the session, which is what keeps the reading and
+         * the shape from being able to disagree at the moment of release. */
+        if (roi_drag_ >= 0) {
+            roi_drag_ = -1;
             e->accept();
             return;
         }
@@ -2653,48 +2799,42 @@ protected:
                     p.drawText(QPoint(r.left() + 4, r.top() - 6),
                                QString::fromUtf8(lbl));
                 }
+                /* The eight grab handles, last so they sit on the outline.
+                 * Drawn in the canvas's own coordinates, so they scale with
+                 * the picture — which is also why the grab test is in canvas
+                 * coordinates and not in source pixels. */
+                draw_roi_handles(p);
             } else if (snap_.tool == DYT_TOOL_POLYGON && snap_.poly_n > 0) {
-                /* The outline through the placed vertices.  While it is still
-                 * open a rubber band runs from the last vertex to the pointer,
-                 * so the user can see where the next click will land; a closed
-                 * outline has no next click and is drawn shut instead. */
+                /* The pentagon the session fitted to the box.  It is always
+                 * closed, so it is drawn as a polygon — there is no rubber
+                 * band, because there is no half-drawn outline: the shape
+                 * exists as soon as the drag does. */
                 QPolygon poly;
                 for (int i = 0; i < snap_.poly_n; i++) {
                     QPoint q;
                     if (proj(snap_.poly[i].x, snap_.poly[i].y, q))
                         poly << q;
                 }
-                if (!snap_.poly_closed && ptr_.x >= 0)
-                    poly << QPoint(x0 + ptr_.x, y0 + ptr_.y);
 
-                const bool shut = snap_.poly_closed && poly.size() >= 3;
-
-                if (poly.size() >= 2) {
+                if (poly.size() >= 3) {
                     p.setBrush(Qt::NoBrush);
                     /* A dark stroke under the bright one, as the other tools
                      * draw, so the shape reads on any picture. */
                     for (int pass = 0; pass < 2; pass++) {
                         p.setPen(pass == 0 ? QPen(QColor(0, 0, 0), 3) : mark);
-                        if (shut)
-                            p.drawPolygon(poly);
-                        else
-                            p.drawPolyline(poly);
+                        p.drawPolygon(poly);
                     }
                 }
-
-                /* The vertices, the first one larger: it is where the shape
-                 * started, and Backspace undoes from the other end.  Only the
-                 * placed ones — the rubber band's end is not a vertex. */
-                p.setBrush(mark);
-                p.setPen(mark);
-                for (int i = 0; i < snap_.poly_n && i < poly.size(); i++)
-                    p.drawEllipse(poly[i], i == 0 ? 4 : 3, i == 0 ? 4 : 3);
 
                 if (snap_.roi_ok && !poly.isEmpty()) {
                     char lbl[128];
                     dyt_vm_roi_label(&snap_, lbl, sizeof lbl);
                     p.drawText(poly[0] + QPoint(8, -8), QString::fromUtf8(lbl));
                 }
+
+                /* The same eight handles the box gets: they are the bounding
+                 * box's, and dragging one reshapes the pentagon with it. */
+                draw_roi_handles(p);
             }
         }
 
@@ -2998,17 +3138,15 @@ private:
         const QPointF org = display_origin();
         const int lx = (int)std::floor((pos.x() - org.x()) / s - kPad);
         const int ly = (int)std::floor((pos.y() - org.y()) / s - kPad);
-        const int placed =
-            dyt_vm_tool_mouse(sess_, &ptr_, ev, snap_.tool, &snap_.xform,
-                              snap_.width, snap_.height,
-                              img_.width(), img_.height(), lx, ly);
-        /* The polygon is placed a click at a time and its outline lives in the
-         * snapshot, so a new vertex has to be read back before it can be drawn
-         * — and the fill with it.  The drag tools only move point 1, which the
-         * next tick picks up anyway, and a polygon *move* places nothing, so
-         * this costs one snapshot per click rather than one per mouse event. */
-        if (placed && snap_.tool == DYT_TOOL_POLYGON && sess_)
-            dyt_session_snapshot(sess_, &snap_, nullptr, 0);
+        dyt_vm_tool_mouse(sess_, &ptr_, ev, snap_.tool, &snap_.xform,
+                          snap_.width, snap_.height,
+                          img_.width(), img_.height(), lx, ly);
+        /* No snapshot here.  Both area tools derive their shape from the
+         * session's points, and the next frame tick reads it back — which is
+         * what keeps a *drag* from running a ROI median per mouse event.  An
+         * edit already writes the session, and the drag handlers resnap()
+         * themselves, so the shape is never a frame behind while it is being
+         * dragged. */
         update();
     }
 
@@ -3054,6 +3192,15 @@ private:
     bool                bar_scale_locked_ = false;
     float               bar_lock_lo_ = 0.f;
     float               bar_lock_hi_ = 0.f;
+    /* Which part of the placed region a drag is moving: -1 nothing, 0..7 a
+     * handle, kRoiGrab the body.  The move is measured from the pointer's
+     * source pixel at the press and the region's top-left then, so it is an
+     * absolute `roi_move_to` per event rather than an accumulating delta. */
+    int                 roi_drag_    = -1;
+    int                 roi_grab_sx_ = 0;
+    int                 roi_grab_sy_ = 0;
+    int                 roi_grab_x0_ = 0;
+    int                 roi_grab_y0_ = 0;
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 
@@ -7741,7 +7888,6 @@ static const key_line_t kKeyLines[] = {
     { "measurement", "  p l b o n     point / line / box / polygon / clear\n" },
     { "measurement", "  T w           Mark: place a text label / drag an arrow\n" },
     { "measurement", "  ^Z ^Y ^R      Mark: undo / redo / reset\n" },
-    { "measurement", "  enter bksp    polygon: finish the outline / undo a vertex\n" },
     { "measurement", "  c             Analysis: annotate the line's chart\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
     { "measurement", "  m             hottest/coldest markers on/off\n" },
@@ -8415,22 +8561,77 @@ static int selftest(const opts &o)
         send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
                    lx1, ly1);
 
-        const bool ok = m0 && m1 &&
-                        s1.p0.x == ex0 && s1.p0.y == ey0 &&
-                        s1.p1.x == ex0 && s1.p1.y == ey0 &&
-                        s2.p0.x == ex0 && s2.p0.y == ey0 &&
-                        s2.p1.x == ex1 && s2.p1.y == ey1;
-        std::printf("  %-4s the mouse places and drags through the widget "
-                    "(%d,%d -> %d,%d)\n", ok ? "ok" : "FAIL",
-                    s1.p0.x, s1.p0.y, s2.p1.x, s2.p1.y);
+        /* The widget reads its geometry from its own snapshot, which a live
+         * run refreshes on every frame tick.  Nothing here delivers one, so
+         * take the same read the tick would — otherwise the handles below
+         * would be tested against the frame before the box existed. */
+        win.view()->resnap();
+
+        const bool placed = m0 && m1 &&
+                            s1.p0.x == ex0 && s1.p0.y == ey0 &&
+                            s1.p1.x == ex0 && s1.p1.y == ey0 &&
+                            s2.p0.x == ex0 && s2.p0.y == ey0 &&
+                            s2.p1.x == ex1 && s2.p1.y == ey1;
+
+        /* The placed box is then *edited* through the same widget: a drag on
+         * the body moves it (`SelsectShape`), a drag on a handle resizes it
+         * (`stretchShape`).  The move's press is the box's centre, well clear
+         * of all eight handles; the resize grabs the right-middle one, which
+         * sits on the box's own right edge half way down — after the move, so
+         * both gestures act on where the box actually is. */
+        const int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
+        int gx = -1, gy = -1, nx = -1, ny = -1;
+        const bool mmap =
+            dyt_view_transform_map(&s2.xform, s2.width, s2.height,
+                                   is.width(), is.height(),
+                                   cx, cy, &gx, &gy) == 0 &&
+            dyt_view_transform_map(&s2.xform, s2.width, s2.height,
+                                   is.width(), is.height(),
+                                   cx + 12, cy + 8, &nx, &ny) == 0;
+
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   cx, cy);
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton,
+                   cx + 12, cy + 8);
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   cx + 12, cy + 8);
+        dyt_snapshot_t s3{};
+        dyt_session_snapshot(sess, &s3, nullptr, 0);
+        const bool moved = mmap && s3.p0.x == s2.p0.x + (nx - gx) &&
+                           s3.p0.y == s2.p0.y + (ny - gy);
+
+        const int rcx = lx1 + 12, rcy = cy + 8;
+        int hx = -1, hy = -1;
+        const bool hmap =
+            dyt_view_transform_map(&s3.xform, s3.width, s3.height,
+                                   is.width(), is.height(),
+                                   rcx + 20, rcy, &hx, &hy) == 0;
+
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   rcx, rcy);
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton,
+                   rcx + 20, rcy);
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   rcx + 20, rcy);
+        dyt_snapshot_t s4{};
+        dyt_session_snapshot(sess, &s4, nullptr, 0);
+        const bool resized = hmap && s4.p1.x == hx &&
+                             s4.p1.y == s3.p1.y && s4.p0.x == s3.p0.x;
+
+        const bool ok = placed && moved && resized;
+        std::printf("  %-4s the mouse places, drags, moves and resizes a box "
+                    "through the widget (%d,%d -> %d,%d, then the right edge "
+                    "%d -> %d)\n", ok ? "ok" : "FAIL",
+                    s1.p0.x, s1.p0.y, s4.p0.x, s4.p0.y, s3.p1.x, s4.p1.x);
         if (!ok)
             fails++;
     }
 
-    /* 24b. The polygon is placed a click at a time through the same widget,
-     * and its gestures are the window's: a click adds a vertex, Enter finishes
-     * the outline, Backspace takes a vertex back, and the right button
-     * finishes it too.
+    /* 24b. The polygon is a *drag* tool, exactly like the box: a
+     * press-drag-release pulls out a rectangle and the session fits a
+     * five-sided shape to it.  So the gesture is the box's, the vertices are
+     * derived rather than clicked, and the shape can be moved and resized by
+     * its bounding box afterwards — which is the point of deriving them.
      *
      * The outline has to reach the overlay as well as the session, so the last
      * check counts the mark colour on the canvas rather than sampling it — the
@@ -8439,50 +8640,32 @@ static int selftest(const opts &o)
      * palette that contains pure yellow, so an absolute count would be reading
      * the palette as much as the outline. */
     {
-        const int px[3] = { 20, 60, 20 };
-        const int py[3] = { 20, 20, 60 };
-        dyt_snapshot_t s{};
+        const int lx0 = 20, ly0 = 20, lx1 = 80, ly1 = 70;
+        const QSize is = win.view()->imageSize();
 
-        send_key(Qt::Key_O);            /* the polygon tool, by its key */
+        /* Does `sn`'s pentagon sit on `sn`'s own box?  The top vertex on the
+         * top edge at the horizontal centre, and the extremes on the other
+         * three sides.  A shape that only echoed stored vertices would not
+         * follow a moved box, which is what the drag below checks. */
+        auto fitted = [](const dyt_snapshot_t &sn) {
+            if (sn.poly_n != DYT_POLYGON_SIDES)
+                return false;
+            const int lo_x = std::min(sn.p0.x, sn.p1.x);
+            const int hi_x = std::max(sn.p0.x, sn.p1.x);
+            const int lo_y = std::min(sn.p0.y, sn.p1.y);
+            const int hi_y = std::max(sn.p0.y, sn.p1.y);
+            bool top = false, bot = false, lft = false, rgt = false;
+            for (int i = 0; i < sn.poly_n; i++) {
+                if (sn.poly[i].y == lo_y &&
+                    std::abs(sn.poly[i].x - (lo_x + hi_x) / 2) <= 1)
+                    top = true;
+                if (sn.poly[i].y == hi_y) bot = true;
+                if (sn.poly[i].x == lo_x) lft = true;
+                if (sn.poly[i].x == hi_x) rgt = true;
+            }
+            return top && bot && lft && rgt;
+        };
 
-        for (int i = 0; i < 3; i++)
-            send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
-                       Qt::LeftButton, px[i], py[i]);
-
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-        const bool tool     = s.tool == DYT_TOOL_POLYGON;
-        const bool placed   = s.poly_n == 3;
-        const bool measured = s.roi_ok && s.roi.n > 0;
-        const bool open     = s.poly_closed == 0;
-
-        /* Enter finishes the outline: it takes no more vertices, but it keeps
-         * measuring the ones it has. */
-        send_key(Qt::Key_Return);
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-        const bool closed = s.poly_closed == 1 && s.poly_n == 3 && s.roi_ok;
-
-        /* Backspace takes the last vertex back and reopens the outline, so it
-         * can be added to again — the only way to correct a misclick without
-         * losing the whole shape. */
-        send_key(Qt::Key_Backspace);
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-        const bool undone = s.poly_n == 2 && s.poly_closed == 0;
-
-        /* The right button finishes it too — but not a two-vertex outline,
-         * which is not a region yet. */
-        send_mouse(QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton,
-                   px[0], py[0]);
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-        const bool refused = s.poly_closed == 0 && s.poly_n == 2;
-
-        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
-                   px[2], py[2]);
-        send_mouse(QEvent::MouseButtonPress, Qt::RightButton, Qt::RightButton,
-                   px[0], py[0]);
-        dyt_session_snapshot(sess, &s, nullptr, 0);
-        const bool shut = s.poly_closed == 1 && s.poly_n == 3;
-
-        /* And the outline is on the canvas, not only in the session. */
         auto count_mark = [](const QImage &im) {
             int n = 0;
             for (int y = 0; y < im.height(); y++)
@@ -8491,17 +8674,69 @@ static int selftest(const opts &o)
                         n++;
             return n;
         };
+
+        send_key(Qt::Key_O);            /* the polygon tool, by its key */
+
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   lx0, ly0);
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, lx1, ly1);
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   lx1, ly1);
+
+        /* As in assertion 24: the widget's own snapshot is what the handle
+         * grab reads, and only a frame tick refreshes it. */
+        win.view()->resnap();
+
+        dyt_snapshot_t s{};
+        dyt_session_snapshot(sess, &s, nullptr, 0);
+
+        const bool tool     = s.tool == DYT_TOOL_POLYGON;
+        const bool placed   = s.poly_n == DYT_POLYGON_SIDES;
+        const bool measured = s.roi_ok && s.roi.n > 0;
+        const bool on_box   = fitted(s);
+
+        /* Move: a press on the body — the box centre, clear of every handle —
+         * drags the whole shape, and the pentagon comes with it.  The move is
+         * absolute from the grab, so the expected top-left is the old one plus
+         * the pointer travel in source pixels. */
+        int gx = -1, gy = -1, nx = -1, ny = -1;
+        const int cx = (lx0 + lx1) / 2, cy = (ly0 + ly1) / 2;
+        const int mx = cx + 15, my = cy + 10;
+        const bool mapped =
+            dyt_view_transform_map(&s.xform, s.width, s.height,
+                                   is.width(), is.height(),
+                                   cx, cy, &gx, &gy) == 0 &&
+            dyt_view_transform_map(&s.xform, s.width, s.height,
+                                   is.width(), is.height(),
+                                   mx, my, &nx, &ny) == 0;
+
+        send_mouse(QEvent::MouseButtonPress, Qt::LeftButton, Qt::LeftButton,
+                   cx, cy);
+        send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton, mx, my);
+        send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton, Qt::NoButton,
+                   mx, my);
+
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+        const bool moved   = mapped && s2.p0.x == s.p0.x + (nx - gx) &&
+                             s2.p0.y == s.p0.y + (ny - gy);
+        const bool follows = fitted(s2);
+
         const int painted = count_mark(win.view()->render_canvas());
-        send_key(Qt::Key_N);            /* clear: the outline goes with it */
+        send_key(Qt::Key_N);            /* clear: the shape goes with it */
+        dyt_snapshot_t s3{};
+        dyt_session_snapshot(sess, &s3, nullptr, 0);
+        const bool cleared_model = s3.poly_n == 0 && !s3.roi_ok;
         const int cleared = count_mark(win.view()->render_canvas());
 
-        const bool ok = tool && placed && measured && open && closed &&
-                        undone && refused && shut &&
+        const bool ok = tool && placed && measured && on_box &&
+                        moved && follows && cleared_model &&
                         painted > cleared + 60;
-        std::printf("  %-4s the polygon is placed a click at a time, and its "
-                    "outline is painted (3 clicks, closed, undone, "
-                    "right-button %s, %d mark px then %d)\n",
-                    ok ? "ok" : "FAIL", shut ? "yes" : "NO", painted, cleared);
+        std::printf("  %-4s the polygon is dragged out like the box, fitted to "
+                    "it and moved with it (%d sides, moved %s, %d mark px "
+                    "then %d)\n",
+                    ok ? "ok" : "FAIL", s.poly_n, moved ? "yes" : "NO",
+                    painted, cleared);
         if (!ok)
             fails++;
     }
@@ -12804,12 +13039,12 @@ static std::string help_text()
     s += "(tools/dytview) draws with, so the two always agree.\n\n";
 
     s += "getting started\n";
-    s += "  * Drag on the picture to place the selected tool (point, line or box)\n";
-    s += "    and read a temperature.  The polygon is placed a click at a time\n";
-    s += "    instead: each click adds a vertex, Enter or the right button\n";
-    s += "    finishes the outline, and Backspace takes a vertex back.  The\n";
-    s += "    reading appears in the strip below the picture, beside the frame's\n";
-    s += "    hottest and coldest pixels (marked H and L on the picture).\n";
+    s += "  * Drag on the picture to place the selected tool (point, line, box or\n";
+    s += "    polygon) and read a temperature.  A box or a polygon can then be\n";
+    s += "    dragged around by its body, or resized by any of the eight handles\n";
+    s += "    drawn on its edges.  The reading appears in the strip below the\n";
+    s += "    picture, beside the frame's hottest and coldest pixels (marked H and\n";
+    s += "    L on the picture).\n";
     s += "  * Everything the keys do is also on the control panel down the right,\n";
     s += "    so a key you have forgotten can be found there.  The two cannot\n";
     s += "    disagree: a control runs exactly what its key runs.\n";

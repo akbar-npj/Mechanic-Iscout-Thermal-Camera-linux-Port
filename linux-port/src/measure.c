@@ -296,6 +296,35 @@ int dyt_measure_polygon(const float *temps, int w, int h,
     return 0;
 }
 
+/* ------------------------------------------------------ polygon placement */
+
+void dyt_polygon_fit_box(int x0, int y0, int x1, int y1,
+                         dyt_point_t out[DYT_POLYGON_SIDES])
+{
+    /* A regular pentagon with a vertex at the top, its bounding box normalised
+     * to the unit square.  Taken from the exact geometry (vertices at
+     * 90 + 72k degrees, circumradius 1) and then rounded to three places — a
+     * hundredth of a pixel on the widest frame this camera produces, which is
+     * far below what a drag can express. */
+    static const double u[DYT_POLYGON_SIDES] = { 0.500, 1.000, 0.809, 0.191, 0.000 };
+    static const double v[DYT_POLYGON_SIDES] = { 0.000, 0.382, 1.000, 1.000, 0.382 };
+    int lo_x, lo_y, hi_x, hi_y, i;
+
+    if (!out)
+        return;
+
+    /* Either corner may be the top-left; the shape is the same box. */
+    lo_x = x0 < x1 ? x0 : x1;
+    hi_x = x0 < x1 ? x1 : x0;
+    lo_y = y0 < y1 ? y0 : y1;
+    hi_y = y0 < y1 ? y1 : y0;
+
+    for (i = 0; i < DYT_POLYGON_SIDES; i++) {
+        out[i].x = lo_x + (int)(u[i] * (double)(hi_x - lo_x) + 0.5);
+        out[i].y = lo_y + (int)(v[i] * (double)(hi_y - lo_y) + 0.5);
+    }
+}
+
 /* --------------------------------------------------------- isotherm / area */
 
 int dyt_measure_isotherm(const float *temps, int w, int h,

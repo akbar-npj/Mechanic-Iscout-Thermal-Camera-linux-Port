@@ -575,36 +575,28 @@ static cv::Mat render(viewer *v)
         }
 
         if (snap.tool == DYT_TOOL_POLYGON && snap.poly_n > 0) {
-            std::vector<cv::Point> verts, outline;
+            /* The pentagon the session fitted to the p0/p1 box.  It is always
+             * closed and always derived, so there is no rubber band and no
+             * vertex markers — the shape exists as soon as the drag does, and
+             * the eight handles (drawn with the box's) are what a drag acts
+             * on. */
+            std::vector<cv::Point> verts;
 
             for (int i = 0; i < snap.poly_n; i++) {
                 int px = 0, py = 0;
                 if (proj(snap.poly[i].x, snap.poly[i].y, px, py))
                     verts.push_back(cv::Point(px, py));
             }
-            outline = verts;
 
-            /* A rubber band to the cursor while the outline is still open:
-             * without it the user cannot see where the next click will land.
-             * A closed outline has no next click, so it gets none. */
-            if (!snap.poly_closed && v->ptr.x >= 0)
-                outline.push_back(cv::Point(v->ptr.x, v->ptr.y));
+            if (verts.size() >= 3) {
+                const cv::Point *pp  = verts.data();
+                const int        npt = (int)verts.size();
 
-            if (outline.size() >= 2) {
-                const cv::Point *pp  = outline.data();
-                const int        npt = (int)outline.size();
-                const bool       shut = snap.poly_closed && verts.size() >= 3;
-
-                cv::polylines(canvas, &pp, &npt, 1, shut,
+                cv::polylines(canvas, &pp, &npt, 1, true,
                               cv::Scalar(0, 0, 0), 3);
-                cv::polylines(canvas, &pp, &npt, 1, shut,
+                cv::polylines(canvas, &pp, &npt, 1, true,
                               cv::Scalar(0, 255, 255), 1);
             }
-            for (size_t i = 0; i < verts.size(); i++)
-                cv::circle(canvas, verts[i], 3,
-                           i == 0 ? cv::Scalar(0, 128, 255)
-                                  : cv::Scalar(0, 255, 255),
-                           cv::FILLED);
 
             if (snap.roi_ok && !verts.empty()) {
                 char buf[160];
@@ -676,12 +668,6 @@ static void on_mouse(int event, int x, int y, int flags, void *user)
     case cv::EVENT_LBUTTONDOWN: ev = DYT_VM_MOUSE_DOWN; break;
     case cv::EVENT_MOUSEMOVE:   ev = DYT_VM_MOUSE_MOVE; break;
     case cv::EVENT_LBUTTONUP:   ev = DYT_VM_MOUSE_UP;   break;
-    case cv::EVENT_RBUTTONDOWN:
-        /* The polygon's own gesture: finish the outline.  Not routed through
-         * the shared placement, which only knows presses, moves and drags. */
-        if (v->tool == DYT_TOOL_POLYGON)
-            dyt_session_set_polygon_closed(v->sess, 1);
-        return;
     default:                    return;
     }
 
@@ -795,8 +781,7 @@ static void usage(const char *prog)
         "      h/v mirror · x rotate a quarter turn · + / - zoom · q or ESC quit\n"
         "      s save a DYT still (picture + raw payload) · w save a PNG of the\n"
         "      whole window\n"
-        "      p point · l line · b box · o polygon (click per vertex,\n"
-        "      right-click or Enter to close, Backspace to undo a vertex)\n"
+        "      p point · l line · b box · o polygon (a drag, like the box)\n"
         "      n clear (click/drag to place)\n"
         "      a alarm on/off · i isotherm (alarm band) overlay\n"
         "      f cycle fusion · [ ] align visible X · ; ' align visible Y\n"
@@ -1109,17 +1094,6 @@ int main(int argc, char **argv)
             dyt_session_set_tool(v.sess, v.tool);
             if (key == 'n')
                 dyt_session_clear_points(v.sess);
-        } else if ((key == 13 || key == 10) && v.tool == DYT_TOOL_POLYGON) {
-            /* Enter closes the outline, so the next click starts a new one
-             * instead of extending the shape just finished.  A polygon
-             * gesture rather than a tool key, which is why it is not in the
-             * chain above. */
-            dyt_session_set_polygon_closed(v.sess, 1);
-        } else if (key == 8 && v.tool == DYT_TOOL_POLYGON) {
-            /* Backspace takes the last vertex back.  Not "z": that is the
-             * super-resolution key, and a polygon tool that shadowed it would
-             * be the only way to lose the binding. */
-            dyt_session_polygon_undo(v.sess);
         } else if (key == 'a') {
             /* Arm the alarm across the middle of whatever range is on
              * screen, so the hottest and coldest parts of the scene trip it.

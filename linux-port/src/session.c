@@ -38,13 +38,11 @@ struct dyt_session {
     /* Measurement.  The points are in source pixels; -1 means "unset".  The
      * scratch buffer is for the ROI median, which is far too expensive for
      * the callback thread — so it is done in snapshot(), on the GUI thread,
-     * and grown here on demand.  The polygon's outline is a second placement
-     * (session.h) and shares the same scratch. */
+     * and grown here on demand.  Both area tools share it, and both describe
+     * their shape with p0/p1: the box directly, the polygon through the
+     * pentagon fitted to the same box. */
     dyt_tool_t   tool;
     dyt_point_t  p0, p1;
-    dyt_point_t  poly[DYT_POLYGON_MAX_VTX];
-    int          poly_n;
-    int          poly_closed;
     float       *roi_scratch;
     int          roi_cap;
 
@@ -396,10 +394,15 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
     out->p0   = s->p0;
     out->p1   = s->p1;
 
-    out->poly_n      = s->poly_n;
-    out->poly_closed = s->poly_closed;
-    if (s->poly_n > 0)
-        memcpy(out->poly, s->poly, (size_t)s->poly_n * sizeof out->poly[0]);
+    /* The polygon's outline is derived, not stored: the same two points that
+     * place the box place a pentagon fitted to it, so a front end that draws
+     * `poly` and a front end that measures it cannot disagree. */
+    out->poly_n = 0;
+    if (s->tool == DYT_TOOL_POLYGON &&
+        s->p0.x >= 0 && s->p0.y >= 0 && s->p1.x >= 0 && s->p1.y >= 0) {
+        dyt_polygon_fit_box(s->p0.x, s->p0.y, s->p1.x, s->p1.y, out->poly);
+        out->poly_n = DYT_POLYGON_SIDES;
+    }
 
     out->point_ok = 0;
     out->point_c  = NAN;
@@ -481,11 +484,12 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
                                  s->roi_scratch, s->roi_cap, &out->roi);
         else
             rc = dyt_measure_polygon(s->temps, s->width, s->height,
-                                     s->poly, s->poly_n,
+                                     out->poly, out->poly_n,
                                      s->roi_scratch, s->roi_cap, &out->roi);
 
-        /* Fewer than three polygon vertices is rc == -1, which leaves roi_ok
-         * clear: an unfinished outline has no region to report. */
+        /* A polygon whose box was never placed has no vertices, and
+         * dyt_measure_polygon reports that as rc == -1, which leaves roi_ok
+         * clear: a tool with nothing placed has no region to report. */
         out->roi_ok = (rc == 0 && out->roi.n > 0);
     }
 
@@ -1074,89 +1078,146 @@ void dyt_session_clear_points(dyt_session_t *s)
     if (!s)
         return;
     pthread_mutex_lock(&s->m);
+    /* Both area tools describe their shape with these two points — the box
+     * directly, the polygon through the pentagon fitted to them — so clearing
+     * them clears whichever shape was placed. */
     s->p0.x = s->p0.y = -1;
     s->p1.x = s->p1.y = -1;
-    /* The polygon is a placement too, so "forget the measurement" forgets it:
-     * a front end has one clear action, not one per tool (session.h). */
-    s->poly_n      = 0;
-    s->poly_closed = 0;
     pthread_mutex_unlock(&s->m);
 }
 
-int dyt_session_polygon_add(dyt_session_t *s, int x, int y)
+/* ---- moving and resizing a placed region (session.h) ------------------- */
+
+/* Whether there is a region to move or stretch.  Both area tools place one —
+ * the box, and the polygon's bounding box, which is the same two points. */
+static int roi_ready(const dyt_session_t *s)
 {
-    int rc = 0;
+    return (s->tool == DYT_TOOL_BOX || s->tool == DYT_TOOL_POLYGON) &&
+           s->p0.x >= 0 && s->p0.y >= 0 &&
+           s->p1.x >= 0 && s->p1.y >= 0;
+}
+
+/* The region's corners in canonical order, p0 the minimum.  A drag can leave
+ * them either way round, and every handle is defined against this order — so
+ * the normalisation happens once, here, rather than in each handle's case. */
+static void roi_norm(const dyt_session_t *s, int *x0, int *y0, int *x1, int *y1)
+{
+    *x0 = s->p0.x < s->p1.x ? s->p0.x : s->p1.x;
+    *y0 = s->p0.y < s->p1.y ? s->p0.y : s->p1.y;
+    *x1 = s->p0.x < s->p1.x ? s->p1.x : s->p0.x;
+    *y1 = s->p0.y < s->p1.y ? s->p1.y : s->p0.y;
+}
+
+int dyt_session_roi_move_to(dyt_session_t *s, int x, int y)
+{
+    int x0, y0, x1, y1, w, h, dx, dy;
 
     if (!s)
         return -1;
 
     pthread_mutex_lock(&s->m);
-
-    if (s->poly_closed) {
-        /* The user declared the outline finished, so this vertex begins a new
-         * one rather than extending the shape they just closed. */
-        s->poly_n      = 0;
-        s->poly_closed = 0;
-    } else if (s->poly_n >= DYT_POLYGON_MAX_VTX) {
-        rc = -1;                /* full: refuse, never recycle (session.h) */
+    if (!roi_ready(s) || s->width <= 0 || s->height <= 0) {
+        pthread_mutex_unlock(&s->m);
+        return -1;
     }
+    roi_norm(s, &x0, &y0, &x1, &y1);
+    w = s->width;
+    h = s->height;
 
-    if (rc == 0) {
-        s->poly[s->poly_n].x = x;
-        s->poly[s->poly_n].y = y;
-        s->poly_n++;
-    }
+    dx = x - x0;
+    dy = y - y0;
+    /* The *region* is what is clamped, not the corner the pointer names: a
+     * region dragged past an edge stops with its far side on the edge instead
+     * of being partly cropped, which would change what is being measured
+     * without the user seeing it. */
+    if (x1 + dx > w - 1) dx = (w - 1) - x1;
+    if (y1 + dy > h - 1) dy = (h - 1) - y1;
+    if (x0 + dx < 0)     dx = -x0;
+    if (y0 + dy < 0)     dy = -y0;
 
+    s->p0.x = x0 + dx;
+    s->p0.y = y0 + dy;
+    s->p1.x = x1 + dx;
+    s->p1.y = y1 + dy;
     pthread_mutex_unlock(&s->m);
-    return rc;
+    return 0;
 }
 
-int dyt_session_polygon_undo(dyt_session_t *s)
+int dyt_session_roi_stretch(dyt_session_t *s, int handle, int x, int y)
 {
-    int n;
+    int x0, y0, x1, y1, w, h;
+    int moves_x, moves_y, left, top;
 
-    if (!s)
+    if (!s || handle < 0 || handle >= DYT_ROI_HANDLES)
         return -1;
 
     pthread_mutex_lock(&s->m);
-    /* Reopening is part of the undo: the user is stepping back through the
-     * shape, so it has to accept vertices again. */
-    s->poly_closed = 0;
-    if (s->poly_n > 0)
-        s->poly_n--;
-    n = s->poly_n;
-    pthread_mutex_unlock(&s->m);
-    return n;
-}
+    if (!roi_ready(s) || s->width <= 0 || s->height <= 0) {
+        pthread_mutex_unlock(&s->m);
+        return -1;
+    }
+    roi_norm(s, &x0, &y0, &x1, &y1);
+    w = s->width;
+    h = s->height;
 
-void dyt_session_set_polygon_closed(dyt_session_t *s, int closed)
-{
-    if (!s)
-        return;
-    pthread_mutex_lock(&s->m);
-    /* A region needs three vertices, so closing a shorter outline would claim
-     * a shape that cannot exist. */
-    s->poly_closed = (closed && s->poly_n >= 3) ? 1 : 0;
-    pthread_mutex_unlock(&s->m);
-}
+    /* Which edges this handle touches.  A middle handle moves one axis only,
+     * and that is load-bearing: the floor below must not run on an axis the
+     * drag never named, or a right-middle drag would quietly resize the
+     * region's height. */
+    left    = (handle == 0 || handle == 6 || handle == 7);
+    top     = (handle == 0 || handle == 1 || handle == 2);
+    moves_x = (handle != 1 && handle != 5);
+    moves_y = (handle != 3 && handle != 7);
 
-void dyt_session_set_polygon_pts(dyt_session_t *s, const dyt_point_t *pts, int n)
-{
-    if (!s)
-        return;
-    if (n < 0 || n > DYT_POLYGON_MAX_VTX)
-        return;                     /* refused, not truncated */
-    if (n > 0 && !pts)
-        return;
+    if (x < 0)      x = 0;
+    else if (x > w - 1) x = w - 1;
+    if (y < 0)      y = 0;
+    else if (y > h - 1) y = h - 1;
 
-    pthread_mutex_lock(&s->m);
-    if (n > 0)
-        memcpy(s->poly, pts, (size_t)n * sizeof s->poly[0]);
-    s->poly_n = n;
-    /* A whole new outline is not the finished shape a previous close
-     * declared. */
-    s->poly_closed = 0;
+    switch (handle) {
+    case 0: x0 = x; y0 = y; break;      /* top-left     */
+    case 1:         y0 = y; break;      /* top-middle   */
+    case 2: x1 = x; y0 = y; break;      /* top-right    */
+    case 3: x1 = x;         break;      /* right-middle */
+    case 4: x1 = x; y1 = y; break;      /* bottom-right */
+    case 5:         y1 = y; break;      /* bottom-middle*/
+    case 6: x0 = x; y1 = y; break;      /* bottom-left  */
+    case 7: x0 = x;         break;      /* left-middle  */
+    }
+
+    /* The vendor's floor (`SelsectShape`'s `max_p.X - 5`): the edge being
+     * dragged stops DYT_ROI_MIN short of the region's own far edge, so the two
+     * never cross.  The *dragged* edge gives way — the far one stays where the
+     * user left it.
+     *
+     * The clamp back into the frame is the one thing the vendor's version does
+     * not do (it only rejects a pointer outside the image), and it is also what
+     * makes a frame smaller than the floor safe: the floor asks for more room
+     * than the frame has, and the clamp simply gives the whole frame rather
+     * than letting an edge land out of bounds. */
+    if (moves_x) {
+        if (x1 - x0 < DYT_ROI_MIN) {
+            if (left) x0 = x1 - DYT_ROI_MIN;
+            else      x1 = x0 + DYT_ROI_MIN;
+        }
+        if (x0 < 0)     x0 = 0;
+        if (x1 > w - 1) x1 = w - 1;
+    }
+    if (moves_y) {
+        if (y1 - y0 < DYT_ROI_MIN) {
+            if (top) y0 = y1 - DYT_ROI_MIN;
+            else     y1 = y0 + DYT_ROI_MIN;
+        }
+        if (y0 < 0)     y0 = 0;
+        if (y1 > h - 1) y1 = h - 1;
+    }
+
+    s->p0.x = x0;
+    s->p0.y = y0;
+    s->p1.x = x1;
+    s->p1.y = y1;
     pthread_mutex_unlock(&s->m);
+    return 0;
 }
 
 int dyt_session_profile(dyt_session_t *s, float *out, int cap)

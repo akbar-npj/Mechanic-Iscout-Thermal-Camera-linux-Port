@@ -193,11 +193,11 @@ int dyt_vm_readout_line(const dyt_snapshot_t *snap, const char *msg,
              snap->p0.x, snap->p0.y, snap->p1.x, snap->p1.y, snap->roi.n);
         break;
     case DYT_TOOL_POLYGON:
-        /* The closed flag is worth showing: it is the difference between "the
-         * next click extends this" and "the next click starts over". */
-        appf(out, n, &off, "polygon %d pts%s n=%d",
-             snap->poly_n, snap->poly_closed ? " (closed)" : "",
-             snap->roi.n);
+        /* The pentagon is derived from the same two points as the box, so the
+         * status line shows the box it was dragged out of, not the five
+         * vertices — that is the number the user is actually controlling. */
+        appf(out, n, &off, "polygon (%d,%d)-(%d,%d) n=%d",
+             snap->p0.x, snap->p0.y, snap->p1.x, snap->p1.y, snap->roi.n);
         break;
     case DYT_TOOL_NONE:
     default:
@@ -598,20 +598,17 @@ int dyt_vm_tool_mouse(dyt_session_t *s, dyt_vm_pointer_t *p,
         p->dragging = 1;
         if (!ok)
             return 0;
-        /* The polygon is placed a click at a time, not dragged: each press
-         * adds a vertex, and the shape is measured as soon as it has three.
-         * A press after the outline was closed begins a new one (the session
-         * decides that, so both front ends get the same gesture). */
-        if (tool == DYT_TOOL_POLYGON)
-            return dyt_session_polygon_add(s, sx, sy) == 0;
+        /* Every tool that places a region — the box and the polygon alike —
+         * starts the same way: a press sets both points, and the drag moves
+         * the second.  The polygon's five vertices are derived from that box
+         * by the session, so there is nothing extra to place here. */
         dyt_session_set_point(s, 0, sx, sy);
         dyt_session_set_point(s, 1, sx, sy);
         return 1;
     }
 
-    /* Only the drag tools move point 1: for the polygon a move has nothing to
-     * place, and the front end draws its own rubber band to the cursor. */
-    if (ev == DYT_VM_MOUSE_MOVE && p->dragging && tool != DYT_TOOL_POLYGON) {
+    /* The drag: point 1 follows the pointer. */
+    if (ev == DYT_VM_MOUSE_MOVE && p->dragging) {
         if (ok) {
             dyt_session_set_point(s, 1, sx, sy);
             return 1;

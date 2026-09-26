@@ -88,9 +88,11 @@ int dyt_measure_line(const float *temps, int w, int h,
 
 /* The most vertices a polygon measurement accepts.  A bound rather than an
  * allocation: measure.c owns no memory, so the scanline's crossing list is a
- * fixed stack array.  A front end is told the limit (the add is refused)
- * instead of having its outline silently truncated — dropping a vertex moves
- * the boundary the user drew. */
+ * fixed stack array.  It is the *measurement*'s bound, not a front end's: the
+ * port's own polygon tool draws DYT_POLYGON_SIDES of them, but this stays
+ * general so the primitive can measure any outline a caller has.  A list over
+ * the bound is refused rather than truncated — dropping a vertex would move the
+ * boundary the caller drew. */
 #define DYT_POLYGON_MAX_VTX 32
 
 /* Statistics over the pixels inside the polygon through `verts` (nvtx >= 3, in
@@ -117,6 +119,27 @@ int dyt_measure_polygon(const float *temps, int w, int h,
                         const dyt_point_t *verts, int nvtx,
                         float *scratch, int scratch_cap,
                         dyt_roi_stats_t *out);
+
+/* ------------------------------------------------------ polygon placement */
+
+/* How many sides the polygon tool draws.  The tool is a *drag*, like the box:
+ * the user pulls out a rectangle and gets a pentagon inscribed in it, so the
+ * shape is a property of the two points, not of a list of clicks. */
+#define DYT_POLYGON_SIDES 5
+
+/* The DYT_POLYGON_SIDES vertices of a regular pentagon stretched to fill the
+ * box (x0,y0)..(x1,y1), in source pixels and in order, written to `out`.
+ *
+ * "Stretched" is the point: the pentagon is scaled independently on each axis,
+ * so it touches all four sides of the box whatever its aspect ratio.  A
+ * *regular* pentagon fitted to the box would have to leave slack on the longer
+ * axis, and then the shape would not follow the rectangle the user dragged.
+ * The vertex order runs clockwise from the top: top-centre, upper-right,
+ * lower-right, lower-left, upper-left.
+ *
+ * The corners are normalised first, so either point may be the top-left. */
+void dyt_polygon_fit_box(int x0, int y0, int x1, int y1,
+                         dyt_point_t out[DYT_POLYGON_SIDES]);
 
 /* --------------------------------------------------------- isotherm / area */
 

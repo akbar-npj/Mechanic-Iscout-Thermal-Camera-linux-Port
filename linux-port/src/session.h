@@ -93,14 +93,13 @@ typedef struct {
     dyt_tool_t  tool;         /* which tool is active */
     dyt_point_t p0, p1;       /* the placed points, in source pixels */
 
-    /* The polygon tool's outline, in source pixels.  `poly_closed` is the
-     * placement state, not the geometry: the region is always measured as a
-     * closed shape, and the flag only says whether the user has declared the
-     * outline finished (so the next vertex starts a new one instead of
-     * extending it). */
-    int         poly_n;                           /* vertices placed, 0..MAX */
-    dyt_point_t poly[DYT_POLYGON_MAX_VTX];
-    int         poly_closed;
+    /* The polygon tool's outline, in source pixels.  It is *derived*, not
+     * placed: the polygon is a drag tool like the box, and the snapshot fits a
+     * DYT_POLYGON_SIDES-sided shape to the p0/p1 box (dyt_polygon_fit_box).
+     * So `poly_n` is DYT_POLYGON_SIDES whenever the tool is POLYGON and the box
+     * is placed, and 0 otherwise — there is no half-drawn outline to report. */
+    int         poly_n;                           /* 0, or DYT_POLYGON_SIDES */
+    dyt_point_t poly[DYT_POLYGON_SIDES];
 
     int   point_ok;           /* 1 when tool == POINT and p0 has a reading */
     float point_c;            /* the reading at p0, Celsius */
@@ -356,46 +355,73 @@ void dyt_session_set_tool(dyt_session_t *s, dyt_tool_t t);
  * simply reports no reading, rather than the front-end having to clamp. */
 void dyt_session_set_point(dyt_session_t *s, int which, int x, int y);
 
-/* Forget the whole measurement — both points and the polygon outline (the
- * viewer's "n" key).  One action rather than one per tool: a front end has a
- * single "clear" affordance, and leaving a polygon behind after the user
- * cleared would be a measurement they cannot see the provenance of. */
+/* Forget the whole measurement — both points, and with them whatever shape
+ * they were describing (the viewer's "n" key).  One action rather than one per
+ * tool: a front end has a single "clear" affordance. */
 void dyt_session_clear_points(dyt_session_t *s);
 
-/* ---- the polygon tool ---------------------------------------------------
- * The outline is the vertices the user placed, in source pixels.  The session
- * closes it automatically, so the region is measured as soon as the third
- * vertex lands and updates with each further one; there is no "commit" step.
- * Until then the tool reports no reading, which is the honest answer for a
- * region that does not exist yet. */
-
-/* Add one vertex.  While the outline is closed this *starts a new one* rather
- * than extending the finished shape — the standard polygon-tool gesture, and
- * the reason the closed flag exists at all.
+/* ---- moving and resizing a placed region --------------------------------
+ * The vendor's own model (CAAnalyzer.decompiled.cs, `SelsectShape` and
+ * `stretchShape`): a placed rectangle is dragged around by its *body* and
+ * resized by any of eight handles — the four corners and the four edge
+ * midpoints.  The port keeps the geometry in the session, so both operations
+ * are session calls and the reading follows on the next frame exactly as a
+ * fresh placement does; a front end that moved the points itself would be a
+ * second copy of the clamp rules.
  *
- * Returns 0 when the vertex was taken, -1 when the outline is full
- * (DYT_POLYGON_MAX_VTX vertices and not closed) or on a bad argument.  A full
- * outline is refused rather than recycled, because silently dropping the shape
- * the user was drawing would lose their work; the front end says so and the
- * user closes it or undoes a vertex. */
-int dyt_session_polygon_add(dyt_session_t *s, int x, int y);
+ * Both tools that place a region share this: the box *and* the polygon, whose
+ * five vertices are derived from the same two points.  Moving or resizing a
+ * pentagon is therefore moving or resizing its bounding box, and the shape
+ * follows.
+ *
+ * The handle numbering is the vendor's, because the front end draws them and
+ * the two must agree about which is which:
+ *
+ *      0 --- 1 --- 2        0 top-left       4 bottom-right
+ *      |           |        1 top-middle     5 bottom-middle
+ *      7           3        2 top-right      6 bottom-left
+ *      |           |        3 right-middle   7 left-middle
+ *      6 --- 5 --- 4
+ */
+#define DYT_ROI_HANDLES 8
 
-/* Take back the most recent vertex, and reopen a closed outline — the user is
- * stepping back through the shape, so it must accept vertices again.  Returns
- * the number of vertices left, or -1 on a bad argument. */
-int dyt_session_polygon_undo(dyt_session_t *s);
+/* The smallest a stretched region may become, on either axis.  The vendor's
+ * own floor is 5 raw pixels, in `SelsectShape`'s corner case, where the dragged
+ * corner stops that far short of the region's own opposite edge
+ * (`num6 -= point.X + num6 - (sHAPE_COM2.max_p.X - 5)`).  It is what stops a
+ * handle dragged past its opposite edge from inverting the region into an empty
+ * one.  It is applied only to the axes the handle actually moves, and the
+ * result is clamped into the frame, so a frame smaller than this cannot push an
+ * edge out of bounds. */
+#define DYT_ROI_MIN 5
 
-/* Declare the outline finished (or reopen it).  Closing with fewer than three
- * vertices does nothing: a region needs three, so the flag would claim a shape
- * that cannot exist. */
-void dyt_session_set_polygon_closed(dyt_session_t *s, int closed);
+/* Move the region so its top-left corner lands on (x, y) — the *absolute*
+ * form, which is what a drag wants.  A front end keeps the pointer's offset
+ * from the grab and calls this, so a move that was clamped does not leave the
+ * region lagging behind the pointer.  The region is clamped as a whole: it
+ * stops at the frame's edge rather than being partly cropped, which would
+ * silently change what is being measured.
+ *
+ * Returns 0, or -1 on a bad argument, no frame yet, or no region to move. */
+int dyt_session_roi_move_to(dyt_session_t *s, int x, int y);
 
-/* Replace the whole outline.  `n` above DYT_POLYGON_MAX_VTX, or a NULL list
- * with n > 0, is refused rather than truncated — dropping a vertex would move
- * the boundary the user drew.  Replaces the placement, so any previous close
- * is cleared with it. */
-void dyt_session_set_polygon_pts(dyt_session_t *s, const dyt_point_t *pts,
-                                 int n);
+/* Put the dragged `handle` at (x, y).  The point is clamped into the frame and
+ * the region is kept at least DYT_ROI_MIN wide and tall, so the opposite edge
+ * never crosses the one being dragged.  A middle handle moves one axis only.
+ *
+ * Returns 0, or -1 on a bad argument, an out-of-range handle, no frame yet, or
+ * no region. */
+int dyt_session_roi_stretch(dyt_session_t *s, int handle, int x, int y);
+
+/* ---- the polygon tool ---------------------------------------------------
+ * The polygon is placed like the box: a press sets the first corner, the drag
+ * the second, and the shape is a DYT_POLYGON_SIDES-sided figure fitted to the
+ * box between them.  There is no click-by-click outline and no commit step —
+ * the shape exists as soon as the drag does, and it is always closed.
+ *
+ * The vertices are not stored: the snapshot derives them from p0/p1 every time
+ * (see dyt_polygon_fit_box), so a moved or resized polygon is simply a moved or
+ * resized box, and the two tools cannot drift apart. */
 
 /* Copy the current line profile into `out` (cap floats).  Returns the number
  * of points written, -1 if there is no frame, or the negated requirement if
