@@ -38,7 +38,7 @@ MainWindow : QWidget
     │                                 camera serial and the fps
     └── ControlPanel (stretch 0)  right panel: QTabWidget
         ├── "Troubleshoot"        Circuit Mode / Temperature Measurement /
-        │                         Analysis / High Temperature / Image
+        │                         Mark / Analysis / High Temperature / Image
         │                         Enhancement / Capture
         ├── "3D Analysis"         a height-mapped surface of the frame
         ├── "Comparison"          a saved reference vs the live frame
@@ -59,13 +59,14 @@ against the session.
 ### The control panel
 
 `ControlPanel` is the Windows counterpart's right column: a `QTabWidget` whose
-**Troubleshoot** tab holds six checkable `QGroupBox`es — Circuit Mode
+**Troubleshoot** tab holds seven checkable `QGroupBox`es — Circuit Mode
 (Short-circuit / Large Current Leakage / Small Current Leakage), Temperature
-Measurement (Spot / Line / Rectangle / Polygon / None), Analysis (Line / Chart
-analysis), High Temperature (Tracking / Alarm / Highlight), Image Enhancement
-(the two flips, Fixed range and Rapid Diagnostics) and Capture (Still / Record /
-Gallery). All but Capture are the reference's own groups, in its own order;
-Capture is this port's addition. Every group the panel shows is backed by the
+Measurement (Spot / Line / Rectangle / Polygon / None), Mark (Text), Analysis
+(Line / Chart analysis), High Temperature (Tracking / Alarm / Highlight), Image
+Enhancement (the two flips, Fixed range and Rapid Diagnostics) and Capture (Still
+/ Record / Gallery). All but Capture and Mark are the reference's own groups, in
+its own order; Capture is this port's addition, and Mark is the annotation half
+of the reference's Mark buttons. Every group the panel shows is backed by the
 engine — there is no longer a tab that waits for its feature. The **3D
 Analysis**, **Comparison** and **Circuit Design** tabs sit between Troubleshoot
 and Super Resolution, where the Windows panel puts them: see below.
@@ -88,6 +89,35 @@ whole palette without the user hunting for one. Its arithmetic is the vendor's
 verbatim, truncating cast and all (see `dyt_vm_rapid_window()` in
 `src/view_model.h`), and pressing it twice changes nothing — the second press
 reads the frame again, not the window the first one latched.
+
+**Mark** is the reference's annotation tool — `DRAW_CODE.Label` and
+`DRAW_CODE.Arrow` (`CAAnalyzer.decompiled.cs:7159`) — and only the annotation
+half of it lives here: the label, with the arrow to follow. A Mark is not a
+measurement, so there is no engine call behind it and no `DYT_TOOL_*` for it; the
+list of labels is the front end's, held on `FrameView` in **source pixels** for
+the same reason the measurement overlay is, so a zoom, a flip or a rotation
+carries a label with the pixel it names. `T` arms the Text tool, a click in the
+picture asks for the string through `on_mark_text_` (a `QInputDialog` in the
+window, a stub under `--selftest`, exactly as `on_about_` is), and the label
+lands on the pixel the click names — `widget_to_source()` is `pointer()`'s own
+inverse, factored out so a label and a point placed by the same click cannot
+disagree. A click outside the picture puts the tool away and places nothing
+(the vendor refuses one at `:10250`), and a cancelled prompt leaves the tool
+armed so the next click can try again. The chip is a plate with the text, a
+leader down to a dot on the pixel, clamped inside the picture by `kMarkInset` so
+a label on the last row is pulled back rather than drawn half off the canvas —
+the vendor fills a rectangle behind its own label for the same reason
+(`M_DarwString`, `:14002`).
+
+A Mark is a *tool*, so it shares one exclusive button group with the measurement
+rows: arming one clears the session's tool and picking a measurement tool clears
+the Mark, mirroring the vendor's single `cursor_code`. That is why the Mark rows
+are a separate group *box* but not a separate button group — two groups would
+have needed the `None` row unchecked while the Mark row was checked, and Qt
+refuses to uncheck the checked button of an exclusive group. Assertion 68 pins
+the whole path: the row, the key, the placement pixel, the painted chip (by
+difference against the same canvas with no mark), the disarm, the off-image
+refusal, the cancelled prompt and the one-tool rule in both directions.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -767,6 +797,7 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 |---|---|
 | `p` / `l` / `b` / `o` | point / line / box / polygon |
 | `n` | no tool, and forget the placed points and the polygon outline |
+| `T` | Mark: arm the text tool (a second press puts it away) |
 | Enter / right button | finish the polygon outline |
 | Backspace | take back the last polygon vertex |
 | `c` | chart analysis: annotate the line's profile (picks up the line tool) |
@@ -1270,8 +1301,8 @@ $ ./build/dytqt --selftest
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (1172x877, 64 distinct colours)
-  ok   the canvas is not clipped (660x821, wants 660x400)
+  ok   the canvas painted (1172x942, 64 distinct colours)
+  ok   the canvas is not clipped (660x886, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
         line 2: tool: none (p point, l line, b box, o polygon, n clear)
@@ -1320,7 +1351,7 @@ $ ./build/dytqt --selftest
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x877 yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x942 yes)
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
@@ -1328,14 +1359,15 @@ $ ./build/dytqt --selftest
   ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
-  ok   the control panel cannot take the keyboard (30 control(s), 0 that would)
+  ok   the Mark Text tool places a label at the clicked pixel and paints it there (row yes, key yes, place yes, painted yes, disarms yes, off-image yes, cancel yes, one tool yes)
+  ok   the control panel cannot take the keyboard (31 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
-  ok   the control panel asks for its content's height (panel 877 of 877, page 851 of 851, shrinks yes, keeps yes, scrolls yes)
+  ok   the control panel asks for its content's height (panel 942 of 942, page 916 of 916, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
@@ -1516,7 +1548,7 @@ worth naming one by one:
   somewhere else while looking entirely plausible.
 
 The last stretch of the parity work — the Windows panel's remaining controls —
-added four more. **64** is the colour bar's two range handles: it reads their
+added five more. **64** is the colour bar's two range handles: it reads their
 geometry off the widget, finds the hot handle's pixel in a render, drags one and
 requires the session to hold the window the drag produced, then double-clicks
 back to auto. **65** is Rapid Diagnostics, and its second half is the one that
@@ -1527,7 +1559,15 @@ circuit modes and requires each to set the range the vendor's own handler sets,
 that only Small Current Leakage moves the panel to the 3D tab, and that the
 checkmark follows. **67** separates the 3D page's two height modes by counting
 clamped vertices under a window narrower than the frame, and requires every
-drawn height to be inside [0, 1] — the vendor's clamp. The alarm's threshold
+drawn height to be inside [0, 1] — the vendor's clamp. **68** is the Mark Text
+tool, and it is the one assertion here that pins a feature with no engine behind
+it: the row and the key, that `T` was not folded into `t` (the range must not
+have moved), that the label lands on the source pixel the click names, that the
+chip is painted at that pixel's projection — asserted by *difference* against the
+same canvas with no mark, so an overlay that was already there cannot satisfy it
+— that the tool disarms after a placement, that a click off the picture places
+nothing, that a cancelled prompt leaves the tool armed, and that the Mark and the
+measurement tools clear each other in both directions. The alarm's threshold
 field is pinned where it is defined rather than through the window: `a` must arm
 at the field's value (assertion 25), the field's clamp and the vendor's rounding
 are `view_model_test`'s, the height ranges are `surface_test`'s, and the fixed

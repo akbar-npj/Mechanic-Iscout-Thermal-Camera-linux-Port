@@ -48,6 +48,7 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QImage>
+#include <QInputDialog>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QListWidget>
@@ -130,6 +131,21 @@ static const int kLineH   = 16;  /* one status line */
 static const int kStripPad = 4;  /* the strip's own margin */
 static const int kDotW    = 9;   /* the connection dot's diameter */
 static const int kDotGap  = 6;   /* dot -> line 3's text */
+
+/* The Mark tool's kinds.  The vendor's DRAW_CODE carries Label and Arrow
+ * (CAAnalyzer.decompiled.cs:7159, :7169) beside the shape and point editors;
+ * the port's Mark is the two *annotations*, which are the two with no engine
+ * measurement behind them — nothing about a label is measured or written to
+ * the device, so the whole feature lives in the front end.  A front-end enum
+ * rather than a DYT_TOOL_*: the engine has no notion of a label, and adding
+ * one it can never act on would be a lie in the session's state. */
+enum MarkKind { MarkNone = 0, MarkText, MarkArrow };
+
+/* How far a Mark's chip is kept inside the picture.  A label placed on the
+ * last row or column would otherwise have its plate drawn half off the canvas
+ * — unreadable, and unreachable by a drag — so the plate is pulled back from
+ * the edge while its leader still points at the pixel it names. */
+static const int kMarkInset = 4;
 
 /* ------------------------------------------------------------------ theme
  *
@@ -1395,6 +1411,11 @@ public:
     {
         if (!apply_measure_key(sess_, k, alarm_setpoint_))
             return 0;
+        /* One tool at a time: picking a measurement tool puts the Mark tool
+         * away, exactly as the vendor's single `cursor_code` does.  The alarm
+         * and isotherm keys are not tools, so they leave it alone. */
+        if (k != 'a' && k != 'i')
+            mark_mode_ = MarkNone;
         resnap();
         return 1;
     }
@@ -1485,6 +1506,88 @@ public:
             return;
         dyt_session_set_range_mode(sess_, m);
         resnap();
+    }
+
+    /* ---- the Mark annotations -------------------------------------------
+     *
+     * A mark is a source pixel and the text placed there, held in source
+     * pixels so a zoom, a flip or a rotation carries it with the pixel it
+     * names — the same rule the measurement overlay follows, and the vendor's
+     * too (it stores `ShowToBit(location)` and draws at `rawPointToShow`).
+     * The list is the front end's because nothing here is measured: there is
+     * no engine call behind a label, which is why the tool is not a
+     * DYT_TOOL_*.
+     */
+    struct MarkLabel {
+        float   x = 0.0f, y = 0.0f;   /* source pixel */
+        QString text;
+    };
+
+    /* The Mark tool, and the one-tool-at-a-time rule.  Picking a mark puts
+     * the measurement tool away and vice versa (measure_key() does the other
+     * half): the vendor has a single `cursor_code`, and a click that placed a
+     * label *and* a point would be two tools at once. */
+    void set_mark_mode(int m)
+    {
+        mark_mode_ = m;
+        if (m != MarkNone && sess_) {
+            dyt_session_set_tool(sess_, DYT_TOOL_NONE);
+            resnap();
+        }
+        update();
+    }
+    int mark_mode() const { return mark_mode_; }
+
+    /* Place a label at a source pixel.  Empty text is refused rather than
+     * stored: a chip with nothing in it is a mark the user cannot read or
+     * find again.  The pixel is clamped into the frame so a label can never
+     * be stored somewhere project() would refuse to draw it. */
+    bool add_mark(const QPointF &src, const QString &text)
+    {
+        if (text.isEmpty() || snap_.width <= 0 || snap_.height <= 0)
+            return false;
+        MarkLabel m;
+        m.x = (float)std::max(0.0, std::min((double)snap_.width - 1,
+                                            (double)src.x()));
+        m.y = (float)std::max(0.0, std::min((double)snap_.height - 1,
+                                            (double)src.y()));
+        m.text = text;
+        marks_.push_back(m);
+        update();
+        return true;
+    }
+
+    void clear_marks() { marks_.clear(); update(); }
+    size_t mark_count() const { return marks_.size(); }
+    const MarkLabel &mark_at(size_t i) const { return marks_[i]; }
+
+    /* Asked for a label's text at a source pixel.  A callback rather than the
+     * dialog inline, so --selftest can place a label without a modal window —
+     * the same reason on_about_ is one.  A null callback, or an empty answer,
+     * refuses the click. */
+    std::function<QString(const QPointF &)> on_mark_text_;
+
+    /* The widget position of a source pixel, and its inverse.  The inverse is
+     * pointer()'s own mapping, factored out so a click that places a label
+     * and a click that places a point cannot disagree about which pixel they
+     * landed on. */
+    bool widget_to_source(const QPointF &pos, QPointF *src) const
+    {
+        if (img_.isNull() || snap_.width <= 0 || snap_.height <= 0 || !src)
+            return false;
+        const double  s   = display_scale();
+        const QPointF org = display_origin();
+        const int lx = (int)std::floor((pos.x() - org.x()) / s - kPad);
+        const int ly = (int)std::floor((pos.y() - org.y()) / s - kPad);
+        int sx = 0, sy = 0;
+        if (dyt_view_transform_map(&snap_.xform, snap_.width, snap_.height,
+                                   img_.width(), img_.height(), lx, ly,
+                                   &sx, &sy) != 0)
+            return false;
+        if (sx < 0 || sy < 0 || sx >= snap_.width || sy >= snap_.height)
+            return false;
+        *src = QPointF(sx, sy);
+        return true;
     }
 
     /* Apply a runtime-parameter key.  `raw` is the *unfolded* character, so
@@ -1940,6 +2043,26 @@ protected:
             e->accept();
             return;
         }
+        /* Then the Mark tool, which is the front end's own — a click in the
+         * picture asks for the text and places it.  The vendor refuses a click
+         * outside the image and puts the tool away (:10250), and so does this:
+         * a label stored off the frame could never be drawn.  A placed label
+         * disarms the tool (one label per click, as the vendor's
+         * `cursor_code = None` does); a cancelled one leaves it armed so the
+         * next click can try again. */
+        if (mark_mode_ == MarkText) {
+            QPointF src;
+            if (!widget_to_source(e->position(), &src)) {
+                set_mark_mode(MarkNone);
+            } else {
+                const QString t = on_mark_text_ ? on_mark_text_(src)
+                                                : QString();
+                if (add_mark(src, t))
+                    set_mark_mode(MarkNone);
+            }
+            e->accept();
+            return;
+        }
         pointer(DYT_VM_MOUSE_DOWN, e->position());
         e->accept();
     }
@@ -2269,6 +2392,22 @@ protected:
             }
         }
 
+        /* The Mark labels.  Over the measurement shapes — a label is the
+         * user's own note, and hiding it behind a box it happens to sit in
+         * would be the wrong way round — and under the two panels.  Each is
+         * projected with the same lambda the measurements use, so a label and
+         * a marker placed on the same pixel cannot land apart, and the chip is
+         * clamped into the picture so a label at the edge stays readable. */
+        if (!marks_.empty()) {
+            const QRect bounds(x0, y0, dw, dh);
+            for (const MarkLabel &m : marks_) {
+                QPoint q;
+                if (!proj((int)std::lround(m.x), (int)std::lround(m.y), q))
+                    continue;
+                draw_mark_chip(p, q, m.text, bounds);
+            }
+        }
+
         /* The two panels, and the confirmation last so it sits over every
          * other overlay.  The rows and the wording are the view model's; only
          * the placement is here. */
@@ -2324,6 +2463,74 @@ private:
         p.setClipRect(QRect(kPad, kPad, under.width(), under.height()));
         p.setOpacity(layout_opacity_ / 100.0);
         p.drawImage(dst, lay);
+        p.restore();
+    }
+
+    /* One Mark label: a small plate holding the text, joined to the pixel it
+     * names by a leader, with a dot on the pixel itself.  The plate is what
+     * makes a label readable over any picture — the vendor's own label
+     * drawing fills a rectangle behind the string (M_DarwString, :14002) —
+     * and the leader is what keeps the text and the pixel from being confused
+     * when several labels sit close together.
+     *
+     * The plate is clamped into the picture by kMarkInset, so a label placed
+     * on the last row or column is pulled back inside rather than drawn half
+     * off the canvas.  `bounds` is the picture's canvas rectangle. */
+    void draw_mark_chip(QPainter &p, const QPoint &anchor, const QString &text,
+                        const QRect &bounds)
+    {
+        p.save();
+
+        /* One point smaller than the canvas font, so a chip reads as a note
+         * beside the picture rather than as part of it. */
+        QFont f = p.font();
+        if (f.pointSize() > 8)
+            f.setPointSize(f.pointSize() - 1);
+        p.setFont(f);
+        const QFontMetrics fm(f);
+
+        const int pad = 3;
+        const int tw  = fm.horizontalAdvance(text) + 2 * pad;
+        const int th  = fm.height() + 2 * pad;
+
+        QRect in = bounds.adjusted(kMarkInset, kMarkInset,
+                                   -kMarkInset, -kMarkInset);
+        /* A picture narrower than the plate (or than the two insets) cannot
+         * hold it with the margin, so the whole picture is used instead —
+         * the clamp still keeps the plate inside the canvas. */
+        if (in.width() < tw || in.height() < th)
+            in = bounds;
+
+        /* To the upper right of the pixel, as the measurement labels are. */
+        int x = anchor.x() + 9;
+        int y = anchor.y() - th - 3;
+        x = std::max(in.left(), std::min(in.right()  - tw + 1, x));
+        y = std::max(in.top(),  std::min(in.bottom() - th + 1, y));
+        const QRect r(x, y, tw, th);
+
+        /* The leader first, so the plate and the dot cover its two ends. */
+        const QPoint to(x, y + th / 2);
+        p.setPen(QPen(QColor(0, 0, 0), 3));
+        p.drawLine(anchor, to);
+        p.setPen(QPen(QColor(255, 255, 0), 1));
+        p.drawLine(anchor, to);
+
+        /* The plate, then the text on it. */
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 200));
+        p.drawRect(r);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QColor(255, 255, 0));
+        p.drawRect(r.adjusted(0, 0, -1, -1));
+        p.setPen(QColor(255, 255, 255));
+        p.drawText(r.adjusted(pad, 0, -pad, 0),
+                   Qt::AlignLeft | Qt::AlignVCenter, text);
+
+        /* The pixel itself, over the leader's end. */
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(255, 255, 0));
+        p.drawEllipse(anchor, 2, 2);
+
         p.restore();
     }
 
@@ -2474,6 +2681,11 @@ private:
     int                       layout_dx_ = 0, layout_dy_ = 0;
     int                       layout_opacity_ = 100;
     bool                      layout_shown_ = false;
+
+    /* The Mark annotations and the tool that places them (see set_mark_mode).
+     * `mark_mode_` is a MarkKind; the list is in source pixels. */
+    std::vector<MarkLabel>    marks_;
+    int                       mark_mode_ = MarkNone;
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -3871,6 +4083,7 @@ public:
         RapidDiag,
         LeakShort, LeakLarge, LeakSmall,
         SurfShape, SurfColor,
+        MarkTextRow,
         Still, Record, Gallery,
         SrOff, SrVisible, SrThermal,
         N_Ids
@@ -3906,12 +4119,13 @@ public:
         tabs_->addTab(build_super_resolution(),
                       QStringLiteral("Super Resolution"));
 
-        /* The circuit mode's and the height mode's checkmarks are this panel's
-         * own state, so they have to be lit from the same sources sync() uses
-         * — a frame will not arrive before the first paint on the fixture
-         * path. */
+        /* The circuit mode's, the height mode's and the Mark tool's checkmarks
+         * are this panel's own state, so they have to be lit from the same
+         * sources sync() uses — a frame will not arrive before the first paint
+         * on the fixture path. */
         sync_leak_marks();
         sync_surface_marks();
+        sync_mark_marks(MarkNone);
     }
 
     /* A click on the control whose key is `key`.  Set by MainWindow, which owns
@@ -4088,6 +4302,16 @@ public:
         set_checked(btn_[SurfColor], m == DYT_SURFACE_COLOR);
     }
 
+    /* The Mark tool's row.  `mode` is a MarkKind, held by the canvas (the
+     * marks are the front end's, so the canvas owns the tool that places
+     * them); this only mirrors it onto the row.  It shares the tools' button
+     * group, so checking it clears whichever tool row was lit. */
+    void sync_mark_marks(int mode)
+    {
+        mark_mode_ = mode;
+        set_checked(btn_[MarkTextRow], mode == MarkText);
+    }
+
     /* The 3D page's height mode.  Held by the SurfaceView (it is an input to
      * the mesh), so this only forwards and re-lights the rows; the pump
      * rebuilds the grid on its next frame. */
@@ -4099,18 +4323,25 @@ public:
     }
 
     /* Bring every checkmark up to date with the frame just painted.  The
-     * session-derived states come from `snap`; the four that live on the
+     * session-derived states come from `snap`; the five that live on the
      * canvas, the window or this panel (the marker toggle, a running clip, an
-     * open gallery, the circuit mode) are passed in or held here, because they
-     * are not in the snapshot. */
+     * open gallery, the circuit mode, the Mark tool) are passed in or held
+     * here, because they are not in the snapshot. */
     void sync(const dyt_snapshot_t &snap, bool hot_shown, bool recording,
-              bool gallery_open)
+              bool gallery_open, int mark_mode)
     {
+        sync_mark_marks(mark_mode);
         set_checked(btn_[Spot],      snap.tool == DYT_TOOL_POINT);
         set_checked(btn_[Line],      snap.tool == DYT_TOOL_LINE);
         set_checked(btn_[Rect],      snap.tool == DYT_TOOL_BOX);
         set_checked(btn_[Poly],      snap.tool == DYT_TOOL_POLYGON);
-        set_checked(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE);
+        /* A Mark tool is a tool: arming one puts the session's tool to NONE
+         * (the vendor's single `cursor_code` does the same), so the Mark row
+         * and the Tool None row must never both be lit.  Both are in the one
+         * exclusive group, and the Mark row was set above, so this only has to
+         * decline to light Tool None. */
+        set_checked(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE &&
+                                     mark_mode_ == MarkNone);
         /* The Analysis pair tracks the chart's mode, not the tool: "Chart
          * analysis" leaves the line tool selected, so a tool-derived checkmark
          * would light the wrong row. */
@@ -4302,6 +4533,20 @@ private:
         for (Id i : { Spot, Line, Rect, Poly, ToolNone })
             mgrp->addButton(row(meas, i, tool_label(i), tool_key(i), true));
         lay->addWidget(meas);
+
+        /* Mark — the annotations, which the vendor's DRAW_CODE carries beside
+         * the shape and point editors (:7159).  Its own *group box*, because
+         * nothing about a label is measured or written to the device, but the
+         * same exclusive button group as the tools above: the vendor has a
+         * single `cursor_code`, so exactly one of the six rows is lit and
+         * arming a Mark clears the measurement tool (see set_mark_mode).  Two
+         * groups would have needed the Tool None row *unchecked* while the Mark
+         * row was checked, and Qt refuses to uncheck the checked button of an
+         * exclusive group — which is why this is one group and not two. */
+        QGroupBox *mark = group(QStringLiteral("Mark"));
+        mgrp->addButton(row(mark, MarkTextRow, QStringLiteral("Text"),
+                            'T', true));
+        lay->addWidget(mark);
 
         /* Analysis — one chart, two presentations of it, in the reference's
          * order and with its labels.  The reference's manual never describes
@@ -4931,6 +5176,15 @@ private:
             }
             p.setBrush(Qt::NoBrush);
             break;
+        case MarkTextRow:
+            /* a note pinned to a pixel: the plate, the leader and the dot the
+             * canvas draws, so the row and what it places look alike. */
+            p.drawRect(cx - 7, cy - 7, 13, 8);
+            p.drawLine(cx - 3, cy + 1, cx - 3, cy + 4);
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawEllipse(QPointF(cx - 3, cy + 6), 1.6, 1.6);
+            break;
         case Still:
             /* a camera */
             p.drawRect(cx - 7, cy - 4, 14, 9);
@@ -4983,6 +5237,10 @@ private:
     QPushButton *btn_[N_Ids] = {};
     ProfilePlot *plot_ = nullptr;        /* the Analysis group's chart */
     int          leak_mode_ = DYT_LEAK_SHORT;  /* the circuit-mode rows */
+    /* The Mark tool the canvas is holding, as the last sync reported it.  A
+     * MarkKind; it decides the Tool None row, because arming a Mark puts the
+     * session's tool to NONE. */
+    int          mark_mode_ = MarkNone;
     QLabel      *sr_status_ = nullptr;   /* the Super Resolution tab's readout */
     QLabel      *ref_path_  = nullptr;   /* the Comparison tab's reference path */
     QLabel      *ref_stats_ = nullptr;   /* the Comparison tab's difference stats */
@@ -6203,6 +6461,18 @@ public:
             return 1;
         }
 
+        /* The Mark annotations, on their shift forms — 't' is the fixed-range
+         * toggle, so the Text tool is 'T'.  Above the fold, or the shift would
+         * be erased and the range would flip instead of a label being armed.
+         * A second press puts the tool away, so the key that armed it also
+         * disarms it (the vendor's label button toggles the same way). */
+        if (raw == 'T' && view_) {
+            view_->set_mark_mode(view_->mark_mode() == MarkText ? MarkNone
+                                                                : MarkText);
+            sync_actions();
+            return 1;
+        }
+
         /* How the picture is shown: palette, unit, range, flip, zoom, fusion.
          * Routed with the unfolded character, because two of the bindings are
          * Shift forms ('H' flips vertically where 'h' flips horizontally) and
@@ -6357,12 +6627,13 @@ private:
      * states, which is what the canvas is still showing. */
     void sync_actions()
     {
-        /* The panel's checkmarks, from the snapshot plus the three states that
+        /* The panel's checkmarks, from the snapshot plus the four states that
          * live on the canvas or the window. */
         if (panel_)
             panel_->sync(snap_, view_ && view_->hot_shown(),
                          strip_ && !strip_->recording_label().isEmpty(),
-                         gal_.open != 0);
+                         gal_.open != 0,
+                         view_ ? view_->mark_mode() : MarkNone);
 
         /* The Analysis chart.  The profile is read here rather than in the
          * panel, so the widget stays free of the session and its lock — and
@@ -6773,6 +7044,7 @@ struct key_line_t {
 
 static const key_line_t kKeyLines[] = {
     { "measurement", "  p l b o n     point / line / box / polygon / clear\n" },
+    { "measurement", "  T             Mark: place a text label\n" },
     { "measurement", "  enter bksp    polygon: finish the outline / undo a vertex\n" },
     { "measurement", "  c             Analysis: annotate the line's chart\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
@@ -10537,6 +10809,182 @@ static int selftest(const opts &o)
                 fails++;
         }
 
+        /* ---- 68. The Mark Text annotation ---------------------------------
+         *
+         * A Mark is the front end's own — there is no engine call behind a
+         * label — so what is pinned is the whole path: 'T' arms the tool, a
+         * click asks for the text and lands the label on the source pixel the
+         * click names, the chip is painted at that pixel's projection, and the
+         * tool puts itself away.  The text comes from on_mark_text_ (a dialog
+         * in the real window), stubbed here for the same reason on_about_ is.
+         *
+         * 'T' is a shift form of 't', so the range must not have moved: a fold
+         * that reached the view keys would have flipped the range instead of
+         * arming the tool.  And the chip is asserted by *difference* against
+         * the same canvas with no mark, so "it painted something" cannot be
+         * satisfied by an overlay that was already there. */
+        {
+            bool rows_ok = false, key_ok = false, place_ok = false,
+                 pixel_ok = false, disarm_ok = false, off_ok = false,
+                 cancel_ok = false, one_tool_ok = false;
+
+            if (view && fv && panel) {
+                send_char(27);
+                panel->tabs()->setCurrentIndex(ControlPanel::TabTroubleshoot);
+                send_char('n');            /* a clean tool state to start from */
+                dyt_session_reset_view(sess);
+                pm.step();
+
+                view->clear_marks();
+
+                QPushButton *bt = panel->button(ControlPanel::MarkTextRow);
+                rows_ok = bt && bt->text() == QStringLiteral("Text") &&
+                          bt->isEnabled();
+
+                /* The source pixel the click below names, read through the
+                 * mapping the placement itself uses. */
+                const QSize is = view->imageSize();
+                const int   lx = 100, ly = 120;
+                dyt_snapshot_t s0{};
+                dyt_session_snapshot(sess, &s0, nullptr, 0);
+                int ex = -1, ey = -1;
+                const bool mapped =
+                    dyt_view_transform_map(&s0.xform, s0.width, s0.height,
+                                           is.width(), is.height(),
+                                           lx, ly, &ex, &ey) == 0;
+
+                /* The picture before the mark, so "was the chip painted?" is a
+                 * difference rather than a guess about colours. */
+                const QImage before = view->render_canvas();
+
+                int prompts = 0;
+                view->on_mark_text_ = [&](const QPointF &) {
+                    prompts++;
+                    return QStringLiteral("T1");
+                };
+
+                dyt_snapshot_t sb{};
+                dyt_session_snapshot(sess, &sb, nullptr, 0);
+                send_char('T');
+                dyt_snapshot_t sa{};
+                dyt_session_snapshot(sess, &sa, nullptr, 0);
+                /* The row follows the tool, and the Tool None row goes out
+                 * while it is armed: a Mark is a tool, so lighting both would
+                 * claim two at once.  The arm came from the keyboard, so a
+                 * checkmark that only tracked the *click* would stay dark. */
+                QPushButton *bn = panel->button(ControlPanel::ToolNone);
+                key_ok = view->mark_mode() == MarkText && mapped &&
+                         sa.range_mode == sb.range_mode &&
+                         bt && bt->isChecked() && bn && !bn->isChecked();
+
+                send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
+                           Qt::LeftButton, lx, ly);
+
+                place_ok = view->mark_count() == 1 && prompts == 1 && mapped &&
+                           (int)std::lround(view->mark_at(0).x) == ex &&
+                           (int)std::lround(view->mark_at(0).y) == ey &&
+                           view->mark_at(0).text == QStringLiteral("T1");
+                /* One label per click, as the vendor's `cursor_code = None`
+                 * after a placement does. */
+                disarm_ok = view->mark_mode() == MarkNone;
+
+                /* The chip is on the canvas at the pixel's own projection: the
+                 * dot beside the plate is the mark colour, and none of it was
+                 * there before.  A 9x9 window around the anchor, because the
+                 * dot is a 2px-radius ellipse. */
+                const QImage after = view->render_canvas();
+                auto yellow_near = [](const QImage &im, int cx, int cy) {
+                    int n = 0;
+                    for (int y = cy - 4; y <= cy + 4; y++)
+                        for (int x = cx - 4; x <= cx + 4; x++) {
+                            if (x < 0 || y < 0 ||
+                                x >= im.width() || y >= im.height())
+                                continue;
+                            const QRgb c = im.pixel(x, y);
+                            if (qRed(c) == 255 && qGreen(c) == 255 &&
+                                qBlue(c) == 0)
+                                n++;
+                        }
+                    return n;
+                };
+                int ox = 0, oy = 0;
+                const bool proj_ok =
+                    dyt_view_transform_project(&sa.xform, sa.width, sa.height,
+                                               is.width(), is.height(),
+                                               ex, ey, &ox, &oy) == 0;
+                const int ax = kPad + ox, ay = kPad + oy;
+                pixel_ok = proj_ok &&
+                           yellow_near(before, ax, ay) == 0 &&
+                           yellow_near(after,  ax, ay) >= 6;
+
+                /* Off the picture: the tool is put away and nothing placed,
+                 * rather than a label stored where project() could never draw
+                 * it.  The prompt must not even be asked. */
+                send_char('T');
+                send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
+                           Qt::LeftButton, 100, -8);
+                off_ok = view->mark_mode() == MarkNone &&
+                         view->mark_count() == 1 && prompts == 1;
+
+                /* A cancelled prompt refuses the click and leaves the tool
+                 * armed, so the next click can try again. */
+                view->on_mark_text_ = [&](const QPointF &) {
+                    prompts++;
+                    return QString();
+                };
+                send_char('T');
+                send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
+                           Qt::LeftButton, lx, ly);
+                cancel_ok = view->mark_count() == 1 && prompts == 2 &&
+                            view->mark_mode() == MarkText;
+
+                /* One tool at a time, both ways: the measurement tool and the
+                 * Mark tool are the vendor's single `cursor_code`, so arming
+                 * one puts the other away. */
+                view->set_mark_mode(MarkNone);
+                send_char('p');
+                pm.step();
+                dyt_snapshot_t s_p{};
+                dyt_session_snapshot(sess, &s_p, nullptr, 0);
+                const bool had_spot = view->mark_mode() == MarkNone &&
+                                      s_p.tool == DYT_TOOL_POINT;
+
+                send_char('T');
+                pm.step();
+                dyt_snapshot_t s_m{};
+                dyt_session_snapshot(sess, &s_m, nullptr, 0);
+                const bool cleared_mark_tool =
+                    view->mark_mode() == MarkText && s_m.tool == DYT_TOOL_NONE;
+
+                send_char('p');
+                pm.step();
+                const bool cleared_mark = view->mark_mode() == MarkNone;
+
+                one_tool_ok = had_spot && cleared_mark_tool && cleared_mark;
+
+                view->clear_marks();
+                view->on_mark_text_ = nullptr;
+                view->set_mark_mode(MarkNone);
+                send_char('n');
+                dyt_session_reset_view(sess);
+                pm.step();
+            }
+
+            const bool ok = rows_ok && key_ok && place_ok && pixel_ok &&
+                            disarm_ok && off_ok && cancel_ok && one_tool_ok;
+            std::printf("  %-4s the Mark Text tool places a label at the "
+                        "clicked pixel and paints it there (row %s, key %s, "
+                        "place %s, painted %s, disarms %s, off-image %s, "
+                        "cancel %s, one tool %s)\n",
+                        ok ? "ok" : "FAIL", rows_ok ? "yes" : "NO",
+                        key_ok ? "yes" : "NO", place_ok ? "yes" : "NO",
+                        pixel_ok ? "yes" : "NO", disarm_ok ? "yes" : "NO",
+                        off_ok ? "yes" : "NO", cancel_ok ? "yes" : "NO",
+                        one_tool_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
         /* A 256x192 layout, one opaque stripe and the rest transparent — the
          * shape that makes "did it composite?" a pixel question rather than a
          * colour one, so it cannot be confused with the picture underneath. */
@@ -11546,6 +11994,18 @@ static int run_gui(const opts &o_in, QApplication &app)
         std::string m;
         save_still(sess, pm.capture.dir, m);
         pm.notice(m, 150);
+    };
+
+    /* The Mark tool's text prompt.  A dialog rather than a fixed string,
+     * because the whole point of the tool is the user's own note.  Cancelling
+     * returns empty, which add_mark() refuses — so a cancelled prompt leaves
+     * the tool armed and nothing placed, and the next click can try again. */
+    win.view()->on_mark_text_ = [&](const QPointF &) -> QString {
+        bool ok = false;
+        const QString t = QInputDialog::getText(
+            &win, QStringLiteral("Mark"), QStringLiteral("Label:"),
+            QLineEdit::Normal, QString(), &ok);
+        return ok ? t.trimmed() : QString();
     };
 
     win.on_record_ = [&]() {
