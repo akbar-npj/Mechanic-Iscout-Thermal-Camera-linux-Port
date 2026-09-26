@@ -81,6 +81,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QString>
+#include <QStringList>
 #include <QTabWidget>
 #include <QTextBrowser>
 #include <QTimer>
@@ -295,7 +296,34 @@ struct prefs {
     int         fusion  = -1;
     int         sr      = -1;
     std::string capture_dir;
+    /* The chrome the user chose to hide, as comma-separated key lists (see
+     * keys_join/keys_split).  Empty means everything is shown, which is what a
+     * first run and a run with no saved file both get.  The keys are the
+     * stable names IconRail::name() and ControlPanel::tab_name() return, not
+     * the enum's numbers, so inserting an item cannot silently hide another. */
+    std::string rail_hidden;
+    std::string tab_hidden;
 };
+
+/* The hidden-key encoding, in one place.  A comma-joined string rather than a
+ * QStringList keeps `prefs` a plain struct — a test can build one without Qt,
+ * and the file stays human-readable.
+ *
+ * It is read back with QSettings::toStringList(), not toString(): an INI value
+ * containing a comma is parsed by QSettings as a QStringList, and
+ * QVariant::toString() on a list returns an EMPTY string — so a two-key list
+ * would silently load as "nothing hidden" while a one-key list loaded fine.
+ * Writing the split list makes the same encoding explicit on the way out, so
+ * the file is unchanged either way and neither side depends on the other. */
+static QStringList keys_split(const std::string &s)
+{
+    return QString::fromStdString(s).split(QLatin1Char(','), Qt::SkipEmptyParts);
+}
+
+static std::string keys_join(const QStringList &keys)
+{
+    return keys.join(QLatin1Char(',')).toStdString();
+}
 
 static std::string prefs_path(const opts &o)
 {
@@ -323,6 +351,10 @@ static void prefs_load(const std::string &path, prefs &p)
     p.sr      = s->value(QStringLiteral("view/sr"),      -1).toInt();
     p.capture_dir =
         s->value(QStringLiteral("capture/dir")).toString().toStdString();
+    p.rail_hidden =
+        keys_join(s->value(QStringLiteral("view/rail_hidden")).toStringList());
+    p.tab_hidden =
+        keys_join(s->value(QStringLiteral("view/tab_hidden")).toStringList());
 }
 
 static void prefs_save(const std::string &path, const prefs &p)
@@ -335,6 +367,10 @@ static void prefs_save(const std::string &path, const prefs &p)
     s->setValue(QStringLiteral("view/sr"),      p.sr);
     s->setValue(QStringLiteral("capture/dir"),
                 QString::fromStdString(p.capture_dir));
+    s->setValue(QStringLiteral("view/rail_hidden"),
+                keys_split(p.rail_hidden));
+    s->setValue(QStringLiteral("view/tab_hidden"),
+                keys_split(p.tab_hidden));
     s->sync();
 }
 
@@ -3692,6 +3728,39 @@ public:
         return btn_[i];
     }
 
+    /* A stable key for `i`, so a saved preference or a Settings row can name
+     * an item without depending on its position in the enum — the same reason
+     * the tab enum is named rather than numbered.  Never null for a valid
+     * item; "?" for anything else, which cannot occur but keeps the return
+     * non-null for a caller that does not check. */
+    static const char *name(RailItem i)
+    {
+        switch (i) {
+        case Palette:    return "palette";
+        case Fusion:     return "fusion";
+        case Mark:       return "mark";
+        case Rotate:     return "rotate";
+        case Compare:    return "compare";
+        case ResetImage: return "reset";
+        case Tutorials:  return "tutorials";
+        case ContactUs:  return "contact";
+        case Setting:    return "setting";
+        case N_RailItems: break;
+        }
+        return "?";
+    }
+
+    /* The button's caption.  One table for the rail and the Settings dialog's
+     * Toolbar group, so a rename cannot leave the chooser naming a button
+     * something else. */
+    static const char *label(RailItem i)
+    {
+        static const char *const k[N_RailItems] = {
+            "Palette", "Fusion", "Mark", "Rotate", "Compare", "Reset",
+            "Tutorials", "Contact", "Setting" };
+        return (i >= 0 && i < N_RailItems) ? k[i] : "";
+    }
+
     /* The icons, painted into 24x24 device-pixel pixmaps.  Each is a delegate
      * so the painting stays in one place and the button just sets the pixmap. */
     static void paint_icon(QPainter &p, RailItem i, const QRect &r)
@@ -3836,14 +3905,11 @@ public:
 private:
     QPushButton *make_button(RailItem i)
     {
-        static const char *const kLabels[N_RailItems] = {
-            "Palette", "Fusion", "Mark", "Rotate", "Compare", "Reset",
-            "Tutorials", "Contact", "Setting" };
         auto *b = new QPushButton(this);
         b->setObjectName(QStringLiteral("rail"));
         b->setFocusPolicy(Qt::NoFocus);   /* see the class comment */
         b->setCheckable(true);
-        b->setText(QString::fromUtf8(kLabels[i]));
+        b->setText(QString::fromUtf8(label(i)));
         /* The one button with two gestures needs to say so: its left-click is
          * the way back to the last tool, and the two Mark kinds are on its
          * right-click menu. */
@@ -4704,6 +4770,38 @@ public:
         TabCount
     };
 
+    /* A stable key for `t`, so a saved preference or a Settings row can name a
+     * tab without depending on its index — the point the enum's own comment
+     * makes.  Never null for a valid tab. */
+    static const char *tab_name(Tab t)
+    {
+        switch (t) {
+        case TabTroubleshoot:    return "troubleshoot";
+        case TabAnalysis3D:      return "analysis3d";
+        case TabComparison:      return "comparison";
+        case TabCircuitDesign:   return "circuit";
+        case TabSuperResolution: return "superres";
+        case TabCount:           break;
+        }
+        return "?";
+    }
+
+    /* The tab's caption.  One table for the tab bar and the Settings dialog's
+     * Toolbar group, so the chooser cannot name a tab something the bar does
+     * not. */
+    static const char *tab_label(Tab t)
+    {
+        switch (t) {
+        case TabTroubleshoot:    return "Troubleshoot";
+        case TabAnalysis3D:      return "3D Analysis";
+        case TabComparison:      return "Comparison";
+        case TabCircuitDesign:   return "Circuit Design";
+        case TabSuperResolution: return "Super Resolution";
+        case TabCount:           break;
+        }
+        return "";
+    }
+
     explicit ControlPanel(QWidget *parent = nullptr) : QWidget(parent)
     {
         setFixedWidth(kPanelW);
@@ -4714,12 +4812,16 @@ public:
         tabs_ = new QTabWidget(this);
         tabs_->setFocusPolicy(Qt::NoFocus);
         outer->addWidget(tabs_);
-        tabs_->addTab(build_troubleshoot(), QStringLiteral("Troubleshoot"));
-        tabs_->addTab(build_analysis_3d(), QStringLiteral("3D Analysis"));
-        tabs_->addTab(build_comparison(), QStringLiteral("Comparison"));
-        tabs_->addTab(build_circuit_design(), QStringLiteral("Circuit Design"));
+        tabs_->addTab(build_troubleshoot(),
+                      QString::fromUtf8(tab_label(TabTroubleshoot)));
+        tabs_->addTab(build_analysis_3d(),
+                      QString::fromUtf8(tab_label(TabAnalysis3D)));
+        tabs_->addTab(build_comparison(),
+                      QString::fromUtf8(tab_label(TabComparison)));
+        tabs_->addTab(build_circuit_design(),
+                      QString::fromUtf8(tab_label(TabCircuitDesign)));
         tabs_->addTab(build_super_resolution(),
-                      QStringLiteral("Super Resolution"));
+                      QString::fromUtf8(tab_label(TabSuperResolution)));
 
         /* The circuit mode's, the height mode's and the Mark tool's checkmarks
          * are this panel's own state, so they have to be lit from the same
@@ -6161,6 +6263,62 @@ public:
         dlay->setColumnStretch(1, 1);
         outer->addWidget(disp);
 
+        /* ---- Toolbar: what the two chrome strips show.  The rail on the left
+         * and the panel's tabs on the right are the reference's own two strips,
+         * and a user who does not use one should not have to give it room.  A
+         * tick means "shown", so the group reads the same way the checkboxes
+         * in the Display group do.
+         *
+         * Setting is always shown: it is where this chooser lives, so a user
+         * who could hide it would have locked themselves out.  Its row is
+         * checked and disabled to say that, and MainWindow's setter refuses
+         * the same change — the guard is in the model, not only in this view. */
+        auto *tb = new QGroupBox(QStringLiteral("Toolbar"), this);
+        auto *tblay = new QGridLayout(tb);
+        tblay->setContentsMargins(8, 6, 8, 8);
+        tblay->setHorizontalSpacing(18);
+        tblay->setVerticalSpacing(4);
+
+        tblay->addWidget(new QLabel(QStringLiteral("Left rail"), tb), 0, 0);
+        tblay->addWidget(new QLabel(QStringLiteral("Right panel"), tb), 0, 1);
+        for (int i = 0; i < IconRail::N_RailItems; i++) {
+            const auto it = (IconRail::RailItem)i;
+            auto *cb = new QCheckBox(QString::fromUtf8(IconRail::label(it)), tb);
+            cb->setObjectName(QStringLiteral("setting"));
+            cb->setFocusPolicy(Qt::NoFocus);
+            if (it == IconRail::Setting) {
+                cb->setChecked(true);
+                cb->setEnabled(false);
+                cb->setToolTip(QStringLiteral(
+                    "Always shown \u2014 this dialog is opened from here."));
+            } else {
+                QObject::connect(cb, &QCheckBox::toggled, this,
+                                 [this, it](bool on) {
+                                     if (on_rail_show)
+                                         on_rail_show((int)it, on);
+                                 });
+            }
+            rail_box_[i] = cb;
+            tblay->addWidget(cb, i + 1, 0);
+        }
+        for (int i = 0; i < ControlPanel::TabCount; i++) {
+            const auto t = (ControlPanel::Tab)i;
+            auto *cb = new QCheckBox(QString::fromUtf8(ControlPanel::tab_label(t)),
+                                     tb);
+            cb->setObjectName(QStringLiteral("setting"));
+            cb->setFocusPolicy(Qt::NoFocus);
+            QObject::connect(cb, &QCheckBox::toggled, this,
+                             [this, t](bool on) {
+                                 if (on_tab_show)
+                                     on_tab_show((int)t, on);
+                             });
+            tab_box_[i] = cb;
+            tblay->addWidget(cb, i + 1, 1);
+        }
+        tblay->setColumnStretch(0, 1);
+        tblay->setColumnStretch(1, 1);
+        outer->addWidget(tb);
+
         status_ = new QLabel(this);
         status_->setObjectName(QStringLiteral("settingstatus"));
         status_->setWordWrap(true);
@@ -6182,6 +6340,10 @@ public:
 
         seed(nullptr);
         sync_display(DYT_UNIT_C, false, false);
+        /* Everything shown until the window says otherwise — a dialog built
+         * directly (a test) must not open with a tick that hides chrome the
+         * window is actually showing. */
+        sync_toolbar(QStringList(), QStringList());
     }
 
     /* Point every row at the value the session knows, and label the ones the
@@ -6253,6 +6415,31 @@ public:
         }
     }
 
+    /* Point the Toolbar ticks at the chrome the window is showing.  Takes the
+     * hidden key lists rather than asking the window, because the dialog is
+     * built from the rail and holds no window or session — the same split
+     * sync_display takes.  Called on every open beside sync_display, and by
+     * MainWindow whenever a visibility changes, so a tick the user clicks and
+     * a tick the window refuses (Setting) cannot disagree with the rail. */
+    void sync_toolbar(const QStringList &rail_hidden,
+                      const QStringList &tab_hidden)
+    {
+        for (int i = 0; i < IconRail::N_RailItems; i++) {
+            if (!rail_box_[i])
+                continue;
+            const QSignalBlocker block(rail_box_[i]);
+            rail_box_[i]->setChecked(!rail_hidden.contains(
+                QString::fromUtf8(IconRail::name((IconRail::RailItem)i))));
+        }
+        for (int i = 0; i < ControlPanel::TabCount; i++) {
+            if (!tab_box_[i])
+                continue;
+            const QSignalBlocker block(tab_box_[i]);
+            tab_box_[i]->setChecked(!tab_hidden.contains(
+                QString::fromUtf8(ControlPanel::tab_name((ControlPanel::Tab)i))));
+        }
+    }
+
     /* -- what --selftest drives.  The rows are indexed by dyt_order_type_t, so
      * a test asks for the parameter by the same name the ladder uses. */
     QDoubleSpinBox *spin(dyt_order_type_t t) const
@@ -6273,14 +6460,27 @@ public:
     QPushButton *about_button() const { return about_; }
     QCheckBox   *fullscreen_box() const { return fullscreen_; }
     QCheckBox   *info_box() const { return info_; }
+    /* The Toolbar ticks, by the same names the rail and the panel use. */
+    QCheckBox   *rail_box(IconRail::RailItem i) const
+    {
+        return (i >= 0 && i < IconRail::N_RailItems) ? rail_box_[i] : nullptr;
+    }
+    QCheckBox   *tab_box(ControlPanel::Tab t) const
+    {
+        return (t >= 0 && t < ControlPanel::TabCount) ? tab_box_[t] : nullptr;
+    }
     QString status_text() const { return status_ ? status_->text() : QString(); }
 
     /* Every action a control here takes goes out through one of these, so the
      * dialog holds no session and cannot become a second front end.  `on_key`
      * is MainWindow's handle_key, which is why the buttons that have keys press
-     * them rather than calling the engine. */
+     * them rather than calling the engine.  The two Toolbar callbacks carry the
+     * item's enum value and the wanted state; MainWindow owns the chrome and is
+     * the only thing that can show or hide it. */
     std::function<void(int)>           on_key;
     std::function<void(dyt_unit_t)>    on_unit;
+    std::function<void(int, bool)>     on_rail_show;
+    std::function<void(int, bool)>     on_tab_show;
 
 private:
     static int decimals(dyt_order_type_t t)
@@ -6311,6 +6511,9 @@ private:
     QPushButton  *about_      = nullptr;
     QCheckBox    *fullscreen_ = nullptr;
     QCheckBox    *info_       = nullptr;
+    /* Toolbar. */
+    QCheckBox    *rail_box_[IconRail::N_RailItems] = {};
+    QCheckBox    *tab_box_[ControlPanel::TabCount] = {};
 };
 
 /* ---------------------------------------------------------- contact dialog */
@@ -6548,12 +6751,103 @@ public:
                 if (sess_)
                     dyt_session_set_unit(sess_, u);
             };
+            /* The Toolbar ticks ask the window to show or hide a rail item or
+             * a tab.  They go through the setters below — which own the
+             * invariant (Setting stays) and the widget — rather than the tick
+             * touching the widget itself, the same routing every other control
+             * in this dialog takes. */
+            settings_->on_rail_show = [this](int i, bool on) {
+                set_rail_item_shown((IconRail::RailItem)i, on);
+            };
+            settings_->on_tab_show = [this](int t, bool on) {
+                set_tab_shown((ControlPanel::Tab)t, on);
+            };
         }
         settings_->seed(settings_current());
         settings_->sync_display(
             (dyt_unit_t)(snap_.unit < DYT_UNIT_N ? snap_.unit : DYT_UNIT_C),
             fullscreen_, view_ && view_->info_shown());
+        settings_->sync_toolbar(rail_hidden_, tab_hidden_);
         return settings_;
+    }
+
+    /* ---- The chrome the user chose to hide ------------------------------
+     *
+     * Two key lists, one per strip, holding the stable names IconRail::name()
+     * and ControlPanel::tab_name() return.  The lists are the model: the
+     * widget's visibility and the Settings ticks are both driven from them, so
+     * a saved preference, a tick and the rail cannot disagree.
+     *
+     * Setting is never hidden.  It is where the Toolbar chooser lives, so a
+     * user who could hide it would have no way back; set_rail_item_shown()
+     * refuses it and the tick for it is disabled.  The guard lives here rather
+     * than in the dialog because this is the one place every route passes. */
+
+    const QStringList &rail_hidden() const { return rail_hidden_; }
+    const QStringList &tab_hidden()  const { return tab_hidden_; }
+
+    bool rail_item_shown(IconRail::RailItem i) const
+    {
+        return !rail_hidden_.contains(QString::fromUtf8(IconRail::name(i)));
+    }
+    bool tab_shown(ControlPanel::Tab t) const
+    {
+        return !tab_hidden_.contains(QString::fromUtf8(ControlPanel::tab_name(t)));
+    }
+
+    void set_rail_item_shown(IconRail::RailItem i, bool shown)
+    {
+        if (i == IconRail::Setting)
+            shown = true;               /* the lock-out guard — see above */
+        const QString key = QString::fromUtf8(IconRail::name(i));
+        if (shown)
+            rail_hidden_.removeAll(key);
+        else if (!rail_hidden_.contains(key))
+            rail_hidden_ += key;
+        if (QPushButton *b = rail_->button(i))
+            b->setVisible(shown);
+        sync_toolbar_now();
+    }
+
+    void set_tab_shown(ControlPanel::Tab t, bool shown)
+    {
+        const QString key = QString::fromUtf8(ControlPanel::tab_name(t));
+        if (shown)
+            tab_hidden_.removeAll(key);
+        else if (!tab_hidden_.contains(key))
+            tab_hidden_ += key;
+        if (panel_ && panel_->tabs())
+            panel_->tabs()->setTabVisible((int)t, shown);
+        sync_toolbar_now();
+    }
+
+    /* Replace the whole list at once, for the preferences the run starts with.
+     * Applied item by item through the same setters, so the guard and the
+     * widget update cannot be skipped on the load path either. */
+    void set_rail_hidden(const QStringList &keys)
+    {
+        for (int i = 0; i < IconRail::N_RailItems; i++)
+            set_rail_item_shown((IconRail::RailItem)i,
+                                !keys.contains(QString::fromUtf8(
+                                    IconRail::name((IconRail::RailItem)i))));
+    }
+    void set_tab_hidden(const QStringList &keys)
+    {
+        for (int i = 0; i < ControlPanel::TabCount; i++)
+            set_tab_shown((ControlPanel::Tab)i,
+                          !keys.contains(QString::fromUtf8(
+                              ControlPanel::tab_name((ControlPanel::Tab)i))));
+    }
+
+    /* Push the current lists into the Settings dialog, if it exists, so a tick
+     * reflects the rail the moment the change is made — the same reason
+     * toggle_fullscreen() calls sync_window().  A change made from the dialog
+     * itself comes back here through the tick's own signal, so this is what
+     * keeps a refused tick (Setting) from staying unchecked. */
+    void sync_toolbar_now()
+    {
+        if (settings_)
+            settings_->sync_toolbar(rail_hidden_, tab_hidden_);
     }
 
     /* The current value of each runtime parameter as the session knows it: a
@@ -7556,6 +7850,11 @@ private:
      * the window manager, because fit_to_view() consults it on every painted
      * frame and isFullScreen() is not free. */
     bool         fullscreen_ = false;
+    /* The chrome the user chose to hide, as the stable key lists of
+     * IconRail::name()/ControlPanel::tab_name().  Empty means everything is
+     * shown, which is the default and what a fresh preference file gives. */
+    QStringList  rail_hidden_;
+    QStringList  tab_hidden_;
     dyt_vm_gallery_t gal_{};
     GalleryPanel *gal_panel_ = nullptr;   /* child of view_, owned by Qt */
     QString      viewing_label_;
@@ -9969,7 +10268,7 @@ static int selftest(const opts &o)
         char  tmpl[] = "/tmp/dytqt-prefs-XXXXXX";
         char *dir    = mkdtemp(tmpl);
         std::string path;
-        bool round = false, prec = false, from = false;
+        bool round = false, prec = false, from = false, keys = false;
 
         if (dir) {
             path = std::string(dir) + "/prefs.ini";
@@ -9977,13 +10276,29 @@ static int selftest(const opts &o)
             prefs p;
             p.palette = 4; p.unit = 1; p.zoom = 3; p.fusion = 2; p.sr = 2;
             p.capture_dir = "/tmp/elsewhere";
+            /* The two chrome lists, so the comma encoding is under test and
+             * not only the scalar fields. */
+            p.rail_hidden = "rotate,contact";
+            p.tab_hidden  = "circuit";
             prefs_save(path, p);
 
             prefs q;
             prefs_load(path, q);
             round = q.palette == 4 && q.unit == 1 && q.zoom == 3 &&
                     q.fusion == 2 && q.sr == 2 &&
-                    q.capture_dir == "/tmp/elsewhere";
+                    q.capture_dir == "/tmp/elsewhere" &&
+                    q.rail_hidden == "rotate,contact" &&
+                    q.tab_hidden == "circuit";
+
+            /* The encoding itself: a key list survives a split/join round
+             * trip, and an empty list encodes to an empty string rather than
+             * to a stray separator that would decode as one empty key. */
+            const QStringList rh = keys_split(q.rail_hidden);
+            keys = rh.size() == 2 && rh.contains(QStringLiteral("rotate")) &&
+                   rh.contains(QStringLiteral("contact")) &&
+                   keys_join(rh) == q.rail_hidden &&
+                   keys_split(std::string()).isEmpty() &&
+                   keys_join(QStringList()).empty();
 
             opts eff;                       /* --palette named, --zoom not */
             eff.palette = 2; eff.palette_set = true;
@@ -9992,19 +10307,24 @@ static int selftest(const opts &o)
                    eff.capture_dir == "/tmp/elsewhere" &&
                    eff.unit == 1 && eff.fusion == 2 && eff.sr == 2;
 
+            /* The chrome belongs to the window, not the session, so this must
+             * leave it empty — run_gui is what fills it in from the window. */
             prefs cur = prefs_from_session(sess, ".");
             from = cur.palette >= 0 && cur.zoom >= 1 &&
-                   !cur.capture_dir.empty();
+                   !cur.capture_dir.empty() &&
+                   cur.rail_hidden.empty() && cur.tab_hidden.empty();
 
             remove(path.c_str());
             rmdir(dir);
         }
 
-        const bool ok = round && prec && from;
+        const bool ok = round && prec && from && keys;
         std::printf("  %-4s preferences round-trip and the command line wins "
-                    "(round-trip %s, precedence %s, from session %s)\n",
+                    "(round-trip %s, precedence %s, from session %s, "
+                    "chrome keys %s)\n",
                     ok ? "ok" : "FAIL", round ? "yes" : "NO",
-                    prec ? "yes" : "NO", from ? "yes" : "NO");
+                    prec ? "yes" : "NO", from ? "yes" : "NO",
+                    keys ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -11095,6 +11415,120 @@ static int selftest(const opts &o)
      * concern — an on-screen control hidden behind Qt's overflow arrow — did
      * not go away, it moved: the tab bar is now the row that can outgrow its
      * container, and assertion 53d measures that fit. */
+
+    /* 53i. The Settings Toolbar section — what the two chrome strips show.
+     * The ticks are the model's view: they are seeded from the window's hidden
+     * lists, and pressing one must reach the rail or the tab bar, not merely
+     * light itself.  The lists are the stable names IconRail::name() and
+     * ControlPanel::tab_name() return, so a saved preference survives an item
+     * being inserted; the tab bar's own captions and the chooser's labels come
+     * from one table, which is checked here too.
+     *
+     * Setting is the exception: it is where this chooser lives, so hiding it
+     * would strand the user.  Its tick is disabled — and because a disabled
+     * tick cannot be pressed, the guard would go untested through the UI, so
+     * the window's setter is asked directly and must refuse.  That is the
+     * route run_gui's preference load also takes, which is why the guard lives
+     * in the setter and not in the dialog. */
+    {
+        SettingsDialog *dlg   = win.settings_dialog();
+        ControlPanel   *panel = win.panel();
+
+        /* The tab bar's captions and the chooser's labels come from one table,
+         * so a rename cannot leave them disagreeing. */
+        bool labels_ok = true;
+        for (int i = 0; i < ControlPanel::TabCount; i++)
+            if (panel->tabs()->tabText(i) !=
+                QString::fromUtf8(ControlPanel::tab_label((ControlPanel::Tab)i)))
+                labels_ok = false;
+
+        /* Seeded from the window: everything is shown, so every tick is on. */
+        bool seeded = true;
+        for (int i = 0; i < IconRail::N_RailItems; i++)
+            if (!dlg->rail_box((IconRail::RailItem)i) ||
+                !dlg->rail_box((IconRail::RailItem)i)->isChecked())
+                seeded = false;
+        for (int i = 0; i < ControlPanel::TabCount; i++)
+            if (!dlg->tab_box((ControlPanel::Tab)i) ||
+                !dlg->tab_box((ControlPanel::Tab)i)->isChecked())
+                seeded = false;
+
+        /* Hide one of each, through the tick a user would press. */
+        const IconRail::RailItem it = IconRail::Rotate;
+        const ControlPanel::Tab   tb = ControlPanel::TabCircuitDesign;
+        if (QCheckBox *cb = dlg->rail_box(it))
+            cb->click();
+        if (QCheckBox *cb = dlg->tab_box(tb))
+            cb->click();
+
+        const bool rail_hid =
+            !win.rail_item_shown(it) &&
+            win.rail()->button(it) && win.rail()->button(it)->isHidden() &&
+            win.rail_hidden().contains(QString::fromUtf8(IconRail::name(it)));
+        const bool tab_hid =
+            !win.tab_shown(tb) &&
+            !panel->tabs()->isTabVisible((int)tb) &&
+            win.tab_hidden().contains(QString::fromUtf8(ControlPanel::tab_name(tb)));
+
+        /* Setting: refused, however it is asked.  Checked twice — the model
+         * must not record it hidden, and the tick must be put back on, which
+         * is what stops the dialog from claiming a state the rail is not in. */
+        win.set_rail_item_shown(IconRail::Setting, false);
+        const bool guard =
+            win.rail_item_shown(IconRail::Setting) &&
+            win.rail()->button(IconRail::Setting) &&
+            !win.rail()->button(IconRail::Setting)->isHidden() &&
+            dlg->rail_box(IconRail::Setting) &&
+            dlg->rail_box(IconRail::Setting)->isChecked() &&
+            !dlg->rail_box(IconRail::Setting)->isEnabled();
+
+        /* The whole-list path run_gui uses for a saved preference: one key
+         * hides exactly the item it names, and the items around it stay.  The
+         * ticks are checked too — a setter that moved the widget but left the
+         * dialog claiming the old state would be a second, disagreeing view. */
+        win.set_rail_hidden(QStringList{ QStringLiteral("reset") });
+        win.set_tab_hidden(QStringList{ QStringLiteral("comparison") });
+        const bool list_ok =
+            !win.rail_item_shown(IconRail::ResetImage) &&
+            win.rail_item_shown(IconRail::Rotate) &&
+            !win.tab_shown(ControlPanel::TabComparison) &&
+            win.tab_shown(ControlPanel::TabCircuitDesign) &&
+            dlg->rail_box(IconRail::ResetImage) &&
+            !dlg->rail_box(IconRail::ResetImage)->isChecked() &&
+            dlg->rail_box(IconRail::Rotate) &&
+            dlg->rail_box(IconRail::Rotate)->isChecked() &&
+            dlg->tab_box(ControlPanel::TabComparison) &&
+            !dlg->tab_box(ControlPanel::TabComparison)->isChecked();
+
+        /* Restore, and prove the restore went through the same setters: the
+         * later geometry assertions must see the window it was built with. */
+        win.set_rail_hidden(QStringList());
+        win.set_tab_hidden(QStringList());
+        bool restored = true;
+        for (int i = 0; i < IconRail::N_RailItems; i++)
+            if (!win.rail_item_shown((IconRail::RailItem)i) ||
+                win.rail()->button((IconRail::RailItem)i)->isHidden())
+                restored = false;
+        for (int i = 0; i < ControlPanel::TabCount; i++)
+            if (!win.tab_shown((ControlPanel::Tab)i) ||
+                !panel->tabs()->isTabVisible(i))
+                restored = false;
+        if (dlg)
+            dlg->hide();
+
+        const bool ok = labels_ok && seeded && rail_hid && tab_hid &&
+                        guard && list_ok && restored;
+        std::printf("  %-4s the Settings Toolbar section hides and shows the "
+                    "rail and the tabs (labels %s, seeded %s, rail %s, tab %s, "
+                    "Setting kept %s, whole-list %s, restored %s)\n",
+                    ok ? "ok" : "FAIL",
+                    labels_ok ? "yes" : "NO", seeded ? "yes" : "NO",
+                    rail_hid ? "yes" : "NO", tab_hid ? "yes" : "NO",
+                    guard ? "yes" : "NO", list_ok ? "yes" : "NO",
+                    restored ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
 
     /* 54. The canvas is drawn at its natural size until the window is bigger
      * than it needs, and scales to fit after that.  Both halves matter: the
@@ -13113,9 +13547,9 @@ static int run_gui(const opts &o_in, QApplication &app)
     /* A saved preference fills in only what the command line did not name, so
      * an explicit flag always wins. */
     opts o = o_in;
+    prefs p;                /* kept past the block for the chrome keys below */
     bool dir_from_prefs = false;
     if (!o.no_prefs) {
-        prefs p;
         prefs_load(prefs_path(o_in), p);
         dir_from_prefs = !o.capture_dir_set && !p.capture_dir.empty();
         opts_apply_prefs(o, p);
@@ -13137,6 +13571,14 @@ static int run_gui(const opts &o_in, QApplication &app)
 
     MainWindow win;
     win.set_session(sess);
+    /* The chrome the last run ended with, applied before the window is first
+     * shown so the rail and the tabs are right on the first paint.  A saved key
+     * that no longer names an item is simply not found, and the Setting guard
+     * holds on this path too because it runs through the same setters. */
+    if (!o.no_prefs) {
+        win.set_rail_hidden(keys_split(p.rail_hidden));
+        win.set_tab_hidden(keys_split(p.tab_hidden));
+    }
     pump       pm;
     pm.sess = sess;
     pm.win  = &win;
@@ -13843,9 +14285,14 @@ static int run_gui(const opts &o_in, QApplication &app)
 
     /* Save the view state the user ended on, so the next run opens the way
      * this one closed.  Done before the session is freed, because the state
-     * comes from the session. */
-    if (!o.no_prefs)
-        prefs_save(prefs_path(o), prefs_from_session(sess, o.capture_dir));
+     * comes from the session.  The chrome keys come from the window, which is
+     * where they live — the session knows nothing about the rail or the tabs. */
+    if (!o.no_prefs) {
+        p = prefs_from_session(sess, o.capture_dir);
+        p.rail_hidden = keys_join(win.rail_hidden());
+        p.tab_hidden  = keys_join(win.tab_hidden());
+        prefs_save(prefs_path(o), p);
+    }
 
     dyt_session_free(sess);
     return rc;

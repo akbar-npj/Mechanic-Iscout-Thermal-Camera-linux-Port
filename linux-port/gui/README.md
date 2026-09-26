@@ -562,6 +562,32 @@ pins all of it, including that the full-screen checkbox *presses F11* rather tha
 setting the flag itself, which is what keeps the window's `fitted_` bookkeeping
 in step.
 
+A third group, **Toolbar**, is what the two chrome strips show: a tick per rail
+item and per panel tab, so a user who never uses, say, the Comparison tab does
+not have to give it room in the tab bar. The ticks are the view; the model is
+`MainWindow`'s two key lists, and every route — a tick, a saved preference, the
+load path — goes through `set_rail_item_shown()` / `set_tab_shown()`, so the rail
+and the dialog cannot disagree. The keys are the stable names `IconRail::name()`
+and `ControlPanel::tab_name()` return rather than enum indices, so inserting an
+item cannot silently hide a different one, and the same names are what the
+preference file holds. The tab bar's captions and the ticks' labels come from one
+table (`tab_label()`), so a rename cannot leave them disagreeing.
+
+**Setting is never hidden.** It is where this chooser lives, so a user who could
+hide it would have no way back. The guard is in the setter, not only in the
+dialog: its tick is checked and disabled, and a direct call to hide Setting is
+refused. That matters because a saved preference is loaded through the same
+setter — and because a disabled tick cannot be pressed, the UI alone would leave
+the guard untested. Assertion 53i pins the seeding, both hides, the refusal and
+the whole-list path.
+
+The lists are saved with the other preferences, so the chrome the user chose
+comes back on the next run. They are read with `QSettings::toStringList()`, not
+`toString()`: an INI value containing a comma is parsed by QSettings as a
+`QStringList`, and `QVariant::toString()` on a list returns an *empty* string —
+so a two-item list silently loaded as "nothing hidden" while a one-item list
+loaded fine. Assertion 44 round-trips both lists and the encoding itself.
+
 `FrameView::render_canvas()` draws the canvas's content at the canvas's own
 size, in canvas coordinates, and is what the overlay assertions sample. A
 widget `grab()` would be cropped once the rail and panel take their columns —
@@ -630,9 +656,10 @@ The key's name therefore goes in the control's tooltip, not in a `shortcut`.
 
 The exceptions are the controls that select an *absolute* value no key can
 express: **Unit** and **Fusion** in the Settings dialog (the `u` and `f` keys
-cycle), the palette entries past the tenth in the rail's popup, and **Reset
-Image**. Each is a single session call, so there is no rule for the two to
-disagree about.
+cycle), the palette entries past the tenth in the rail's popup, the **Toolbar**
+ticks, and **Reset Image**. Each is a single session call — or, for the Toolbar
+ticks, a single `set_*_shown()` — so there is no rule for the two to disagree
+about.
 
 The checkmarks come from the snapshot, not from the button's own toggle:
 `sync_actions()` runs after every painted frame and hands `snap_` to
@@ -1546,6 +1573,7 @@ $ ./build/dytqt --selftest
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, 6 fusion patterns yes, fusion mark yes, fusion pick yes, fusion popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
   ok   the control panel asks for its content's height (panel 1050 of 1050, page 1024 of 1024, shrinks yes, keeps yes, scrolls yes)
+  ok   the Settings Toolbar section hides and shows the rail and the tabs (labels yes, seeded yes, rail yes, tab yes, Setting kept yes, whole-list yes, restored yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
@@ -1735,6 +1763,15 @@ worth naming one by one:
   **53h** requires the panel to ask for its content's height so the last group is
   not clipped — the two directions of "a control the user cannot reach". Both are
   described under [The control panel](#the-control-panel).
+* **53i** covers the Toolbar chooser, the Settings group that shows and hides the
+  rail items and the panel tabs. It requires the ticks to be seeded from the
+  window, a press to actually hide the widget, the whole-list load path to hide
+  exactly the item it names, and **Setting to be refused** even when the setter is
+  called directly — a disabled tick cannot be pressed, so the UI alone would
+  leave the guard untested, and the load path reaches the same setter. Its
+  failure modes are mutations that drop the guard, drop the `setVisible()` call,
+  drop the `setTabVisible()` call, or make the sync a no-op. Described under
+  [The control panel](#the-control-panel).
 * **54** grows the window and requires the canvas to be 1:1 before, scaled and
   centred after, and 1:1 again when it shrinks back; the first half is what keeps
   the pixel assertions honest, since at the natural size the scale is exactly 1
