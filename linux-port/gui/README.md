@@ -527,15 +527,31 @@ or a super-resolved frame) while it was up. Assertion 49 pins the round trip.
 |---|---|---|
 | 1 | `dyt_vm_status_line()`, verbatim | `mode 1000 \| fusion ir \| 01-iron-red.dat 1/28 \| C \| x2- \| 25 frames` |
 | 2 | `dyt_vm_readout_line()`, verbatim | `tool: none (p point, l line, b box, n clear)` |
-| 3 | the front end's own | `range auto   \|   FIXTURE  25.0 fps` |
+| 3 | the front end's own | `range auto   \|   LIVE   Camera SN: CA09DDC00212  25.0 fps` |
 
-Line 3 carries the two things the view model has no business naming — the frame
-rate and the device state — plus the range mode. The mode is formatted by the
-engine (`dyt_range_mode_name()`), but it is deliberately **not** folded into
-`dyt_vm_status_line()`. That shared line is already ~378 px of a 404 px window at
-zoom 1, and `tools/dytview.cpp` draws it into a strip only as wide as the *image*
-(256 px at zoom 1), where it is already clipped; extending it would clip further,
-and would change another front end's display and its pinned tests for no gain.
+Line 3 carries the things the view model has no business naming — the range
+mode, the device state, the camera's serial and the frame rate. The mode is
+formatted by the engine (`dyt_range_mode_name()`), but it is deliberately **not**
+folded into `dyt_vm_status_line()`. That shared line is already ~378 px of a
+404 px window at zoom 1, and `tools/dytview.cpp` draws it into a strip only as
+wide as the *image* (256 px at zoom 1), where it is already clipped; extending it
+would clip further, and would change another front end's display and its pinned
+tests for no gain.
+
+The serial segment — `Camera SN: <serial>`, the pair the Windows app's own
+status bar carries — is the **module** serial `dyt_sn_str()` produces, not the
+decoded user serial, which the info panel shows on its own row. It is drawn only
+when the bring-up read found one, so a missing serial is an absent segment
+rather than a field of spaces. The value comes from **`FrameView`'s
+`dyt_device_info_t`**, which is the same struct the info panel and the Settings
+dialog read — not from a session field. That is a deliberate departure from the
+original plan, which assumed `session.c` performed the bring-up read; it does
+not (the front end does, in the idle window between `dyt_capture_open()` and
+`dyt_capture_start()`, because the session never touches the capture layer).
+Keeping the identity in one place is what makes the status line and the info
+panel unable to disagree about which camera is attached, and a teardown's
+`clear_info()` clears both. Assertion 62 pins all three: the segment is absent
+with no device, present with one, and equal to the info panel's serial row.
 
 The rate is shown only for the states that have painted frames — a `0.0 fps`
 beside `CONNECTING` would be a claim about a stream that is not running yet.
@@ -1261,6 +1277,7 @@ $ ./build/dytqt --selftest
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
   ok   the Circuit Design tab overlays a layout and aligns it (tab yes, clamp yes, push yes, hold yes, paint yes, move yes, rot yes)
+  ok   the status line names the camera's serial (absent yes, shown yes, agrees yes)
 === ALL PASS ===
 ```
 

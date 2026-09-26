@@ -712,10 +712,10 @@ static const char *state_placeholder(DevState s)
 /* The third status line, and the front end's own.
  *
  * The two lines above it are the view model's, verbatim; this one carries the
- * two things the view model has no business naming — the frame rate and the
- * device state — plus the range mode, which is formatted by the engine
- * (dyt_range_mode_name) but deliberately *not* folded into
- * dyt_vm_status_line().  That shared line is already ~378 px of a 404 px
+ * things the view model has no business naming — the range mode, the device
+ * state, the camera's serial number and the frame rate.  The range mode is
+ * formatted by the engine (dyt_range_mode_name) but deliberately *not* folded
+ * into dyt_vm_status_line().  That shared line is already ~378 px of a 404 px
  * window at zoom 1, and dytview draws it into a strip only as wide as the
  * image, where it is already clipped; extending it would clip further and
  * would change another front end's display for no gain.  See gui/README.md.
@@ -723,12 +723,23 @@ static const char *state_placeholder(DevState s)
  * The rate is only shown for the states that have painted frames: a "0.0 fps"
  * beside CONNECTING would be a claim about a stream that is not running yet.
  * STALLED is included on purpose — there the 0.0 *is* the evidence, and hiding
- * it would leave the frozen picture looking healthy. */
-static QString state_line(DevState s, const dyt_snapshot_t &snap, double fps)
+ * it would leave the frozen picture looking healthy.
+ *
+ * `sn` is the module serial from the bring-up read, or NULL when there is no
+ * device (the fixture path) or the read failed — in which case the segment is
+ * omitted rather than shown empty, so a blank field cannot be mistaken for a
+ * serial of spaces.  The Windows app's own status bar carries exactly this
+ * pair — a connection word and "Camera SN: <serial>" — and the serial is the
+ * *module* serial (dyt_sn_str's output), not the decoded user serial, which
+ * the info panel shows on its own row. */
+static QString state_line(DevState s, const dyt_snapshot_t &snap, double fps,
+                          const char *sn)
 {
     QString out = QStringLiteral("range %1   |   %2")
                       .arg(QString::fromUtf8(dyt_range_mode_name(snap.range_mode)),
                            QString::fromUtf8(state_label(s)));
+    if (sn && *sn)
+        out += QStringLiteral("   Camera SN: %1").arg(QString::fromUtf8(sn));
     if (s == DevState::Fixture || s == DevState::Live ||
         s == DevState::Stalled)
         out += QStringLiteral("  %1 fps").arg(fps, 0, 'f', 1);
@@ -5319,7 +5330,8 @@ public:
         dyt_vm_status_line(&snap, mode, a, sizeof a);
         dyt_vm_readout_line(&snap, msg, b, sizeof b);
         strip_->set_lines(QString::fromUtf8(a), QString::fromUtf8(b),
-                          viewing() ? viewing_label_ : state_line(st, snap, fps));
+                          viewing() ? viewing_label_
+                                    : state_line(st, snap, fps, serial()));
         strip_->set_alarm(snap.alarm_on != 0, snap.alarm);
         snap_ = snap;               /* for the action lambdas */
         fit_to_view();
@@ -5331,11 +5343,29 @@ public:
     void set_state_line(DevState st, const dyt_snapshot_t &snap, double fps)
     {
         strip_->set_lines(strip_->line(0), strip_->line(1),
-                          viewing() ? viewing_label_ : state_line(st, snap, fps));
+                          viewing() ? viewing_label_
+                                    : state_line(st, snap, fps, serial()));
         /* The panel's Super Resolution page is session state, not frame state,
          * so it stays right while the canvas is still a placeholder — which is
          * exactly when a user wondering why the radios are dead needs it. */
         sync_sr_panel();
+    }
+
+    /* The module serial the bring-up read found, or NULL when there is no
+     * device (the fixture path) or the read failed.
+     *
+     * Read from FrameView, which holds the one dyt_device_info_t the info
+     * panel and the Settings dialog also read — the device identity is the
+     * front end's, not the session's (the session never touches the capture
+     * layer; the front end does the idle-window read itself).  One source
+     * means the status line and the info panel cannot disagree about which
+     * camera is attached, and a teardown that clears the info clears both. */
+    const char *serial() const
+    {
+        if (!view_)
+            return nullptr;
+        const dyt_device_info_t &d = view_->device_info();
+        return d.have_sn ? d.sn_str : nullptr;
     }
 
     /* The single key dispatch.  Every key the app understands is interpreted
@@ -9448,6 +9478,49 @@ static int selftest(const opts &o)
                     clamp_ok ? "yes" : "NO", wire_ok ? "yes" : "NO",
                     hold_ok ? "yes" : "NO", paint_ok ? "yes" : "NO",
                     move_ok ? "yes" : "NO", rot_ok ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 62. The camera's serial number on the status line.  The Windows app's
+     * status bar carries the connection word and "Camera SN: <serial>"; the
+     * port puts the same pair on its third line.  Three risks: the segment
+     * appears when there is no device (a blank field read as a serial of
+     * spaces), it is missing when a device did report one, and the status line
+     * and the info panel disagree about which camera is attached — which a
+     * second copy of the identity would allow, and is why the strip reads
+     * FrameView's dyt_device_info_t rather than a session field. */
+    {
+        dyt_snapshot_t s{};
+        const bool have = dyt_session_snapshot(sess, &s, nullptr, 0) == 0;
+
+        /* With no device identity the segment is omitted, not shown empty. */
+        fv->clear_info();
+        win.set_state_line(DevState::Live, s, 25.0);
+        const QString without = win.strip() ? win.strip()->line(2) : QString();
+
+        dyt_device_info_t d{};
+        d.have_sn = 1;
+        std::snprintf(d.sn_str, sizeof d.sn_str, "%s", "CA09DDC00212");
+        d.sn_len = (int)std::strlen(d.sn_str);
+        fv->set_info(d, true);
+        win.set_state_line(DevState::Live, s, 25.0);
+        const QString with = win.strip() ? win.strip()->line(2) : QString();
+
+        /* The info panel's serial row carries the same value, because it is
+         * the same struct — not a second field that could drift. */
+        const QString info = fv->info_line(0);
+
+        const bool absent_ok = !without.contains(QStringLiteral("Camera SN"));
+        const bool shown_ok =
+            with.contains(QStringLiteral("Camera SN: CA09DDC00212"));
+        const bool agree_ok  = info.contains(QStringLiteral("CA09DDC00212"));
+        const bool ok = have && absent_ok && shown_ok && agree_ok;
+
+        std::printf("  %-4s the status line names the camera's serial "
+                    "(absent %s, shown %s, agrees %s)\n",
+                    ok ? "ok" : "FAIL", absent_ok ? "yes" : "NO",
+                    shown_ok ? "yes" : "NO", agree_ok ? "yes" : "NO");
         if (!ok)
             fails++;
     }
