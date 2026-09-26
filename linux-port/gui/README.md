@@ -952,8 +952,12 @@ rectangle the two handles bound — so the handles stay where the user put them.
 scale that re-fit every frame slides both handles around under the pointer as the
 live frame's drifting min/max moves it: the handle being dragged does not stay at
 the point it was grabbed, and the *other* end wanders too although its value never
-changed. `bar_scale()` therefore returns a latched pair of values while the window
-is fixed, and the live frame's extremes otherwise; `bar_scale_follow()` is the one
+changed. Measured on the device (2026-09-26, a hand-held scene at 41–44 °C): the
+frame's own extremes move by 0.06–0.35 °C between consecutive frames and by about
+a degree a second — on a 2.6 °C span that is a quarter of the bar, tens of canvas
+rows, per frame. `bar_scale()` therefore returns a latched pair of values while
+the window is fixed, and the live frame's extremes otherwise;
+`bar_scale_follow()` is the one
 place that decides, called from both `set_frame()` (the pump) and `resnap()` (a
 one-off gesture). The latch is also taken **at the press**, before the first move:
 the window only turns fixed *on* that move, so between the two the pump is still
