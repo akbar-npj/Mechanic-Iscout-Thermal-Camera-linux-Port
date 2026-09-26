@@ -77,6 +77,8 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSize>
+#include <QSlider>
+#include <QSpinBox>
 #include <QString>
 #include <QTabWidget>
 #include <QTextBrowser>
@@ -88,6 +90,7 @@
 #include "capture.h"
 #include "compare.h"
 #include "frame_source.h"
+#include "fusion.h"      /* dyt_fusion_clamp_align — the layout align's clamp */
 #include "imgwrite.h"    /* dyt_write_png — the still's shareable half */
 #include "mnn.h"         /* the optional super-resolution model */
 #include "palette.h"
@@ -206,6 +209,7 @@ struct opts {
     std::string capture_dir = ".";   /* where 's' and 'v' put their files */
     std::string model;               /* --model: the super-resolution model */
     std::string reference;           /* --reference: a saved still to diff against */
+    std::string layout_image;        /* --layout-image: a board layout to overlay */
     int  width   = 256;
     int  palette = 1;
     int  zoom    = 2;
@@ -363,6 +367,8 @@ static void usage(const char *prog)
         "                   zoom2.mnn in the tree or beside the installed app)\n"
         "  --reference PATH a saved still (.dyt.jpg) to diff against in the\n"
         "                   Comparison tab (default: none)\n"
+        "  --layout-image P a board layout image to overlay in the Circuit\n"
+        "                   Design tab (default: none)\n"
         "  --sr MODE        super-resolution: off|visible|thermal (default off)\n"
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
@@ -448,6 +454,7 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--fusion")                  { const char *v = next("--fusion"); if (!v) return false; o.fusion = std::atoi(v); }
         else if (a == "--model")                   { const char *v = next("--model"); if (!v) return false; o.model = v; }
         else if (a == "--reference")               { const char *v = next("--reference"); if (!v) return false; o.reference = v; }
+        else if (a == "--layout-image")            { const char *v = next("--layout-image"); if (!v) return false; o.layout_image = v; }
         else if (a == "--sr") {
             const char *v = next("--sr");
             if (!v) return false;
@@ -1283,6 +1290,56 @@ public:
         update();
     }
 
+    /* ---- the circuit-layout overlay -------------------------------------
+     *
+     * The Windows "Circuit Design" tab composites a board layout over the
+     * thermal picture, so a hot component can be read off the layout rather
+     * than off a bare blob.  There is no gerber/CAD parser in scope: the
+     * layout is an image the user supplies (a PNG), drawn over whichever
+     * picture the canvas is showing at that picture's own size — the live
+     * frame, or a saved still/clip the gallery put up.
+     *
+     * The align offset is in *drawn-image* pixels, not sensor pixels.  The
+     * layout is scaled to the drawn picture, so an offset in sensor pixels
+     * would silently change size when the user zoomed, which no other control
+     * in the app does; in drawn pixels "X +5" always moves the layout five
+     * pixels of the picture as it is shown, and the selftest can pin the
+     * composite without a sensor.  The ±40 range is the vendor's fusion
+     * alignment range (DYT_FUSION_ALIGN_MAX) and the clamp is
+     * dyt_fusion_clamp_align(), so the two alignment controls cannot disagree
+     * about what "in range" means — a shared limit, not a shared unit. */
+    void set_layout(const QImage &img)
+    {
+        layout_ = img;
+        update();
+    }
+    void clear_layout()
+    {
+        layout_ = QImage();
+        update();
+    }
+    bool  has_layout() const { return !layout_.isNull(); }
+    QSize layoutSize() const { return layout_.size(); }
+
+    void set_layout_align(int dx, int dy)
+    {
+        layout_dx_ = dyt_fusion_clamp_align(dx);
+        layout_dy_ = dyt_fusion_clamp_align(dy);
+        update();
+    }
+    int layout_dx() const { return layout_dx_; }
+    int layout_dy() const { return layout_dy_; }
+
+    void set_layout_opacity(int pct)
+    {
+        layout_opacity_ = std::max(0, std::min(100, pct));
+        update();
+    }
+    int layout_opacity() const { return layout_opacity_; }
+
+    void set_layout_shown(bool on) { layout_shown_ = on; update(); }
+    bool layout_shown() const { return layout_shown_; }
+
     /* Apply a measurement key.  Returns 1 if the key was ours, so the window
      * can fall through to whatever else it binds.  The snapshot is refreshed
      * so the overlay switches at once rather than at the next tick; only the
@@ -1677,11 +1734,16 @@ protected:
          * only thing there is to look at. */
         if (!override_.isNull()) {
             p.drawImage(QPoint(x0, y0), override_);
+            draw_layout(p);
             draw_confirm(p);
             return;
         }
 
         p.drawImage(QPoint(x0, y0), img_);
+
+        /* The circuit layout sits over the picture and under everything else,
+         * so the colour bar, the markers and the labels all stay on top. */
+        draw_layout(p);
 
         /* The colour bar.  The tick rule — which palette entry belongs to
          * which row — is the view model's, so the Qt bar and the OpenCV one
@@ -1887,6 +1949,56 @@ protected:
     }
 
 private:
+    /* The circuit-layout overlay: the loaded layout scaled to the picture it
+     * sits over and offset by the align control, alpha-composited at the
+     * opacity the slider sets.  Drawn over the base image and *under* every
+     * other overlay, so the measurement markers and the info panel stay
+     * readable on top of it — the layout is context, not a measurement.
+     *
+     * The picture it covers is the override when one is up, else the live
+     * frame; with neither there is nothing to align a layout to, so it is
+     * skipped (and the placeholder path never reaches here). */
+    void draw_layout(QPainter &p)
+    {
+        if (!layout_shown_ || layout_.isNull() || layout_opacity_ <= 0)
+            return;
+        const QImage &under = override_.isNull() ? img_ : override_;
+        if (under.isNull())
+            return;
+
+        /* On the live frame the layout gets the *same* turn and mirrors the
+         * picture got, so it moves with the thermal content instead of staying
+         * put while the picture turns under it.  The dst rect below does the
+         * scaling (the layout is stretched to cover the picture whatever its
+         * own size), so only the rotation and the flips are applied here —
+         * the same QTransform primitives, in the same order, that
+         * transformed() uses for the frame itself.  A saved still or clip
+         * already has its transform baked into the image, so its layout is
+         * drawn as loaded. */
+        QImage lay = layout_;
+        if (override_.isNull()) {
+            if (snap_.xform.rot)
+                lay = lay.transformed(QTransform().rotate(snap_.xform.rot),
+                                      Qt::FastTransformation);
+            Qt::Orientations ori;
+            if (snap_.xform.flip_h) ori |= Qt::Horizontal;
+            if (snap_.xform.flip_v) ori |= Qt::Vertical;
+            if (ori)
+                lay = lay.flipped(ori);
+        }
+
+        const QRect dst(kPad + layout_dx_, kPad + layout_dy_,
+                        under.width(), under.height());
+        /* Clipped to the picture's rect: an aligned layout is meant to shift
+         * *within* the picture, and without this a positive offset would
+         * bleed over the colour bar. */
+        p.save();
+        p.setClipRect(QRect(kPad, kPad, under.width(), under.height()));
+        p.setOpacity(layout_opacity_ / 100.0);
+        p.drawImage(dst, lay);
+        p.restore();
+    }
+
     /* The device panel: the module serial, the decoded user serial, the four
      * stored radiometric parameters and the slot count, top-left over the
      * image — the reference viewer's placement (draw_info_panel).  A value a
@@ -2016,6 +2128,14 @@ private:
     /* A saved still or clip frame being viewed.  Owned here; pushed by
      * MainWindow, which is also where the gallery lives. */
     QImage                    override_;
+
+    /* The circuit-layout overlay (see set_layout).  `layout_` empty means none
+     * is loaded; whether a loaded one is drawn is `layout_shown_`, which the
+     * page's toggle owns. */
+    QImage                    layout_;
+    int                       layout_dx_ = 0, layout_dy_ = 0;
+    int                       layout_opacity_ = 100;
+    bool                      layout_shown_ = false;
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -3344,7 +3464,8 @@ public:
      * tab is inserted ahead of them — which is exactly what happened when 3D
      * Analysis landed. */
     enum Tab {
-        TabTroubleshoot = 0, TabAnalysis3D, TabComparison, TabSuperResolution,
+        TabTroubleshoot = 0, TabAnalysis3D, TabComparison, TabCircuitDesign,
+        TabSuperResolution,
         TabCount
     };
 
@@ -3361,6 +3482,7 @@ public:
         tabs_->addTab(build_troubleshoot(), QStringLiteral("Troubleshoot"));
         tabs_->addTab(build_analysis_3d(), QStringLiteral("3D Analysis"));
         tabs_->addTab(build_comparison(), QStringLiteral("Comparison"));
+        tabs_->addTab(build_circuit_design(), QStringLiteral("Circuit Design"));
         tabs_->addTab(build_super_resolution(),
                       QStringLiteral("Super Resolution"));
     }
@@ -3409,6 +3531,55 @@ public:
     double compare_threshold() const
     {
         return ref_thresh_ ? ref_thresh_->value() : 2.0;
+    }
+
+    /* The Circuit Design tab's hooks.  The pump/window owns the canvas, so it
+     * is what loads the image and pushes the alignment into FrameView; the
+     * panel is the view, exactly the split the Comparison hooks take.
+     * `on_layout_changed_` fires for the align spins, the opacity slider and
+     * the show toggle alike, so the window has one push to make. */
+    std::function<void()> on_load_layout_;
+    std::function<void()> on_clear_layout_;
+    std::function<void()> on_layout_changed_;
+
+    /* What the layout controls are set to, as the push reads them.  Public so
+     * the window (and the selftest) can drive the panel→canvas contract
+     * without reaching into private members. */
+    int  layout_dx() const { return layout_spin_x_ ? layout_spin_x_->value() : 0; }
+    int  layout_dy() const { return layout_spin_y_ ? layout_spin_y_->value() : 0; }
+    int  layout_opacity() const
+    {
+        return layout_opacity_ ? layout_opacity_->value() : 100;
+    }
+    bool layout_shown() const
+    {
+        return layout_show_ ? layout_show_->isChecked() : false;
+    }
+    /* The align fields, so the selftest can pin their ±DYT_FUSION_ALIGN_MAX
+     * clamp — the same limit the vendor's fusion alignment uses. */
+    QSpinBox *layout_spin_x() const { return layout_spin_x_; }
+    QSpinBox *layout_spin_y() const { return layout_spin_y_; }
+
+    /* Push the loaded layout's path (or "(none)") into the page, the way
+     * sync_compare() pushes the reference path. */
+    void sync_layout(const QString &path)
+    {
+        if (layout_path_)
+            layout_path_->setText(path.isEmpty() ? QStringLiteral("(none)")
+                                                 : path);
+    }
+
+    /* Turn the page's show toggle on or off.  Public because the window is
+     * what loads an image (a dialog or --layout-image), and loading one that
+     * stayed hidden because the toggle happened to be off would look like the
+     * load failed.  Signals are blocked: the caller pushes afterwards, and a
+     * signal here would push twice. */
+    void set_layout_shown(bool on)
+    {
+        if (!layout_show_)
+            return;
+        const QSignalBlocker block(layout_show_);
+        layout_show_->setChecked(on);
     }
 
     /* The panel is as tall as its current page's content.
@@ -3806,6 +3977,139 @@ private:
         return scroll;
     }
 
+    /* The Circuit Design tab.  The Windows panel overlays a board layout on
+     * the thermal picture so a hot component can be named; with no
+     * gerber/CAD parser in scope, the layout is an image the user loads.  The
+     * page only *drives* the overlay — the image lives on FrameView and the
+     * compositing happens in its draw path — so this page is the same
+     * "controls that push, not a second renderer" shape the other tabs use. */
+    QWidget *build_circuit_design()
+    {
+        auto *page = new QWidget;
+        auto *lay  = new QVBoxLayout(page);
+        lay->setContentsMargins(6, 6, 6, 6);
+        lay->setSpacing(8);
+
+        QGroupBox *src = group(QStringLiteral("Layout image"));
+        auto *slay = qobject_cast<QVBoxLayout *>(src->layout());
+        layout_path_ = new QLabel(QStringLiteral("(none)"), src);
+        layout_path_->setWordWrap(true);
+        layout_path_->setFocusPolicy(Qt::NoFocus);
+        layout_path_->setObjectName(QStringLiteral("layoutpath"));
+        slay->addWidget(layout_path_);
+
+        auto *load = new QPushButton(QStringLiteral("Load layout…"), src);
+        load->setFocusPolicy(Qt::NoFocus);
+        load->setObjectName(QStringLiteral("loadlayout"));
+        connect(load, &QPushButton::clicked, [this]() {
+            if (on_load_layout_)
+                on_load_layout_();
+        });
+        slay->addWidget(load);
+
+        auto *clear = new QPushButton(QStringLiteral("Clear layout"), src);
+        clear->setFocusPolicy(Qt::NoFocus);
+        clear->setObjectName(QStringLiteral("clearlayout"));
+        connect(clear, &QPushButton::clicked, [this]() {
+            if (on_clear_layout_)
+                on_clear_layout_();
+        });
+        slay->addWidget(clear);
+        lay->addWidget(src);
+
+        /* Alignment and opacity.  The ±range is the vendor's fusion alignment
+         * limit, so the two alignment controls share one definition of "in
+         * range" — dyt_fusion_clamp_align() is the clamp FrameView applies,
+         * and the spin's own range is the same constant. */
+        QGroupBox *adj = group(QStringLiteral("Alignment"));
+        auto *alay = qobject_cast<QVBoxLayout *>(adj->layout());
+
+        auto *xrow = new QHBoxLayout;
+        xrow->setContentsMargins(0, 0, 0, 0);
+        xrow->setSpacing(6);
+        auto *xlbl = new QLabel(QStringLiteral("X offset:"), adj);
+        xlbl->setFocusPolicy(Qt::NoFocus);
+        xrow->addWidget(xlbl);
+        layout_spin_x_ = new QSpinBox(adj);
+        layout_spin_x_->setFocusPolicy(Qt::NoFocus);
+        layout_spin_x_->setRange(-DYT_FUSION_ALIGN_MAX, DYT_FUSION_ALIGN_MAX);
+        layout_spin_x_->setSuffix(QStringLiteral(" px"));
+        layout_spin_x_->setObjectName(QStringLiteral("layoutx"));
+        connect(layout_spin_x_, qOverload<int>(&QSpinBox::valueChanged),
+                [this](int) { layout_changed(); });
+        xrow->addWidget(layout_spin_x_);
+        alay->addLayout(xrow);
+
+        auto *yrow = new QHBoxLayout;
+        yrow->setContentsMargins(0, 0, 0, 0);
+        yrow->setSpacing(6);
+        auto *ylbl = new QLabel(QStringLiteral("Y offset:"), adj);
+        ylbl->setFocusPolicy(Qt::NoFocus);
+        yrow->addWidget(ylbl);
+        layout_spin_y_ = new QSpinBox(adj);
+        layout_spin_y_->setFocusPolicy(Qt::NoFocus);
+        layout_spin_y_->setRange(-DYT_FUSION_ALIGN_MAX, DYT_FUSION_ALIGN_MAX);
+        layout_spin_y_->setSuffix(QStringLiteral(" px"));
+        layout_spin_y_->setObjectName(QStringLiteral("layouty"));
+        connect(layout_spin_y_, qOverload<int>(&QSpinBox::valueChanged),
+                [this](int) { layout_changed(); });
+        yrow->addWidget(layout_spin_y_);
+        alay->addLayout(yrow);
+
+        auto *orow = new QHBoxLayout;
+        orow->setContentsMargins(0, 0, 0, 0);
+        orow->setSpacing(6);
+        auto *olbl = new QLabel(QStringLiteral("Opacity:"), adj);
+        olbl->setFocusPolicy(Qt::NoFocus);
+        orow->addWidget(olbl);
+        layout_opacity_ = new QSlider(Qt::Horizontal, adj);
+        layout_opacity_->setFocusPolicy(Qt::NoFocus);
+        layout_opacity_->setRange(0, 100);
+        layout_opacity_->setValue(100);
+        layout_opacity_->setObjectName(QStringLiteral("layoutopacity"));
+        connect(layout_opacity_, &QSlider::valueChanged,
+                [this](int) { layout_changed(); });
+        orow->addWidget(layout_opacity_, 1);
+        alay->addLayout(orow);
+
+        layout_show_ = new QCheckBox(QStringLiteral("Show layout"), adj);
+        layout_show_->setFocusPolicy(Qt::NoFocus);
+        layout_show_->setChecked(true);
+        layout_show_->setObjectName(QStringLiteral("layoutshow"));
+        connect(layout_show_, &QCheckBox::toggled,
+                [this](bool) { layout_changed(); });
+        alay->addWidget(layout_show_);
+        lay->addWidget(adj);
+
+        auto *hint = new QLabel(
+            QStringLiteral("Load a board layout (a PNG or other image) to "
+                           "composite it over the picture.  The offset is in "
+                           "pixels of the displayed picture; the range matches "
+                           "the fusion alignment (±%1).").arg(
+                               DYT_FUSION_ALIGN_MAX), page);
+        hint->setObjectName(QStringLiteral("layouthint"));
+        hint->setWordWrap(true);
+        hint->setFocusPolicy(Qt::NoFocus);
+        lay->addWidget(hint);
+
+        lay->addStretch(1);
+
+        auto *scroll = new QScrollArea(this);
+        scroll->setWidget(page);
+        scroll->setWidgetResizable(true);
+        scroll->setFocusPolicy(Qt::NoFocus);
+        scroll->setFrameShape(QFrame::NoFrame);
+        return scroll;
+    }
+
+    /* One place for the three controls' change to reach the window, so a new
+     * control cannot forget to push. */
+    void layout_changed()
+    {
+        if (on_layout_changed_)
+            on_layout_changed_();
+    }
+
     /* The Super Resolution tab.  Off / Visible plane (2x) / Thermal plane
      * (2x), one at a time, each routed through the same dispatch as the 'z'
      * and 'Z' keys.  The page is ours, not the vendor's: super-resolution is a
@@ -4042,12 +4346,33 @@ private:
     QLabel      *ref_stats_ = nullptr;   /* the Comparison tab's difference stats */
     QDoubleSpinBox *ref_thresh_ = nullptr; /* the Comparison tab's threshold */
     SurfaceView *surface_   = nullptr;   /* the 3D Analysis tab's view */
+    /* The Circuit Design tab's controls.  The image itself lives on FrameView;
+     * these only drive it. */
+    QLabel    *layout_path_    = nullptr;
+    QSpinBox  *layout_spin_x_  = nullptr;
+    QSpinBox  *layout_spin_y_  = nullptr;
+    QSlider   *layout_opacity_ = nullptr;
+    QCheckBox *layout_show_    = nullptr;
     /* The mode the last sync reported, so the Off row knows which key means
      * "off" from where the session is.  Kept as the last *synced* mode rather
      * than read live because the panel has no session handle — it reports, it
      * does not act on the engine directly. */
     dyt_sr_t     sr_mode_ = DYT_SR_OFF;
 };
+
+/* Push the Circuit Design page's controls into the canvas.  A free function
+ * rather than a lambda inside run_gui so the selftest can drive the same
+ * contract: the panel is the view and FrameView is the canvas, and this is the
+ * one place the two are joined.  Called on every control change and once at
+ * start-up, so the two cannot drift. */
+static void push_layout(ControlPanel *panel, FrameView *view)
+{
+    if (!panel || !view)
+        return;
+    view->set_layout_align(panel->layout_dx(), panel->layout_dy());
+    view->set_layout_opacity(panel->layout_opacity());
+    view->set_layout_shown(panel->layout_shown());
+}
 
 /* --------------------------------------------------------- settings dialog */
 
@@ -8956,6 +9281,177 @@ static int selftest(const opts &o)
             fails++;
     }
 
+    /* 61. The Circuit Design tab.  The vendor's panel overlays a board layout
+     * on the thermal picture; with no gerber/CAD parser in scope the layout is
+     * an image the user loads.  Six risks, each a different failure: the tab is
+     * not where the vendor puts it or is not named for what it does; the align
+     * control accepts a value the canvas will not honour, so the two disagree
+     * about what the control means; the panel and the canvas are not actually
+     * joined; the overlay does not hold what was loaded; it does not composite
+     * at all — a loaded image that changed no pixel looks exactly like a
+     * working one in a screenshot of the page; and it does not follow the view,
+     * so it stays put while the thermal content turns under it.  The composite
+     * is therefore asserted by *difference* against the same canvas rendered
+     * with no layout: an opaque stripe must appear where the layout puts it,
+     * move by exactly the offset, and turn with a quarter turn. */
+    {
+        ControlPanel *panel = win.panel();
+        QTabWidget   *tabs  = panel ? panel->tabs() : nullptr;
+        FrameView    *view  = win.view();
+
+        const bool tab_ok = tabs && panel &&
+                            tabs->count() == ControlPanel::TabCount &&
+                            tabs->tabText(ControlPanel::TabCircuitDesign) ==
+                                QStringLiteral("Circuit Design") &&
+                            tabs->tabText(ControlPanel::TabComparison) ==
+                                QStringLiteral("Comparison") &&
+                            tabs->tabText(ControlPanel::TabSuperResolution) ==
+                                QStringLiteral("Super Resolution");
+
+        /* The align fields clamp to the vendor's fusion range.  The canvas
+         * clamps with the same function (dyt_fusion_clamp_align), so a value
+         * the spin accepted but the canvas refused cannot exist. */
+        bool clamp_ok = false;
+        if (panel && panel->layout_spin_x() && panel->layout_spin_y()) {
+            QSpinBox *sx = panel->layout_spin_x();
+            QSpinBox *sy = panel->layout_spin_y();
+            sx->setValue(1000);
+            sy->setValue(-1000);
+            const bool hi = sx->value() ==  DYT_FUSION_ALIGN_MAX &&
+                            sy->value() == -DYT_FUSION_ALIGN_MAX;
+            sx->setValue(-1000);
+            sy->setValue(1000);
+            const bool lo = sx->value() == -DYT_FUSION_ALIGN_MAX &&
+                            sy->value() ==  DYT_FUSION_ALIGN_MAX;
+            sx->setValue(0);
+            sy->setValue(0);
+            clamp_ok = hi && lo;
+        }
+
+        /* The panel→canvas push, through the very function run_gui wires, so
+         * the contract the app uses is the one under test. */
+        bool wire_ok = false;
+        if (panel && view && panel->layout_spin_x()) {
+            panel->on_layout_changed_ = [&]() { push_layout(panel, view); };
+            panel->layout_spin_x()->setValue(7);
+            panel->layout_spin_y()->setValue(-9);
+            wire_ok = view->layout_dx() == 7 && view->layout_dy() == -9;
+            panel->layout_spin_x()->setValue(0);
+            panel->layout_spin_y()->setValue(0);
+            panel->on_layout_changed_ = nullptr;
+        }
+
+        /* A 256x192 layout, one opaque stripe and the rest transparent — the
+         * shape that makes "did it composite?" a pixel question rather than a
+         * colour one, so it cannot be confused with the picture underneath. */
+        QImage layout(256, 192, QImage::Format_ARGB32);
+        layout.fill(Qt::transparent);
+        {
+            QPainter lp(&layout);
+            lp.fillRect(QRect(0, 0, 8, 192), QColor(0, 255, 0));
+        }
+
+        bool hold_ok = false, paint_ok = false, move_ok = false, rot_ok = false;
+        if (view) {
+            /* Establish the framing this probe assumes: the layout is given
+             * the view's rotation and mirrors, so the stripe's position is
+             * only predictable with the view unrotated and unmirrored.  Reset
+             * and re-render rather than trusting what earlier assertions left
+             * — the same rule 53g follows in the other direction. */
+            dyt_session_reset_view(sess);
+            pm.step();
+
+            /* Hide the overlays that draw over the picture, so the probe is
+             * about the layout and not about a marker that happens to sit on
+             * it.  Restored before returning. */
+            const bool had_hot = view->hot_shown();
+            const bool had_info = fv->info_shown();
+            if (had_hot)
+                view->toggle_hot();
+            if (had_info)
+                fv->toggle_info();
+            fv->measure_key('n');       /* no tool outline over the probe */
+
+            view->clear_layout();
+            view->set_layout_opacity(100);
+            view->set_layout_shown(false);
+            const QImage base = view->render_canvas();
+
+            view->set_layout(layout);
+            view->set_layout_shown(true);
+            hold_ok = view->has_layout() && view->layoutSize() == QSize(256, 192);
+
+            const QImage with = view->render_canvas();
+
+            /* The stripe is scaled to the drawn picture, so probe in drawn
+             * pixels: 8/256 = 1/32 of the picture's width, at its mid height. */
+            const int iw = view->imageSize().width();
+            const int ih = view->imageSize().height();
+            const int py = kPad + ih / 2;
+            const int px = kPad + iw / 64;      /* inside the stripe */
+            const int ox = kPad + iw / 4;       /* clear of it */
+
+            paint_ok = iw > 0 && ih > 0 &&
+                       with.pixel(px, py) != base.pixel(px, py) &&
+                       with.pixel(ox, py) == base.pixel(ox, py);
+
+            /* Moving the layout +20 px in x must move the covered pixel by
+             * exactly that: the old probe is clear again, and the probe 20 px
+             * to its right is now covered. */
+            view->set_layout_align(20, 0);
+            const QImage moved = view->render_canvas();
+            move_ok = moved.pixel(px, py) == base.pixel(px, py) &&
+                      moved.pixel(px + 20, py) != base.pixel(px + 20, py) &&
+                      view->layout_dx() == 20;
+
+            /* The canvas clamps too, not only the spin. */
+            view->set_layout_align(1000, -1000);
+            move_ok = move_ok && view->layout_dx() ==  DYT_FUSION_ALIGN_MAX &&
+                      view->layout_dy() == -DYT_FUSION_ALIGN_MAX;
+            view->set_layout_align(0, 0);
+
+            /* The layout follows the view's rotation.  A quarter turn turns
+             * the vertical stripe into a horizontal band along the top, so the
+             * probe moves from the left edge to the top edge — the check that
+             * the overlay is not pinned to the unrotated picture while the
+             * thermal content turns under it.  Rendered against the same
+             * rotated frame with no layout, so the comparison is the layout's
+             * contribution and not the rotation's. */
+            dyt_session_rotate(sess, DYT_ROT_90);
+            pm.step();
+            view->set_layout_shown(false);
+            const QImage rbase = view->render_canvas();
+            view->set_layout_shown(true);
+            const QImage rwith = view->render_canvas();
+            const int rw = view->imageSize().width();
+            const int rh = view->imageSize().height();
+            rot_ok = rw > 0 && rh > 0 &&
+                     rwith.pixel(kPad + rw / 2, kPad + rh / 64) !=
+                         rbase.pixel(kPad + rw / 2, kPad + rh / 64);
+
+            /* Leave the view and the canvas as the rest of the run found them. */
+            dyt_session_reset_view(sess);
+            pm.step();
+            view->clear_layout();
+            if (had_hot)
+                view->toggle_hot();
+            if (had_info)
+                fv->toggle_info();
+        }
+
+        const bool ok = tab_ok && clamp_ok && wire_ok && hold_ok &&
+                        paint_ok && move_ok && rot_ok;
+        std::printf("  %-4s the Circuit Design tab overlays a layout and "
+                    "aligns it (tab %s, clamp %s, push %s, hold %s, paint %s, "
+                    "move %s, rot %s)\n",
+                    ok ? "ok" : "FAIL", tab_ok ? "yes" : "NO",
+                    clamp_ok ? "yes" : "NO", wire_ok ? "yes" : "NO",
+                    hold_ok ? "yes" : "NO", paint_ok ? "yes" : "NO",
+                    move_ok ? "yes" : "NO", rot_ok ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
     /* Leave the view model's state as the rest of the run found it. */
     fv->clear_info();
     win.on_quit_  = nullptr;
@@ -9472,6 +9968,58 @@ static int run_gui(const opts &o_in, QApplication &app)
          * let that happen.  The hook exists so the panel can grow a side
          * effect later without a second wiring. */
     };
+
+    /* The Circuit Design tab.  The overlay lives on the canvas, so the window
+     * is what loads the image and what pushes the alignment; the panel only
+     * holds the controls.  Loading turns the show toggle on, so an image that
+     * loaded while the toggle was off cannot look like a failed load. */
+    win.panel()->on_load_layout_ = [&]() {
+        const QString qpath = QFileDialog::getOpenFileName(
+            &win, QStringLiteral("Load circuit layout"),
+            QString::fromStdString(o.capture_dir),
+            QStringLiteral("Images (*.png *.jpg *.jpeg *.bmp *.gif);;"
+                           "All files (*)"));
+        if (qpath.isEmpty())
+            return;
+        const QImage img(qpath);
+        if (img.isNull()) {
+            pm.notice("cannot read layout image", 200);
+            return;
+        }
+        win.view()->set_layout(img);
+        win.panel()->set_layout_shown(true);
+        win.panel()->sync_layout(qpath);
+        push_layout(win.panel(), win.view());
+        pm.notice("layout loaded", 120);
+    };
+    win.panel()->on_clear_layout_ = [&]() {
+        win.view()->clear_layout();
+        win.panel()->sync_layout(QString());
+        pm.notice("layout cleared", 120);
+    };
+    win.panel()->on_layout_changed_ = [&]() {
+        push_layout(win.panel(), win.view());
+    };
+    /* The controls start where the page built them (centred, opaque, shown),
+     * so the canvas and the page agree before any click. */
+    push_layout(win.panel(), win.view());
+
+    /* An explicit --layout-image loads at start-up, the way the button does,
+     * so a scripted run can pin the overlay without a click.  A path that
+     * cannot be read is reported and skipped rather than fatal: the layout is
+     * an overlay, not the app's reason to run. */
+    if (!o.layout_image.empty()) {
+        const QImage img(QString::fromStdString(o.layout_image));
+        if (img.isNull()) {
+            std::fprintf(stderr, "dytqt: --layout-image %s is not readable\n",
+                         o.layout_image.c_str());
+        } else {
+            win.view()->set_layout(img);
+            win.panel()->set_layout_shown(true);
+            win.panel()->sync_layout(QString::fromStdString(o.layout_image));
+            push_layout(win.panel(), win.view());
+        }
+    }
 
     /* An explicit --reference loads the still at start-up, the same way the
      * button does, so a scripted run can pin the comparison without a click. */

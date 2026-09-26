@@ -39,6 +39,7 @@ MainWindow : QWidget
         │                         High Temperature / Image Enhancement / Capture
         ├── "3D Analysis"         a height-mapped surface of the frame
         ├── "Comparison"          a saved reference vs the live frame
+        ├── "Circuit Design"      a board layout overlaid on the frame
         └── "Super Resolution"    Off / Visible plane (2x) / Thermal plane (2x)
 ```
 
@@ -60,11 +61,10 @@ Measurement (Spot / Line / Rectangle / Polygon / None), Analysis (Line / Chart
 analysis), High Temperature (Tracking / Alarm / Highlight), Image Enhancement
 (the two flips and Fixed range) and Capture (Still / Record / Gallery). The
 first four are the reference's own groups, in its own order; Capture is this
-port's addition. Only groups the engine backs are present — the Circuit Design
-tab still waits for its feature (Track B) — so nothing on screen is a control
-that does nothing. The **3D Analysis** and **Comparison** tabs sit between
-Troubleshoot and Super Resolution, where the Windows panel puts them: see
-below.
+port's addition. Every group the panel shows is backed by the engine — there is
+no longer a tab that waits for its feature. The **3D Analysis**, **Comparison**
+and **Circuit Design** tabs sit between Troubleshoot and Super Resolution, where
+the Windows panel puts them: see below.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -204,6 +204,45 @@ mismatched pair. The rail's **Compare** button is now live (it was greyed
 while the engine waited) and switches the panel to this tab — assertion 53g
 flipped from "Compare is disabled" to "Compare switches the tab".
 
+**Circuit Design** is the last of the Windows panel's tabs. It overlays a board
+layout image on the thermal picture, so a hot component can be named off the
+layout rather than off a bare blob. There is no gerber/CAD parser in scope — the
+layout is an image the user loads ("Load layout…" opens a file dialog, or
+`--layout-image PATH` loads one at start-up). The image lives on **`FrameView`**,
+not on the panel: `set_layout()` / `clear_layout()` / `set_layout_align()` /
+`set_layout_opacity()` / `set_layout_shown()`, and a private `draw_layout()`
+composites it in `draw_content()` over the base picture and *under* every other
+overlay, so the colour bar, the H/L markers and the info panel all stay readable
+on top. The page only drives those — `ControlPanel::on_load_layout_`,
+`on_clear_layout_`, `on_layout_changed_`, with one free `push_layout()` that both
+`run_gui` and the selftest wire, so the panel→canvas contract is the one under
+test. Loading an image turns the page's show toggle on, so a load that happened
+while the toggle was off cannot look like a failed load.
+
+The align offset is in **drawn-image pixels**, not sensor pixels: the layout is
+scaled to the drawn picture, so an offset in sensor pixels would silently change
+size when the user zoomed, which no other control does. The ±40 range is the
+vendor's fusion alignment limit (`DYT_FUSION_ALIGN_MAX`) and the clamp is
+`dyt_fusion_clamp_align()` — the very function the canvas applies — so the spin
+box and the canvas cannot disagree about what "in range" means. On the live frame
+the layout also gets the view's **rotation and mirrors** (the same `QTransform`
+primitives `transformed()` uses for the frame, in the same order), so it turns
+with the thermal content instead of staying put while the picture turns under it;
+a saved still or clip already has its transform baked in, so its layout is drawn
+as loaded.
+
+Assertion 61 pins the tab's name and place, the spin's ±40 clamp, the
+panel→canvas push, that the overlay holds the image, the composite itself, and
+that the layout follows a quarter turn. The composite is asserted by *difference*
+against the same canvas rendered with no layout: a 256×192 layout with one opaque
+stripe must appear where the layout puts it, move by exactly the offset, and —
+after `dyt_session_rotate()` — reappear as a horizontal band along the top. A
+loaded image that changed no pixel would look identical to a working one in a
+screenshot of the page, which is why the check is a pixel difference rather than
+a "the widget is not null". The probe hides the hot markers and the tool first
+(and restores them), so a marker cannot sit on the probe and fail it for the
+wrong reason.
+
 A `QTabWidget` whose tabs do not fit hides the overflow behind scroll arrows —
 the "control the user cannot reach" failure, and a live risk here because the tab
 count only grows. The tab style therefore carries `font-size: 9px` (matching the
@@ -216,13 +255,13 @@ the unthemed metrics they were calibrated against.
 The column is sized for the **tab bar**, not for the rows: the Windows panel
 carries four horizontal tabs (Troubleshoot | 3D Analysis | Comparison | Circuit
 Design) and ours carries those plus Super Resolution, so `kPanelW` is 440 px.
-Measured with the tab style above, the four tabs built today want 330 px of the
-438 available (assertion 53d prints it), which leaves room for Circuit Design
-when Track B finishes it. The vendor's own panel is ~400 px by the same measure,
-so this is close to the reference rather than a departure from it. (It was
-224 px, sized for a single Troubleshoot tab; that overflowed as soon as the
-second tab landed — the two wanted 239 px of the 222 available — and assertion
-53d is what caught it.)
+Measured with the tab style above, the five tabs built today want 415 px of the
+438 available (assertion 53d prints it) — tight, but the fit is what 53d exists
+to check, and it fails loudly on any host whose font metrics push it over. The
+vendor's own panel is ~400 px by the same measure, so this is close to the
+reference rather than a departure from it. (It was 224 px, sized for a single
+Troubleshoot tab; that overflowed as soon as the second tab landed — the two
+wanted 239 px of the 222 available — and assertion 53d is what caught it.)
 
 Its **height** is the same concern turned vertical, and it is subtler. Each
 scrollable page sits in a `QScrollArea` with `widgetResizable(true)`, which
@@ -1096,6 +1135,8 @@ is unaffected.
 | `--unit N` | temperature unit: 0 = C, 1 = F, 2 = K (default C) |
 | `--fusion N` | fusion pattern index (default 0 = infrared only) |
 | `--model PATH` | super-resolution model (default: search for `zoom2.mnn`) |
+| `--reference PATH` | a saved still (`.dyt.jpg`) to diff against in the Comparison tab (default: none) |
+| `--layout-image PATH` | a board layout image to overlay in the Circuit Design tab (default: none) |
 | `--sr MODE` | super-resolution: `off` \| `visible` \| `thermal` (default `off`) |
 | `--frames N` | stop after N frames (default: run until closed) |
 | `--fps N` | timer rate (default 25) |
@@ -1208,10 +1249,10 @@ $ ./build/dytqt --selftest
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the control panel cannot take the keyboard (22 control(s), 0 that would)
+  ok   the control panel cannot take the keyboard (24 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
-  ok   every control-panel tab fits, with no scroll arrow (4 tab(s), 330 px of 438)
+  ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
@@ -1219,6 +1260,7 @@ $ ./build/dytqt --selftest
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
+  ok   the Circuit Design tab overlays a layout and aligns it (tab yes, clamp yes, push yes, hold yes, paint yes, move yes, rot yes)
 === ALL PASS ===
 ```
 
