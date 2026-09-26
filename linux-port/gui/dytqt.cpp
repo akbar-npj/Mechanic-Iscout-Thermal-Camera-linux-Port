@@ -1325,6 +1325,11 @@ public:
         snap_  = snap;
         img_   = img;
         pal_   = pal;
+        /* The bar's scale follows the range mode, and this is the one place a
+         * live frame reaches the view: a fixed window latches the scale here,
+         * an auto one releases it, so the live frame's drifting extremes
+         * cannot move a window the user has set.  See bar_scale. */
+        bar_scale_follow();
         temps_ = temps;   /* borrowed from the pump's scratch, refreshed here
                            * in the same step() that fills it, so no paint can
                            * see a stale plane */
@@ -1450,8 +1455,10 @@ public:
      * right-click), not for a drag. */
     void resnap()
     {
-        if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0)
+        if (sess_ && dyt_session_snapshot(sess_, &snap_, nullptr, 0) == 0) {
+            bar_scale_follow();
             update();
+        }
     }
 
     /* Apply a view key — palette, unit, range, flip, zoom, fusion,
@@ -1966,10 +1973,10 @@ public:
      * session.  FrameView has no session to set a range on and no business
      * owning one — the same split push_layout and push_alarm take. */
 
-    /* The scale the bar is drawn over: the frame's own extremes.  A frame with
-     * no spread (or none yet) falls back to the display range, so the
+    /* The scale the bar is a scale *over*: the frame's own extremes.  A frame
+     * with no spread (or none yet) falls back to the display range, so the
      * fractions below stay finite rather than dividing by zero. */
-    void bar_scale(float *lo, float *hi) const
+    void live_bar_scale(float *lo, float *hi) const
     {
         if (snap_.stats.hi > snap_.stats.lo) {
             *lo = snap_.stats.lo;
@@ -1980,9 +1987,75 @@ public:
         }
     }
 
-    /* The canvas y of the bar row a temperature sits on, and its widget-space
-     * twin.  The widget one goes through the display transform, so a hit test
-     * and the drawing cannot disagree about where the handle is. */
+    /* The scale the bar is drawn over, and the one a drag is measured
+     * against.
+     *
+     * At AUTO the window *is* the frame, so the scale is the frame's own
+     * extremes and re-fits with every frame — which is what auto means, and
+     * invisible, because the handles are then pinned to the bar's two ends.
+     *
+     * Once the window is FIXED the scale must *not* follow the frame any
+     * more.  The bar is then a fixed ruler with the window a sub-range of it
+     * — the vendor's own arrangement, where `panel_temp_line` is a
+     * fixed-length scale and the window is the rectangle the two handles
+     * bound — so the handles stay where the user put them.  A scale that
+     * re-fit every frame would slide both handles around under the pointer as
+     * the live frame's drifting min/max moved it: the handle being dragged
+     * would not stay at the point it was grabbed, and the *other* end would
+     * wander too, though its value never changed.  That is the bug this
+     * latch exists to prevent, and it is why the latch is taken at the press
+     * as well as on a fixed snapshot — the first move of a drag must already
+     * be measured against the scale the grab was made on. */
+    void bar_scale(float *lo, float *hi) const
+    {
+        if (bar_scale_locked_) {
+            *lo = bar_lock_lo_;
+            *hi = bar_lock_hi_;
+            return;
+        }
+        live_bar_scale(lo, hi);
+    }
+
+    /* Freeze the scale at the frame's own extremes.  Latched once, the scale
+     * only ever grows, and only for a *fixed* window: the vendor's window is
+     * always a sub-rectangle of its bar, so one set wider than the frame
+     * (Rapid Diagnostics brackets the extremes with a margin) expands the
+     * ruler rather than pinning both handles to the ends and reading as no
+     * window at all.  An auto window is the frame itself and needs no such
+     * guarantee — expanding for it would let the frame's own drift grow the
+     * ruler, which is the very thing the latch exists to stop. */
+    void bar_scale_latch()
+    {
+        if (!bar_scale_locked_) {
+            live_bar_scale(&bar_lock_lo_, &bar_lock_hi_);
+            bar_scale_locked_ = true;
+        }
+        if (snap_.range_mode != DYT_RANGE_FIXED)
+            return;
+        if (snap_.lo < bar_lock_lo_) bar_lock_lo_ = snap_.lo;
+        if (snap_.hi > bar_lock_hi_) bar_lock_hi_ = snap_.hi;
+    }
+
+    /* Follow the range mode: a fixed window latches the scale, an auto one
+     * hands it back to the frame.  The single place both rules are applied,
+     * so the live pump (set_frame), a one-off gesture (resnap) and the press
+     * that starts a drag cannot disagree about which scale is in force.
+     *
+     * A drag in progress holds its scale whatever the mode says: the window
+     * only turns fixed on the first *move*, so between the press and that move
+     * the pump is still reporting auto and would otherwise unlock the scale
+     * the grab was measured against. */
+    void bar_scale_follow()
+    {
+        if (bar_drag_ >= 0 || snap_.range_mode == DYT_RANGE_FIXED)
+            bar_scale_latch();
+        else
+            bar_scale_locked_ = false;
+    }
+
+    /* The canvas y of the bar row a temperature sits on.  Canvas, because
+     * that is the space the handles are drawn and hit-tested in — a hit test
+     * and the drawing must not disagree about where the handle is. */
     int bar_row_canvas(float c) const
     {
         float bl = 0.f, bhi = 0.f;
@@ -1995,8 +2068,8 @@ public:
     }
 
     /* The degrees one canvas row of the bar is worth — the scale's span over
-     * its height.  The handles are fixed, so a drag is *relative*:
-     * `bar_drag_apply` turns the pointer's travel into rows of this. */
+     * its height.  A drag is *relative*, like the vendor's: `bar_drag_apply`
+     * turns the pointer's travel into rows of this. */
     float bar_deg_per_row() const
     {
         float bl = 0.f, bhi = 0.f;
@@ -2208,6 +2281,12 @@ protected:
          * own `lut_num` model; see bar_drag_apply). */
         const int h = bar_handle_at(e->pos());
         if (h >= 0) {
+            /* Freeze the scale *now*, before the first move: the gesture is
+             * measured against the ruler the user grabbed, and the window only
+             * becomes fixed on the first move — so a latch that waited for the
+             * mode to change would let the live frame shift the scale under the
+             * pointer for that first step. */
+            bar_scale_latch();
             bar_drag_     = h;
             bar_drag_y0_  = e->pos().y();
             bar_drag_val0_ = (h == 0) ? snap_.hi : snap_.lo;
@@ -2965,13 +3044,17 @@ private:
      * here (set_alarm_setpoint); this is only the value 'a' arms at. */
     float               alarm_setpoint_ = DYT_ALARM_SETPOINT_DEFAULT;
     /* Which colour-bar handle a drag is moving: 0 the top (the window's high
-     * end), 1 the bottom, -1 nothing.  The handles are fixed, so the drag is
-     * relative and these are what it is measured from: the pointer's y at the
-     * press, the end's value then, and the scale's degrees per canvas row. */
+     * end), 1 the bottom, -1 nothing.  The drag is relative and these are
+     * what it is measured from: the pointer's y at the press, the end's value
+     * then, and the scale's degrees per canvas row. */
     int                 bar_drag_ = -1;
     int                 bar_drag_y0_   = 0;
     float               bar_drag_val0_ = 0.f;
     float               bar_drag_deg_  = 0.f;
+    /* The bar's scale while the window is fixed.  See bar_scale. */
+    bool                bar_scale_locked_ = false;
+    float               bar_lock_lo_ = 0.f;
+    float               bar_lock_hi_ = 0.f;
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 
@@ -11006,7 +11089,7 @@ static int selftest(const opts &o)
         {
             bool geom_ok = false, paint_ok = false, drag_ok = false,
                  indiv_ok = false, auto_ok = false, scaled_ok = false,
-                 ride_ok = false;
+                 ride_ok = false, frozen_ok = false, follow_ok = false;
             float seen_lo = 0.f, seen_hi = 0.f;
 
             if (view && fv) {
@@ -11063,14 +11146,20 @@ static int selftest(const opts &o)
                     dyt_session_set_range_mode(sess, DYT_RANGE_AUTO);
                 };
 
-                /* A press on a handle and a move `dy` px down from it. */
-                auto drag = [&](const QPoint &canvas_pt, int dy) {
+                /* A press on a handle and a move `dy` px down from it.  `mid`
+                 * runs between the press and that move, which is how a frame
+                 * that drifts *during* the gesture is driven; it is empty for
+                 * the plain drags. */
+                auto drag = [&](const QPoint &canvas_pt, int dy,
+                                const std::function<void()> &mid = {}) {
                     const QPoint a = fv->canvas_to_widget(QPointF(canvas_pt));
                     const QPoint b(a.x(), a.y() + dy);
                     QMouseEvent p(QEvent::MouseButtonPress, QPointF(a),
                                   QPointF(a), Qt::LeftButton, Qt::LeftButton,
                                   Qt::NoModifier);
                     QApplication::sendEvent(fv, &p);
+                    if (mid)
+                        mid();
                     QMouseEvent m(QEvent::MouseMove, QPointF(b), QPointF(b),
                                   Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
                     QApplication::sendEvent(fv, &m);
@@ -11080,19 +11169,59 @@ static int selftest(const opts &o)
                     QApplication::sendEvent(fv, &r);
                 };
 
-                /* The up handle, dragged *down*: the high end falls by the
-                 * pointer's travel and the low end does not move at all.  The
-                 * tolerance is tight (0.1 C) and the direction is asserted
-                 * outright, because the fixture's whole span is only about a
-                 * degree — a reversed delta would otherwise stay inside a
-                 * loose bound. */
-                const int   dy  = bar.height() / 4;
-                const float deg = fv->bar_deg_per_row();
-                drag(hu, dy);
+                /* The same scene with its hot end 0.4 C higher, fed straight
+                 * into the session: the frame's own extremes really move while
+                 * the window does not.  That is what a live camera does between
+                 * every pair of frames, and it is the drift the bar's scale has
+                 * to ignore once the window is fixed.  The cold end is left
+                 * exactly where it was, so a drift *during* a drag cannot be
+                 * confused with a change of the window: the low end must not
+                 * follow the drift either. */
+                auto feed_warm = [&](const dyt_snapshot_t &base,
+                                     dyt_snapshot_t *out) {
+                    const int   w    = base.width, h = base.height;
+                    const float lo   = base.stats.lo;
+                    const float span = (base.stats.hi - base.stats.lo) + 0.4f;
+                    std::vector<float> t((size_t)w * (size_t)h);
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++)
+                            t[(size_t)y * (size_t)w + (size_t)x] =
+                                lo + span * (float)x / (float)(w > 1 ? w - 1 : 1);
+                    const dyt_frame_info_t fi{ t.data(), w, h };
+                    if (dyt_session_process(sess, &fi) != 0)
+                        return false;
+                    if (out)
+                        dyt_session_snapshot(sess, out, nullptr, 0);
+                    return true;
+                };
+
+                /* The up handle, dragged *down*, with the live frame drifting
+                 * *during* the gesture — the state a real camera is always in,
+                 * and the one a still fixture cannot show.  Two things must
+                 * hold.  The end moves by the pointer's whole travel, so the
+                 * drift cannot change the degrees-per-row the gesture is
+                 * measured in; and the handle stays *under the pointer*, so the
+                 * drift cannot move the ruler it is drawn on.  A scale that
+                 * re-fit every frame fails both: it slides the handle out from
+                 * under the pointer, which is the reported bug.  The low end
+                 * does not move at all, and the tolerance is tight (0.1 C)
+                 * because the fixture's whole span is only about a degree — a
+                 * reversed delta would otherwise stay inside a loose bound. */
+                const int    dy  = bar.height() / 4;
+                const float  deg = fv->bar_deg_per_row();
+                const double sc  = fv->display_scale();
+                bool         drift_ok = false;
+                drag(hu, dy, [&]() {
+                    dyt_snapshot_t d{};
+                    drift_ok = feed_warm(s0, &d) &&
+                               d.stats.hi > s0.stats.hi + 0.2f &&
+                               std::fabs(d.stats.lo - s0.stats.lo) < 1e-3f;
+                    fv->resnap();     /* the view re-reads the drifted frame */
+                });
                 dyt_snapshot_t s1{};
                 dyt_session_snapshot(sess, &s1, nullptr, 0);
                 const float want_hi = s0.hi - (float)dy * deg;
-                drag_ok = s1.range_mode == DYT_RANGE_FIXED &&
+                drag_ok = drift_ok && s1.range_mode == DYT_RANGE_FIXED &&
                           s1.hi < s0.hi - 0.1f &&
                           std::fabs(seen_hi - want_hi) < 0.1f &&
                           std::fabs(s1.hi - want_hi) < 0.1f &&
@@ -11102,10 +11231,14 @@ static int selftest(const opts &o)
                 /* The handle the user is holding has to *follow the pointer* —
                  * that is the point of the vendor's model and what makes the
                  * gesture legible.  The up handle is now on the new high
-                 * boundary; the down handle has not moved, because its end did
-                 * not.  Read from the view's own snapshot, which the drag
-                 * updates before the repaint, so this holds even with nothing
-                 * streaming. */
+                 * boundary, and it travelled *with* the pointer — one canvas
+                 * row down for every canvas row the pointer went down, which
+                 * is what "stays at the grabbed point" means.  The down handle
+                 * has not moved, because its end did not.  Read from the view's
+                 * own snapshot, which the drag updates before the repaint, so
+                 * this holds even with nothing streaming. */
+                follow_ok = fv->bar_handle_pos(0).y() ==
+                            hu.y() + (int)std::lround((double)dy / sc);
                 ride_ok = fv->bar_handle_pos(0).y() ==
                               fv->bar_handle_row(s1.hi) &&
                           fv->bar_handle_pos(0).y() != hu.y() &&
@@ -11128,6 +11261,30 @@ static int selftest(const opts &o)
                            std::fabs(seen_lo - want_lo) < 0.1f &&
                            std::fabs(s2.lo - want_lo) < 0.1f &&
                            std::fabs(s2.hi - s1.hi) < 1e-3f;
+
+                /* The frame's own extremes drift from frame to frame, and the
+                 * bar's scale is the frame's — so while the window is FIXED
+                 * the scale has to be frozen with it.  A scale that re-fit
+                 * every frame slides the ruler under the handles as the drift
+                 * moves it: the handle being dragged does not stay at the
+                 * point it was grabbed, and the *other* end wanders too
+                 * although its value never changed.  That is the reported bug,
+                 * and a live camera drifts by far more than the fraction of a
+                 * degree that would hide it.  Here the same scene arrives a
+                 * little warmer — the frame really moved, the window did not —
+                 * and both handles must stay exactly where they are. */
+                const QPoint hu_b = fv->bar_handle_pos(0);
+                const QPoint hd_b = fv->bar_handle_pos(1);
+
+                dyt_snapshot_t s_dr{};
+                frozen_ok = feed_warm(s2, &s_dr) &&
+                            s_dr.stats.hi > s2.stats.hi + 0.2f &&
+                            std::fabs(s_dr.stats.lo - s2.stats.lo) < 1e-3f;
+                fv->resnap();          /* the view re-reads the drifted frame */
+                frozen_ok = frozen_ok &&
+                            fv->bar_handle_pos(0) == hu_b &&
+                            fv->bar_handle_pos(1) == hd_b;
+                pm.step();             /* the fixture frame is back */
 
                 const QPoint mid =
                     fv->canvas_to_widget(QPointF(bar.center()));
@@ -11177,16 +11334,18 @@ static int selftest(const opts &o)
             }
 
             const bool ok = geom_ok && paint_ok && drag_ok && indiv_ok &&
-                            auto_ok && scaled_ok && ride_ok;
+                            auto_ok && scaled_ok && ride_ok && frozen_ok &&
+                            follow_ok;
             std::printf("  %-4s the colour bar's two handles ride the window's "
                         "boundaries — up on the right at the high one, down on "
                         "the left at the low one — and each drags only its own "
                         "end, with a double-click back to auto (geometry %s, "
-                        "painted %s, drag %s, rides %s, individual %s, "
-                        "auto %s, scaled %s)\n",
+                        "painted %s, drag %s, follows %s, rides %s, "
+                        "individual %s, frozen %s, auto %s, scaled %s)\n",
                         ok ? "ok" : "FAIL", geom_ok ? "yes" : "NO",
                         paint_ok ? "yes" : "NO", drag_ok ? "yes" : "NO",
-                        ride_ok ? "yes" : "NO", indiv_ok ? "yes" : "NO",
+                        follow_ok ? "yes" : "NO", ride_ok ? "yes" : "NO",
+                        indiv_ok ? "yes" : "NO", frozen_ok ? "yes" : "NO",
                         auto_ok ? "yes" : "NO", scaled_ok ? "yes" : "NO");
             if (!ok)
                 fails++;

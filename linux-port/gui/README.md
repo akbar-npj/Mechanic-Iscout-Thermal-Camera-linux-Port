@@ -942,6 +942,28 @@ follow the pointer on that paint instead of waiting for the pump's next frame �
 which never comes when nothing is streaming; the session stays the authority and
 the next `resnap()` overwrites it with the same numbers.
 
+**The scale freezes when the window does.** At AUTO the window *is* the frame, so
+the bar's scale is the frame's own extremes and re-fits with every frame — which
+is what auto means, and invisible, because the handles are then pinned to the
+bar's two ends. Once the window is FIXED the scale must stop following the frame.
+The bar is then a fixed ruler with the window a sub-range of it — the vendor's own
+arrangement, where `panel_temp_line` is a fixed-length scale and the window is the
+rectangle the two handles bound — so the handles stay where the user put them. A
+scale that re-fit every frame slides both handles around under the pointer as the
+live frame's drifting min/max moves it: the handle being dragged does not stay at
+the point it was grabbed, and the *other* end wanders too although its value never
+changed. `bar_scale()` therefore returns a latched pair of values while the window
+is fixed, and the live frame's extremes otherwise; `bar_scale_follow()` is the one
+place that decides, called from both `set_frame()` (the pump) and `resnap()` (a
+one-off gesture). The latch is also taken **at the press**, before the first move:
+the window only turns fixed *on* that move, so between the two the pump is still
+reporting auto and would otherwise let the drift move the ruler the gesture was
+measured against — which is why `bar_scale_follow()` also holds the scale while
+`bar_drag_ >= 0`. A fixed window that is *wider* than the frame (Rapid Diagnostics
+brackets the extremes with a margin) expands the ruler rather than pinning both
+handles to the ends and reading as no window at all; an auto window never expands
+it, because that would be the drift growing the ruler again.
+
 Two 1 px **boundary lines** across the bar, in the hot/cold colours, mark the
 window's edges under the handles, and each window value is labelled beside its
 own handle — so the number stays next to the thing that set it, which is again
@@ -1472,7 +1494,7 @@ $ ./build/dytqt --selftest
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
   ok   the alarm's threshold field clamps to -20..450 and the session arms at what it holds (clamp yes, pushed yes, follows an armed edit yes)
-  ok   the colour bar's two handles ride the window's boundaries — up on the right at the high one, down on the left at the low one — and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, rides yes, individual yes, auto yes, scaled yes)
+  ok   the colour bar's two handles ride the window's boundaries — up on the right at the high one, down on the left at the low one — and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, follows yes, rides yes, individual yes, frozen yes, auto yes, scaled yes)
   ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
@@ -1670,7 +1692,21 @@ fixture's whole span is only about a degree: a reversed delta would otherwise
 stay inside a loose bound. It also pins that the dragged handle **rides** — after
 the up-handle drag the up handle is on the new high boundary and has actually
 moved, while the down handle has not — which is the whole point of the vendor's
-model and what makes the gesture legible. Its last half repeats the up-handle
+model and what makes the gesture legible. Its first drag is also driven with the
+live frame **drifting during the gesture**: the same scene is fed into the session
+with its hot end 0.4 °C higher, which is what a live camera does between every pair
+of frames, and the assertion requires two things of the result — the end still
+moved by the pointer's whole travel, and the handle still travelled *with* the
+pointer, one canvas row for each canvas row the pointer went down. A bar whose
+scale re-fit every frame fails both: it slides the handle out from under the
+pointer. After both drags a second drifted frame pins the same rule at rest: the
+frame's extremes really moved (the cold end is left exactly where it was, so the
+drift cannot be mistaken for a window change) and *neither* handle moved. Those
+two halves are the reported bug — "the triangle doesn't follow the pointer, and
+dragging the top-right one moves the bottom-left one up" — and four mutations
+prove they bite: dropping the freeze, dropping the press-time latch, dropping the
+"a drag holds its scale" clause, and letting the latch expand to an *auto* window
+each turn `follows` or `frozen` to NO. Its last half repeats the up-handle
 drag with the canvas magnified, which is the state the real app is always in —
 the sensor's canvas is far smaller than the screen — and pins that both the grab
 radius and the value change go through the display scale. They have to: the
