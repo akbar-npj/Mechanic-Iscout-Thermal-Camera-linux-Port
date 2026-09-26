@@ -133,6 +133,24 @@ int dyt_vm_bar_label(const dyt_snapshot_t *snap, int which, char *out, size_t n)
 float dyt_vm_bar_frac(float c, float lo, float hi);
 float dyt_vm_bar_temp(float frac, float lo, float hi);
 
+/* ------------------------------------------------ rapid diagnostics window */
+
+/* The fixed display window the Windows app's "Rapid Diagnostics" button picks
+ * for a frame whose temperatures run from `lo` to `hi` (`panel_but_fast_Click`,
+ * CAAnalyzer.decompiled.cs:19419): round each end outward to a whole ten
+ * degrees, then widen by one more ten on each side, so the window brackets the
+ * scene with a margin rather than touching it.
+ *
+ * The vendor's arithmetic is a truncating `(int)` cast, not a floor/ceil, and
+ * the two differ for negative temperatures: there the cold end can land a
+ * fraction of a degree *above* `lo`.  That is kept as written — the port's
+ * whole point is to match the shipped app, and a window that quietly disagrees
+ * with it is worse than one that clips a tenth of a degree.
+ *
+ * Returns 0 on success, or -1 on a null output, a non-finite end, or an
+ * inverted range. */
+int dyt_vm_rapid_window(float lo, float hi, float *out_lo, float *out_hi);
+
 /* ----------------------------------------------------------- device panel */
 
 #define DYT_VM_INFO_MAX_LINES 8

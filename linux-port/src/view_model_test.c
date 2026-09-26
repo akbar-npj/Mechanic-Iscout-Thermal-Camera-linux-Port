@@ -564,6 +564,80 @@ static void test_bar_scale(void)
     intcheck("bar scale: frac then temp is the identity", i, 21);
 }
 
+static void test_rapid_window(void)
+{
+    float lo = 0.0f, hi = 0.0f;
+    int   rc;
+
+    /* A positive scene: each end rounds to a whole ten and then widens by
+     * ten, so the window brackets the picture with a margin. */
+    rc = dyt_vm_rapid_window(23.4f, 31.7f, &lo, &hi);
+    if (rc == 0 && fabsf(lo - 10.0f) < 1e-4f && fabsf(hi - 40.0f) < 1e-4f)
+        ok("rapid: a positive range widens to whole tens");
+    else {
+        char d[80];
+        snprintf(d, sizeof d, "rc %d, got [%.1f, %.1f]", rc, (double)lo, (double)hi);
+        fail("rapid: a positive range widens to whole tens", d);
+    }
+
+    /* The vendor's cast is a C# `(int)`, which truncates toward zero rather
+     * than flooring.  For a positive range that is the same thing, and the
+     * boundary shows it: 34.9 rounds down to 40, 35.0 rounds up to 50. */
+    rc = dyt_vm_rapid_window(20.0f, 34.9f, &lo, &hi);
+    const bool under = (rc == 0 && fabsf(hi - 40.0f) < 1e-4f);
+    rc = dyt_vm_rapid_window(20.0f, 35.0f, &lo, &hi);
+    const bool at = (rc == 0 && fabsf(hi - 50.0f) < 1e-4f);
+    if (under && at)
+        ok("rapid: the cast rounds a positive end to the nearest ten");
+    else
+        fail("rapid: the cast rounds a positive end to the nearest ten", "no");
+
+    /* A negative range is where truncate-toward-zero differs from floor: the
+     * cold end lands *above* lo.  That is the shipped behaviour, pinned here
+     * so a later "fix" has to argue with a failing test rather than slip in. */
+    rc = dyt_vm_rapid_window(-23.4f, -22.0f, &lo, &hi);
+    if (rc == 0 && fabsf(lo - (-20.0f)) < 1e-4f && fabsf(hi - 0.0f) < 1e-4f)
+        ok("rapid: a negative range keeps the vendor's truncation");
+    else {
+        char d[80];
+        snprintf(d, sizeof d, "rc %d, got [%.1f, %.1f]", rc, (double)lo, (double)hi);
+        fail("rapid: a negative range keeps the vendor's truncation", d);
+    }
+
+    /* Across a positive sweep the window must always contain the scene —
+     * that is the whole point of the button. */
+    int i, bad = 0;
+    for (i = 0; i <= 200; i++) {
+        const float a = 1.0f + (float)i * 0.37f;
+        const float b = a + 4.0f;
+        float wl = 0.0f, wh = 0.0f;
+        if (dyt_vm_rapid_window(a, b, &wl, &wh) != 0 || wl > a || wh < b)
+            bad++;
+    }
+    intcheck("rapid: a positive window always contains the scene", bad, 0);
+
+    /* A flat frame is legal and still gets a window. */
+    rc = dyt_vm_rapid_window(30.0f, 30.0f, &lo, &hi);
+    if (rc == 0 && lo <= 30.0f && hi >= 30.0f)
+        ok("rapid: a flat frame still gets a window");
+    else
+        fail("rapid: a flat frame still gets a window", "no");
+
+    /* Refusals: nothing to read, and nothing sane to bracket. */
+    rc = dyt_vm_rapid_window(20.0f, 30.0f, NULL, &hi);
+    const bool n1 = (rc == -1);
+    rc = dyt_vm_rapid_window(20.0f, 30.0f, &lo, NULL);
+    const bool n2 = (rc == -1);
+    rc = dyt_vm_rapid_window(30.0f, 20.0f, &lo, &hi);
+    const bool n3 = (rc == -1);
+    rc = dyt_vm_rapid_window(NAN, 20.0f, &lo, &hi);
+    const bool n4 = (rc == -1);
+    if (n1 && n2 && n3 && n4)
+        ok("rapid: a null, an inverted or a non-finite range is refused");
+    else
+        fail("rapid: a null, an inverted or a non-finite range is refused", "no");
+}
+
 /* ------------------------------------------------------------ device panel */
 
 static void test_info(void)
@@ -1830,6 +1904,7 @@ int main(void)
     test_roi_label();
     test_bar();
     test_bar_scale();
+    test_rapid_window();
     test_info();
     test_param();
     test_isotherm();

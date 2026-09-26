@@ -1452,6 +1452,30 @@ public:
         return 1;
     }
 
+    /* Rapid Diagnostics: the Windows panel's button of that name (its icon is
+     * the `fixed_temp` glyph, and it sits in the LUT group — the port's Image
+     * Enhancement).  It reads the *frame's* own extremes and latches a fixed
+     * window that brackets them with a margin, so a scene with poor contrast
+     * gets a range that uses the whole palette without the user hunting for
+     * one.  The arithmetic is dyt_vm_rapid_window()'s, so the vendor's
+     * rounding is pinned by the view-model test and not re-derived here.
+     *
+     * Applied to the session directly, the way view_key() does: the view owns
+     * the session, and the panel row reaches this through handle_key('F')
+     * exactly as the keyboard does. */
+    void rapid_diagnostics()
+    {
+        float lo = 0.0f, hi = 0.0f;
+
+        if (!sess_ || dyt_session_snapshot(sess_, &snap_, nullptr, 0) != 0)
+            return;
+        if (dyt_vm_rapid_window(snap_.stats.lo, snap_.stats.hi,
+                                &lo, &hi) != 0)
+            return;
+        dyt_session_set_fixed_range(sess_, lo, hi);
+        resnap();
+    }
+
     /* Apply a runtime-parameter key.  `raw` is the *unfolded* character, so
      * the reference's case-sensitive bindings survive: 'e' emissivity, 'A'
      * ambient, 'R' reflected, 'D' distance, and 'y' to send.  The ladder and
@@ -3798,6 +3822,7 @@ public:
         AnalysisLine, AnalysisChart,
         Tracking, Alarm, Highlight,
         FlipH, FlipV, FixedRange,
+        RapidDiag,
         Still, Record, Gallery,
         SrOff, SrVisible, SrThermal,
         N_Ids
@@ -4232,6 +4257,13 @@ private:
         row(enh, FlipH,      QStringLiteral("Flip horizontally"), 'h', true);
         row(enh, FlipV,      QStringLiteral("Flip vertically"),   'H', true);
         row(enh, FixedRange, QStringLiteral("Fixed range"),       't', true);
+        /* The vendor's Rapid Diagnostics lives in the LUT group
+         * (panel_tool_img_lut holds panel_tool_temp_w, :24729), which is this
+         * one, so it belongs beside the range control it moves.  Its key is
+         * 'F' — 'f' is fusion and 't' already toggles the range; the shift
+         * form is what the port uses for a variant of a lowercase binding
+         * ('H' beside 'h'), and "Fast" is the mnemonic. */
+        row(enh, RapidDiag,  QStringLiteral("Rapid Diagnostics"), 'F', false);
         lay->addWidget(enh);
 
         QGroupBox *cap = group(QStringLiteral("Capture"));
@@ -4698,6 +4730,20 @@ private:
             p.drawLine(cx + 5, cy - 6, cx + 5, cy + 6);
             p.drawLine(cx + 5, cy - 6, cx + 2, cy - 6);
             p.drawLine(cx + 5, cy + 6, cx + 2, cy + 6);
+            break;
+        case RapidDiag:
+            /* a gauge bracketed by two range ends: the frame's own scale,
+             * narrowed to a window.  Deliberately unlike FixedRange's two
+             * bars — the two rows sit on the same line of the panel and must
+             * not read as the same control. */
+            p.drawArc(QRectF(cx - 7, cy - 7, 14, 12), 0, 180 * 16);
+            p.drawLine(cx - 7, cy - 1, cx - 7, cy + 5);
+            p.drawLine(cx + 7, cy - 1, cx + 7, cy + 5);
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx, cy + 2) << QPointF(cx - 3, cy + 6)
+                          << QPointF(cx + 3, cy + 6));
             break;
         case Still:
             /* a camera */
@@ -5923,6 +5969,14 @@ public:
             return 1;
         }
 
+        /* Rapid Diagnostics — the panel row routes 'F' here too.  Placed
+         * before the view keys so the shift form is not folded away, and
+         * guarded on view_ so a synthetic press with no canvas is inert. */
+        if (raw == 'F' && view_) {
+            view_->rapid_diagnostics();
+            return 1;
+        }
+
         /* How the picture is shown: palette, unit, range, flip, zoom, fusion.
          * Routed with the unfolded character, because two of the bindings are
          * Shift forms ('H' flips vertically where 'h' flips horizontally) and
@@ -6505,6 +6559,7 @@ static const key_line_t kKeyLines[] = {
     { "capture",     "  space         pause / resume a playing clip\n" },
     { "the picture", "  1-0 , .       palette        u  unit\n" },
     { "the picture", "  t             range auto/fixed\n" },
+    { "the picture", "  F             rapid diagnostics: auto-fit the range\n" },
     { "the picture", "  h H           flip horizontally / vertically\n" },
     { "the picture", "  + -           zoom\n" },
     { "the picture", "  z Z           super-resolve the visible / thermal plane\n" },
@@ -9964,6 +10019,100 @@ static int selftest(const opts &o)
                         geom_ok ? "yes" : "NO", paint_ok ? "yes" : "NO",
                         drag_ok ? "yes" : "NO", moved_ok ? "yes" : "NO",
                         auto_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
+        /* ---- Rapid Diagnostics ------------------------------------------
+         *
+         * The panel row and the 'F' key must both latch a fixed window that
+         * brackets the frame's own extremes.  Driven through the window's key
+         * dispatch, so the row's *wiring* — not only the arithmetic — is what
+         * this pins; the vendor's rounding is view_model_test's job. */
+        {
+            bool row_ok = false, mode_ok = false, reframe_ok = false,
+                 idem_ok = false, row_same_ok = false, contains_ok = false;
+            if (view && fv) {
+                send_char(27);              /* nothing armed: the ladder would
+                                             * swallow 'F' otherwise */
+                dyt_session_reset_view(sess);
+                pm.step();
+
+                dyt_snapshot_t s0{};
+                dyt_session_snapshot(sess, &s0, nullptr, 0);
+
+                QPushButton *rb = win.panel()
+                                      ? win.panel()->button(ControlPanel::RapidDiag)
+                                      : nullptr;
+                row_ok = rb && rb->text() == QStringLiteral("Rapid Diagnostics") &&
+                         rb->isEnabled();
+
+                send_char('F');
+
+                dyt_snapshot_t s1{};
+                dyt_session_snapshot(sess, &s1, nullptr, 0);
+                /* The vendor's own expression, written out here rather than
+                 * called, so a change to dyt_vm_rapid_window() cannot pass by
+                 * agreeing with itself. */
+                const float e_lo =
+                    (float)((int)((s0.stats.lo + 5.0f) / 10.0f) * 10 - 10);
+                const float e_hi =
+                    (float)((int)((s0.stats.hi + 5.0f) / 10.0f) * 10 + 10);
+                mode_ok = s1.range_mode == DYT_RANGE_FIXED &&
+                          std::fabs(s1.lo - e_lo) < 1e-2f &&
+                          std::fabs(s1.hi - e_hi) < 1e-2f;
+                contains_ok = s1.lo <= s0.stats.lo && s1.hi >= s0.stats.hi &&
+                              (s1.hi - s1.lo) > (s0.stats.hi - s0.stats.lo);
+
+                /* The source must be the *frame's* extremes, not whatever
+                 * window is showing.  At AUTO the two coincide, so the check
+                 * above cannot tell them apart.  Two presses can: the window
+                 * the first one latched is wider than the frame, so a second
+                 * press that read *that* back would derive a wider window
+                 * again and walk outward.  Reading the frame, it must be a
+                 * no-op.  (A narrow window is tried first, because that is the
+                 * state a user actually leaves the range in.) */
+                const float mid = (s0.stats.lo + s0.stats.hi) * 0.5f;
+                dyt_session_set_fixed_range(sess, mid - 0.5f, mid + 0.5f);
+                pm.step();
+                send_char('F');
+                dyt_snapshot_t s3{};
+                dyt_session_snapshot(sess, &s3, nullptr, 0);
+                reframe_ok = std::fabs(s3.lo - s1.lo) < 1e-2f &&
+                             std::fabs(s3.hi - s1.hi) < 1e-2f;
+
+                send_char('F');
+                dyt_snapshot_t s4{};
+                dyt_session_snapshot(sess, &s4, nullptr, 0);
+                idem_ok = std::fabs(s4.lo - s1.lo) < 1e-2f &&
+                          std::fabs(s4.hi - s1.hi) < 1e-2f;
+
+                /* The row is not a second implementation: pressing it from
+                 * AUTO must land on the same window the key did. */
+                dyt_session_set_range_mode(sess, DYT_RANGE_AUTO);
+                pm.step();
+                if (rb)
+                    rb->click();
+                dyt_snapshot_t s2{};
+                dyt_session_snapshot(sess, &s2, nullptr, 0);
+                row_same_ok = s2.range_mode == DYT_RANGE_FIXED &&
+                              std::fabs(s2.lo - s1.lo) < 1e-2f &&
+                              std::fabs(s2.hi - s1.hi) < 1e-2f;
+
+                dyt_session_reset_view(sess);
+                pm.step();
+            }
+
+            const bool ok = row_ok && mode_ok && contains_ok && reframe_ok &&
+                            idem_ok && row_same_ok;
+            std::printf("  %-4s rapid diagnostics latches a fixed window over "
+                        "the frame, by the key and by the row (row %s, mode "
+                        "%s, contains %s, reframe %s, idempotent %s, "
+                        "row-same %s)\n",
+                        ok ? "ok" : "FAIL", row_ok ? "yes" : "NO",
+                        mode_ok ? "yes" : "NO", contains_ok ? "yes" : "NO",
+                        reframe_ok ? "yes" : "NO", idem_ok ? "yes" : "NO",
+                        row_same_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }

@@ -329,6 +329,22 @@ float dyt_vm_bar_temp(float frac, float lo, float hi)
     return lo + frac * (hi - lo);
 }
 
+int dyt_vm_rapid_window(float lo, float hi, float *out_lo, float *out_hi)
+{
+    if (!out_lo || !out_hi)
+        return -1;
+    if (!isfinite(lo) || !isfinite(hi) || !(hi >= lo))
+        return -1;
+
+    /* Verbatim from panel_but_fast_Click (:19419-19420).  The `(int)` is a
+     * C# cast, which truncates toward zero, so this is not floor()/ceil() —
+     * for a positive range it rounds to the nearest ten, and for a negative
+     * one it rounds toward zero.  See the header for why that is deliberate. */
+    *out_lo = (float)((int)((lo + 5.0f) / 10.0f) * 10 - 10);
+    *out_hi = (float)((int)((hi + 5.0f) / 10.0f) * 10 + 10);
+    return 0;
+}
+
 /* ----------------------------------------------------------- device panel */
 
 /* A parameter's effective value: the runtime override if this session sent
