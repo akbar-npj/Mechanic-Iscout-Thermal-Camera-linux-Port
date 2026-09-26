@@ -231,6 +231,35 @@ else
     skip "the RPM spec ships" "packaging/rpm/dytqt.spec absent"
 fi
 
+# --- the optional Qt OpenGL module ---
+#
+# The 3D Analysis view compiles a GL renderer only when the Makefile found
+# Qt6OpenGLWidgets, and the two have to agree about the macro that decides it.
+# A rename on either side does not fail the build: the GL class simply stops
+# being compiled, every host silently falls back to the software renderer, and
+# the GUI selftest still passes (it asserts the fallback, and its backend check
+# is `using_gl() == gl_ready()` — true in both worlds).  So the agreement is
+# checked here, where the Makefile is visible.
+#
+# The module is optional on purpose — without it the GUI still builds and the
+# tab still draws — which is why this is a coherence check, not a requirement.
+if grep -q 'Qt6OpenGLWidgets' Makefile \
+   && grep -q 'DYT_HAVE_QT6_OPENGL' Makefile \
+   && grep -q 'DYT_HAVE_QT6_OPENGL' gui/dytqt.cpp; then
+    ok "the optional Qt OpenGL module is wired through one macro"
+else
+    fail "the optional Qt OpenGL module is wired through one macro"
+fi
+
+# The deb's fallback Depends has to name the OpenGL packages too, or a host
+# that falls back to it (no dpkg-shlibdeps) installs a binary whose GL library
+# nothing pulls in.  The measured path finds them on its own.
+if grep -q 'libqt6openglwidgets6' Makefile; then
+    ok "the deb's fallback Depends names the Qt OpenGL packages"
+else
+    fail "the deb's fallback Depends names the Qt OpenGL packages"
+fi
+
 if [ "$fails" -ne 0 ]; then
     echo "== packaging metadata FAILED =="
     exit 1

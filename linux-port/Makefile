@@ -164,6 +164,19 @@ ifdef HAVE_MNN
 QT_DEFS += -DDYT_HAVE_MNN
 endif
 
+# The 3D Analysis view prefers a QOpenGLWidget, but GL is *not* required: when
+# Qt6OpenGLWidgets is absent the widget falls back to its QPainter renderer and
+# the GUI still builds and runs — the same "detected, never required" rule
+# Qt6Widgets itself follows.  DYT_HAVE_QT6_OPENGL is what the source compiles
+# the GL renderer under; without it, only the software path exists.
+QT6_GL_CFLAGS := $(shell pkg-config --cflags Qt6OpenGLWidgets Qt6OpenGL 2>/dev/null)
+QT6_GL_LIBS   := $(shell pkg-config --libs   Qt6OpenGLWidgets Qt6OpenGL 2>/dev/null)
+ifneq ($(strip $(QT6_GL_LIBS)),)
+QT6_CFLAGS += $(QT6_GL_CFLAGS)
+QT6_LIBS   += $(QT6_GL_LIBS)
+QT_DEFS    += -DDYT_HAVE_QT6_OPENGL
+endif
+
 # The version the About box reports, taken from the same VERSION the package is
 # built as.  The single quotes survive make and the shell and leave the double
 # quotes for the compiler, so the macro is the string "0.1.0" and not a number.
@@ -244,7 +257,7 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/visible.o $(BUILD)/fusion.o $(BUILD)/session_capture.o \
             $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
             $(BUILD)/mnn.o $(BUILD)/sr.o $(BUILD)/view_model.o \
-            $(BUILD)/frame_ready.o $(BUILD)/compare.o
+            $(BUILD)/frame_ready.o $(BUILD)/compare.o $(BUILD)/surface.o
 
 # The MNN runtime object belongs *in* the archive, beside mnn.o.  mnn.o is a
 # member of libdyt.a and, when a runtime is present, references
@@ -268,7 +281,7 @@ TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/visible_test $(BUILD)/fusion_test $(BUILD)/jpeg_test \
          $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test \
          $(BUILD)/sr_test $(BUILD)/view_model_test $(BUILD)/frame_ready_test \
-         $(BUILD)/poll_model_test $(BUILD)/compare_test
+         $(BUILD)/poll_model_test $(BUILD)/compare_test $(BUILD)/surface_test
 TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
 # capture_demo and probe talk to the device directly through libusb — only
 # buildable with it.  capture_demo's prereq on $(UVC_LIB) is what pulls the
@@ -411,6 +424,12 @@ $(BUILD)/measure_test: src/measure_test.c $(LIB) | $(BUILD)
 # ramps (one pixel lifted), so the diff grid's hot pixel and the stats are
 # checkable by hand, and the swap is the mutation-verify.  No hardware.
 $(BUILD)/compare_test: src/compare_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# surface_test drives the 3D mesh builder over synthetic ramps, a flat sheet
+# and a single hot pixel, so each expected normal direction is checkable by
+# hand.  Device-free, GL-free and headless.  No hardware.
+$(BUILD)/surface_test: src/surface_test.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
 # alarm_test covers the high/low Schmitt triggers: the in-band non-clear and
@@ -608,6 +627,7 @@ check: all
 	@$(BUILD)/display_test
 	@$(BUILD)/measure_test
 	@$(BUILD)/compare_test
+	@$(BUILD)/surface_test
 	@$(BUILD)/alarm_test
 	@$(BUILD)/session_test
 	@$(BUILD)/view_model_test
@@ -712,6 +732,11 @@ DEB_MAINTAINER ?= dytqt port <noreply@example.invalid>
 # Debian bookworm, ...410 on trixie), so this default names one release; set
 # DEB_DEPENDS for your target.  The Qt6 and libusb names are unversioned.
 #
+# The two OpenGL packages are for the 3D Analysis view.  They are named here
+# because the default build finds Qt6OpenGLWidgets and links it; a build that
+# did not (the widget then uses its software renderer) would carry them
+# needlessly, which is a harmless extra dependency and never a missing one.
+#
 # libMNN is deliberately absent, and needs no entry: it ships *inside* this
 # package (at $(MNNDIR)) and its own NEEDED entries are libstdc++/libm/
 # libgcc_s/libc, which are already here.  dpkg-shlibdeps cannot know that — it
@@ -722,7 +747,8 @@ DEB_MAINTAINER ?= dytqt port <noreply@example.invalid>
 DEB_DEPENDS ?= libc6, libstdc++6, libgcc-s1, libusb-1.0-0, \
 	libopencv-core406, libopencv-imgproc406, libopencv-highgui406, \
 	libopencv-videoio406, libopencv-imgcodecs406, \
-	libqt6widgets6, libqt6gui6, libqt6core6
+	libqt6widgets6, libqt6gui6, libqt6core6, \
+	libqt6opengl6, libqt6openglwidgets6
 
 DEB_ROOT := $(BUILD)/deb/$(DEB_NAME)_$(VERSION)_$(DEB_ARCH)
 DEB_FILE := $(BUILD)/$(DEB_NAME)_$(VERSION)_$(DEB_ARCH).deb

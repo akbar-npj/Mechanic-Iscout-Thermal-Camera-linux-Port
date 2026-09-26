@@ -37,6 +37,8 @@ MainWindow : QWidget
     └── ControlPanel (stretch 0)  right panel: QTabWidget
         ├── "Troubleshoot"        Temperature Measurement / Analysis /
         │                         High Temperature / Image Enhancement / Capture
+        ├── "3D Analysis"         a height-mapped surface of the frame
+        ├── "Comparison"          a saved reference vs the live frame
         └── "Super Resolution"    Off / Visible plane (2x) / Thermal plane (2x)
 ```
 
@@ -58,11 +60,11 @@ Measurement (Spot / Line / Rectangle / Polygon / None), Analysis (Line / Chart
 analysis), High Temperature (Tracking / Alarm / Highlight), Image Enhancement
 (the two flips and Fixed range) and Capture (Still / Record / Gallery). The
 first four are the reference's own groups, in its own order; Capture is this
-port's addition. Only groups the engine backs are present — the 3D Analysis
-and Circuit Design tabs wait for their features (Track B) — so nothing on
-screen is a control that does nothing. The **Comparison** tab (between
-Troubleshoot and Super Resolution, where the Windows panel puts it) is the
-one Track B feature that has landed: see below.
+port's addition. Only groups the engine backs are present — the Circuit Design
+tab still waits for its feature (Track B) — so nothing on screen is a control
+that does nothing. The **3D Analysis** and **Comparison** tabs sit between
+Troubleshoot and Super Resolution, where the Windows panel puts them: see
+below.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -146,6 +148,44 @@ With no model the three radios are disabled rather than left clickable and
 silently ineffective. Assertion 53c pins the radios, the status line and the
 `Off` row, on both a model-present and a model-absent run.
 
+**3D Analysis** is the tab the Windows panel puts between Troubleshoot and
+Comparison. The engine is `src/surface.c` — a pure-C, no-allocation module that
+turns the Celsius plane into a height-mapped triangle mesh: `w*h` vertices with
+`z` the temperature, finite-difference normals, and `(w-1)*(h-1)*6` indices.
+The same module carries the view: `dyt_surface_mvp()` builds an orthographic
+orbit matrix and `dyt_surface_project()` applies it, and **both** renderers use
+it, so they cannot disagree about where a vertex lands.
+
+The tab's centre is a `SurfaceView`, which owns one model and two renderers.
+The GL renderer is a `QOpenGLWidget` (a `QOpenGLShaderProgram`, a VBO/EBO and a
+VAO, GLSL 1.10) — the plan's choice, and the one that draws a 97k-triangle mesh
+for free. The software renderer is a `QPainter` painter's-algorithm pass over
+the same mesh: project, sort the triangles back to front by clip `z`, fill each
+with its palette colour shaded by its normal. `SurfaceView` shows GL when a
+context comes up and hides it — revealing the software renderer underneath —
+when it does not, so the tab is never a dead page. The decision is data, not a
+build flag: `using_gl()` is `gl_ready()`, and assertion 60 checks exactly that
+equality, so it holds whether or not a context exists. Qt6OpenGLWidgets is
+detected and never required (the Makefile's `DYT_HAVE_QT6_OPENGL`); without it
+the GL class is not compiled at all and the software renderer is the only one.
+Verified both ways: the default build reports `backend GL`, a build with
+`QT6_GL_LIBS=` forced empty reports `backend software`, and both pass.
+
+Colour comes from the **active palette**, through the same `dyt_palette_index()`
+lookup the canvas uses, at the same display range the snapshot resolved — so a
+peak reads the same colour in the surface as in the 2D view. The mesh is
+decimated to at most 96x96 (stride-subsampled, both ends pinned) so the software
+renderer stays interactive; the height is the temperature normalised to [0, 1],
+which is the same normalisation the engine's normals were computed on, so the
+shading describes the shape actually drawn. Drag orbits, the wheel zooms, and
+**Reset view** returns to the opening camera. Assertion 60 builds a mesh from a
+live frame, checks the first and last vertices are the first and last source
+pixels (so the height is the frame's temperature, not a fiction), checks every
+colour against the palette lookup, drives the camera with a synthetic drag and
+wheel, and grabs the software renderer to require a sizeable, roughly *square*
+patch of many shades — square being the check that the aspect term in the
+matrix still keeps the mesh square in a wide viewport.
+
 **Comparison** is the tab the Windows panel puts between Troubleshoot and
 Circuit Design. The engine is `src/compare.c` — a pure-C, no-allocation module
 that takes two Celsius grids (a reference saved still + the live frame) and
@@ -174,23 +214,26 @@ stylesheet is restored immediately so the geometry assertions after it still see
 the unthemed metrics they were calibrated against.
 
 The column is sized for the **tab bar**, not for the rows: the Windows panel
-carries four horizontal tabs and ours carries those plus Super Resolution, so
-`kPanelW` is 440 px. Measured with the tab style above, one tab wants 80 px, two
-155, three 231, four 316, five 415 — five plus the pane's 2-px border is 417, so
-440 leaves about 5% for a different platform's font metrics. The vendor's own
-panel is ~400 px by the same measure, so this is close to the reference rather
-than a departure from it. (It was 224 px, sized for a single Troubleshoot tab;
-that overflowed as soon as the second tab landed — the two wanted 239 px of the
-222 available — and assertion 53d is what caught it.)
+carries four horizontal tabs (Troubleshoot | 3D Analysis | Comparison | Circuit
+Design) and ours carries those plus Super Resolution, so `kPanelW` is 440 px.
+Measured with the tab style above, the four tabs built today want 330 px of the
+438 available (assertion 53d prints it), which leaves room for Circuit Design
+when Track B finishes it. The vendor's own panel is ~400 px by the same measure,
+so this is close to the reference rather than a departure from it. (It was
+224 px, sized for a single Troubleshoot tab; that overflowed as soon as the
+second tab landed — the two wanted 239 px of the 222 available — and assertion
+53d is what caught it.)
 
-Its **height** is the same concern turned vertical, and it is subtler. Each page
-sits in a `QScrollArea` with `widgetResizable(true)`, which resizes the page to
-the viewport — so a page taller than the viewport is not scrolled, it is
-*squeezed*, and the last group is clipped with no scrollbar to say anything is
-missing. And `QScrollArea::sizeHint()` reports a small default rather than its
-widget's, so a window sized from it comes up short and hands the page a viewport
-it cannot fit in. `ControlPanel::sizeHint()` therefore asks the *page's own
-layout* for what it needs; the window's hint is the max over its columns, so
+Its **height** is the same concern turned vertical, and it is subtler. Each
+scrollable page sits in a `QScrollArea` with `widgetResizable(true)`, which
+resizes the page to the viewport — so a page taller than the viewport is not
+scrolled, it is *squeezed*, and the last group is clipped with no scrollbar to
+say anything is missing. And `QScrollArea::sizeHint()` reports a small default
+rather than its widget's, so a window sized from it comes up short and hands the
+page a viewport it cannot fit in. `ControlPanel::sizeHint()` therefore asks the
+*page's own layout* for what it needs (unwrapping the scroll area only when the
+page is one — the 3D Analysis page is not, because a scroll area would eat the
+wheel that zooms the view); the window's hint is the max over its columns, so
 covering the panel is what makes the window tall enough. That was a real bug —
 the Capture group was cut off at the bottom of the window — and assertion 53h
 pins it, on the panel's own hint rather than the window's, because the canvas can
@@ -998,6 +1041,15 @@ sudo apt install qt6-base-dev            # Debian/Ubuntu
 The Makefile detects it through `pkg-config Qt6Widgets` and sets `HAVE_QT6`;
 without Qt6 the target is simply absent and every other target still builds.
 
+The **3D Analysis** tab additionally prefers Qt6 OpenGL (`Qt6OpenGLWidgets` and
+`Qt6OpenGL`, part of `qt6-qtbase-devel` on Fedora and `qt6-base-dev` on Debian
+— so the same install already covers it). It is detected and never required:
+when the modules are absent the Makefile leaves `DYT_HAVE_QT6_OPENGL` undefined,
+the GL renderer is not compiled, and the tab draws through its software
+renderer. `packaging/check.sh` pins that the Makefile and the source agree
+about the macro, because a rename on either side would silently downgrade every
+host to the software path without failing anything.
+
 ```
 make build/dytqt
 ```
@@ -1156,16 +1208,17 @@ $ ./build/dytqt --selftest
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the control panel cannot take the keyboard (19 control(s), 0 that would)
+  ok   the control panel cannot take the keyboard (22 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
-  ok   every control-panel tab fits, with no scroll arrow (2 tab(s), 179 px of 438)
+  ok   every control-panel tab fits, with no scroll arrow (4 tab(s), 330 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
-  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, pending yes)
+  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
   ok   the control panel asks for its content's height (panel 731 of 731, page 705 of 705, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
+  ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
 === ALL PASS ===
 ```
 
@@ -1495,6 +1548,15 @@ running each staged `usr/bin/dytqt` with `XDG_DATA_DIRS` pointed at the matching
 staged share loads the staged model and passes the full selftest. That last one
 is the end-to-end check that the two relative paths (the rpath and the data
 search) are right.
+
+Re-verified after the 3D Analysis tab landed (this host, Fedora 44 Asahi on
+aarch64): `rpmbuild` resolved the new `libQt6OpenGL.so.6` and
+`libQt6OpenGLWidgets.so.6` NEEDED entries into the package's `Requires` by
+itself — no hand-written dependency, so the metadata cannot drift from what the
+binary actually links — and the extracted `usr/bin/dytqt --selftest` reports
+`backend GL` for the 3D tab and passes. The deb's fallback `Depends` names the
+matching `libqt6opengl6`/`libqt6openglwidgets6`, and `packaging/check.sh` pins
+that it does.
 
 The RPM was then installed for real — `sudo dnf install ./build/dytqt-*.rpm` —
 and the **GUI launched from `/usr/bin/dytqt`**, which is exactly what the

@@ -54,6 +54,18 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
+/* The GL renderer is optional: without Qt6OpenGLWidgets the tab still works
+ * through its QPainter fallback, so these headers — and the class that needs
+ * them — are compiled only when the module was found (see the Makefile). */
+#ifdef DYT_HAVE_QT6_OPENGL
+#include <QMatrix4x4>
+#include <QOpenGLBuffer>
+#include <QOpenGLFunctions>
+#include <QOpenGLShaderProgram>
+#include <QOpenGLVertexArrayObject>
+#include <QOpenGLWidget>
+#include <QVector3D>
+#endif
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
@@ -61,6 +73,7 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSize>
@@ -69,6 +82,7 @@
 #include <QTextBrowser>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <QWidget>
 
 #include "capture.h"
@@ -79,6 +93,7 @@
 #include "palette.h"
 #include "session.h"
 #include "session_capture.h"
+#include "surface.h"     /* the 3D Analysis mesh + view transform */
 #include "view_model.h"
 
 #ifdef DYT_HAVE_OPENCV
@@ -2783,6 +2798,513 @@ void ProfilePlot::paintEvent(QPaintEvent *)
                QString::number(n - 1));
 }
 
+/* ------------------------------------------------------------ the 3D surface
+ *
+ * The Windows app's "3D Analysis" tab (manual p.5) draws the thermal grid as
+ * a height-mapped landscape.  Two renderers share one model: a GL one for the
+ * ordinary case, and a QPainter one for a machine where QOpenGLWidget cannot
+ * make a context — so the tab is never dead, and `make check` can exercise the
+ * software path on any host.  They draw the same vertices, the same palette
+ * colours and the same matrix (src/surface.c), so they cannot drift apart in
+ * what they show.
+ *
+ * The model is deliberately not a widget: it holds the decimated grid, the
+ * mesh, the colours and the orbit camera, and both renderers borrow it.  That
+ * is also what the selftest reads, because the interesting failures — a wrong
+ * height, a colour off the palette, a camera that will not orbit — are all in
+ * the model, not in the GL calls.
+ */
+
+/* The decimation cap.  The engine builds a mesh for whatever grid it is
+ * handed, but 256x192 is ~97k triangles, which the software path cannot
+ * repaint at an interactive rate — and a 3D overview of a sensor does not
+ * need every pixel.  Capping both renderers at the same grid keeps them
+ * showing the same surface. */
+static const int kSurfaceMaxDim = 96;
+
+/* The camera a fresh view starts from: turned a little off-axis so the grid
+ * reads as a landscape rather than a flat sheet, and tilted so the near edge
+ * is low. */
+static const float kSurfaceYaw0   = 0.6f;
+static const float kSurfacePitch0 = 0.5f;
+static const float kSurfaceZoom0  = 1.0f;
+
+struct SurfaceModel {
+    int   w = 0, h = 0;                        /* the display grid, decimated */
+    std::vector<dyt_surface_vertex_t> verts;   /* z == temperature, + normals */
+    std::vector<float>    pos;                 /* display x,y,height per vertex */
+    std::vector<uint32_t> idx;                 /* (w-1)*(h-1)*6 */
+    std::vector<uint8_t>  col;                 /* palette RGB per vertex */
+
+    /* The orbit camera.  Kept on the model, not a renderer, so switching
+     * backend or resizing does not move the view. */
+    float yaw = kSurfaceYaw0, pitch = kSurfacePitch0, zoom = kSurfaceZoom0;
+
+    bool empty() const { return verts.empty() || idx.empty(); }
+    long tri_count() const { return (long)(idx.size() / 3); }
+    long vertex_count() const { return (long)verts.size(); }
+
+    void reset_camera()
+    {
+        yaw = kSurfaceYaw0; pitch = kSurfacePitch0; zoom = kSurfaceZoom0;
+    }
+
+    void clear()
+    {
+        w = h = 0;
+        verts.clear(); pos.clear(); idx.clear(); col.clear();
+    }
+
+    /* Decimate `src` to at most kSurfaceMaxDim on either axis, build the mesh,
+     * and colour it from the palette.  `lo`/`hi` are the same display range
+     * the 2D view uses, so a vertex's colour is the colour that pixel would
+     * have in the canvas.  A grid below 2x2 has no cells, so the model is
+     * left empty rather than handed a degenerate mesh. */
+    void set_grid(const float *src, int sw, int sh,
+                  const dyt_palette_t &pal, float lo, float hi)
+    {
+        clear();
+        if (!src || sw < 2 || sh < 2)
+            return;
+
+        int dw = std::max(2, std::min(sw, kSurfaceMaxDim));
+        int dh = std::max(2, std::min(sh, kSurfaceMaxDim));
+
+        /* Stride-subsample, pinning both ends, so the extremes survive and the
+         * grid keeps its aspect. */
+        std::vector<float> small((size_t)dw * dh);
+        for (int j = 0; j < dh; j++) {
+            const int sj = (int)((long)j * (sh - 1) / (dh - 1));
+            for (int i = 0; i < dw; i++) {
+                const int si = (int)((long)i * (sw - 1) / (dw - 1));
+                small[(size_t)j * dw + i] = src[(size_t)sj * sw + si];
+            }
+        }
+
+        w = dw;
+        h = dh;
+        verts.resize((size_t)w * h);
+        idx.resize((size_t)dyt_surface_index_count(w, h));
+        if (dyt_surface_vertices(small.data(), w, h, verts.data()) != 0 ||
+            dyt_surface_indices(w, h, idx.data()) != 0) {
+            clear();
+            return;
+        }
+
+        /* Display positions: x,y are already in [-1, 1]; the height is the
+         * temperature normalised to [0, 1].  Normalising here rather than in
+         * the renderers is what keeps the engine's normals — computed on the
+         * same normalised height — describing the shape that is actually
+         * drawn, and it gives the surface a sensible aspect whatever the
+         * Celsius range happens to be. */
+        float zlo = 0.0f, zhi = 0.0f;
+        bool  seen = false;
+        for (size_t k = 0; k < verts.size(); k++) {
+            const float z = verts[k].z;
+            if (!std::isfinite(z))
+                continue;
+            if (!seen || z < zlo) zlo = z;
+            if (!seen || z > zhi) zhi = z;
+            seen = true;
+        }
+        const float zrange = seen ? zhi - zlo : 0.0f;
+
+        pos.resize(verts.size() * 3);
+        col.resize(verts.size() * 3);
+        for (size_t k = 0; k < verts.size(); k++) {
+            float hn = zrange > 0.0f ? (verts[k].z - zlo) / zrange : 0.0f;
+            if (!std::isfinite(hn))
+                hn = 0.0f;
+            pos[k * 3 + 0] = verts[k].x;
+            pos[k * 3 + 1] = verts[k].y;
+            pos[k * 3 + 2] = hn;
+
+            /* The same lookup the canvas uses, so the two views agree about
+             * what a temperature looks like. */
+            const int pi = dyt_palette_index(verts[k].z, lo, hi);
+            col[k * 3 + 0] = pal.rgb[pi * 3 + 0];
+            col[k * 3 + 1] = pal.rgb[pi * 3 + 1];
+            col[k * 3 + 2] = pal.rgb[pi * 3 + 2];
+        }
+    }
+};
+
+/* The light the surface is shaded with, in mesh space.  Mesh space, not view
+ * space, on purpose: the shading then describes the shape (peaks lit, slopes
+ * turned away) and does not change as the user orbits — and both renderers get
+ * it without either having to reconstruct a rotation matrix. */
+static const float kSurfaceLight[3] = { 0.35f, 0.35f, 0.87f };
+
+/* The software renderer: project the mesh, sort the triangles back to front,
+ * and fill each with its palette colour shaded by its normal.  Slow enough
+ * that the model is decimated, fast enough to orbit, and it needs no context
+ * at all — which is the whole point of it existing. */
+class SoftSurface : public QWidget {
+public:
+    explicit SoftSurface(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setFocusPolicy(Qt::NoFocus);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAutoFillBackground(false);
+    }
+
+    void set_model(const SurfaceModel *m) { m_ = m; update(); }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), QColor(0x0f, 0x12, 0x18));
+
+        if (!m_ || m_->empty() || width() < 2 || height() < 2) {
+            p.setPen(QColor(0xc8, 0xc8, 0xc8));
+            p.drawText(rect(), Qt::AlignCenter,
+                       QStringLiteral("No thermal frame yet."));
+            return;
+        }
+
+        const float aspect = (float)width() / (float)height();
+        float mvp[16];
+        dyt_surface_mvp(m_->yaw, m_->pitch, m_->zoom, aspect, mvp);
+
+        const int nv = (int)m_->verts.size();
+        std::vector<float> sx(nv), sy(nv), sz(nv);
+        for (int k = 0; k < nv; k++)
+            dyt_surface_project(mvp, m_->pos[k * 3 + 0], m_->pos[k * 3 + 1],
+                                m_->pos[k * 3 + 2], &sx[k], &sy[k], &sz[k]);
+
+        /* Painter's algorithm: the camera looks down -z, so the most negative
+         * clip z is the farthest triangle and goes first. */
+        const int nt = (int)m_->tri_count();
+        std::vector<int>   order(nt);
+        std::vector<float> depth(nt);
+        for (int t = 0; t < nt; t++) {
+            order[t] = t;
+            const uint32_t a = m_->idx[t * 3 + 0], b = m_->idx[t * 3 + 1],
+                           c = m_->idx[t * 3 + 2];
+            depth[t] = (sz[a] + sz[b] + sz[c]) / 3.0f;
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return depth[a] < depth[b]; });
+
+        const auto to_x = [&](float n) { return (n * 0.5f + 0.5f) * width(); };
+        const auto to_y = [&](float n) { return (1.0f - (n * 0.5f + 0.5f)) * height(); };
+
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(Qt::NoPen);
+        for (int oi = 0; oi < nt; oi++) {
+            const int      t  = order[oi];
+            const uint32_t ia = m_->idx[t * 3 + 0], ib = m_->idx[t * 3 + 1],
+                           ic = m_->idx[t * 3 + 2];
+
+            /* Flat shade from the face's averaged vertex normal. */
+            const float nx = m_->verts[ia].nx + m_->verts[ib].nx + m_->verts[ic].nx;
+            const float ny = m_->verts[ia].ny + m_->verts[ib].ny + m_->verts[ic].ny;
+            const float nz = m_->verts[ia].nz + m_->verts[ib].nz + m_->verts[ic].nz;
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            float lam = 0.0f;
+            if (nl > 0.0f)
+                lam = (nx * kSurfaceLight[0] + ny * kSurfaceLight[1] +
+                       nz * kSurfaceLight[2]) / nl;
+            lam = std::max(0.0f, lam);
+            const float shade = 0.35f + 0.65f * lam;
+
+            const int r = (int)((m_->col[ia * 3 + 0] + m_->col[ib * 3 + 0] +
+                                 m_->col[ic * 3 + 0]) / 3.0f * shade);
+            const int g = (int)((m_->col[ia * 3 + 1] + m_->col[ib * 3 + 1] +
+                                 m_->col[ic * 3 + 1]) / 3.0f * shade);
+            const int b = (int)((m_->col[ia * 3 + 2] + m_->col[ib * 3 + 2] +
+                                 m_->col[ic * 3 + 2]) / 3.0f * shade);
+
+            QPolygonF tri;
+            tri << QPointF(to_x(sx[ia]), to_y(sy[ia]))
+                << QPointF(to_x(sx[ib]), to_y(sy[ib]))
+                << QPointF(to_x(sx[ic]), to_y(sy[ic]));
+            p.setBrush(QColor(std::min(255, r), std::min(255, g), std::min(255, b)));
+            p.drawPolygon(tri);
+        }
+    }
+
+private:
+    const SurfaceModel *m_ = nullptr;
+};
+
+/* The GL renderer.  It uploads the model's mesh once per change and draws it
+ * with the same matrix the software path uses.  A shader that will not compile
+ * or link is reported through on_gl_status so the container can fall back,
+ * rather than leaving a blank widget behind.
+ *
+ * Compiled only when Qt6OpenGLWidgets was found; without it the container
+ * simply has no GL renderer and always uses the software one. */
+#ifdef DYT_HAVE_QT6_OPENGL
+class GLSurface : public QOpenGLWidget, protected QOpenGLFunctions {
+public:
+    explicit GLSurface(QWidget *parent = nullptr) : QOpenGLWidget(parent)
+    {
+        setFocusPolicy(Qt::NoFocus);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+    }
+
+    std::function<void(bool)> on_gl_status;
+
+    void set_model(const SurfaceModel *m) { m_ = m; dirty_ = true; update(); }
+
+protected:
+    void initializeGL() override
+    {
+        initializeOpenGLFunctions();
+        glEnable(GL_DEPTH_TEST);
+        glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
+
+        /* GLSL 1.10 (the default Qt compiles without a #version), so this
+         * works on the compatibility profile a plain desktop context gives
+         * and on ES2.  A core-profile context would reject attribute/varying,
+         * which is one of the ways ok_ ends up false and the container falls
+         * back to the software renderer. */
+        static const char *kVert =
+            "attribute vec3 a_pos;\n"
+            "attribute vec3 a_nrm;\n"
+            "attribute vec3 a_col;\n"
+            "uniform mat4 u_mvp;\n"
+            "uniform vec3 u_light;\n"
+            "varying vec3 v_col;\n"
+            "void main() {\n"
+            "    float lam = max(dot(normalize(a_nrm), u_light), 0.0);\n"
+            "    v_col = a_col * (0.35 + 0.65 * lam);\n"
+            "    gl_Position = u_mvp * vec4(a_pos, 1.0);\n"
+            "}\n";
+        static const char *kFrag =
+            "varying vec3 v_col;\n"
+            "void main() { gl_FragColor = vec4(v_col, 1.0); }\n";
+
+        ok_ = prog_.addShaderFromSourceCode(QOpenGLShader::Vertex, kVert) &&
+              prog_.addShaderFromSourceCode(QOpenGLShader::Fragment, kFrag) &&
+              prog_.link();
+        if (ok_) {
+            vbo_ = new QOpenGLBuffer(QOpenGLBuffer::VertexBuffer);
+            ibo_ = new QOpenGLBuffer(QOpenGLBuffer::IndexBuffer);
+            vao_ = new QOpenGLVertexArrayObject;
+            vbo_->create();
+            ibo_->create();
+            vao_->create();
+        }
+        dirty_ = true;
+        if (on_gl_status)
+            on_gl_status(ok_);
+    }
+
+    void resizeGL(int w, int h) override { glViewport(0, 0, w, h); }
+
+    void paintGL() override
+    {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        if (!ok_ || !m_ || m_->empty())
+            return;
+        if (dirty_)
+            upload();
+
+        const float aspect =
+            height() > 0 ? (float)width() / (float)height() : 1.0f;
+        float mvp[16];
+        dyt_surface_mvp(m_->yaw, m_->pitch, m_->zoom, aspect, mvp);
+        QMatrix4x4 qm;
+        std::memcpy(qm.data(), mvp, sizeof mvp);
+
+        prog_.bind();
+        prog_.setUniformValue("u_mvp", qm);
+        prog_.setUniformValue("u_light",
+                              QVector3D(kSurfaceLight[0], kSurfaceLight[1],
+                                        kSurfaceLight[2]));
+        vao_->bind();
+        glDrawElements(GL_TRIANGLES, (GLsizei)m_->idx.size(),
+                       GL_UNSIGNED_INT, nullptr);
+        vao_->release();
+        prog_.release();
+    }
+
+private:
+    /* Interleaved pos(3) + normal(3) + colour(3), rebuilt only when the model
+     * changes.  The element buffer must stay bound while the VAO is bound —
+     * releasing it first would clear the VAO's element binding. */
+    void upload()
+    {
+        dirty_ = false;
+        const int n = (int)m_->verts.size();
+        std::vector<float> buf((size_t)n * 9);
+        for (int k = 0; k < n; k++) {
+            float *d = &buf[(size_t)k * 9];
+            d[0] = m_->pos[k * 3 + 0];
+            d[1] = m_->pos[k * 3 + 1];
+            d[2] = m_->pos[k * 3 + 2];
+            d[3] = m_->verts[k].nx;
+            d[4] = m_->verts[k].ny;
+            d[5] = m_->verts[k].nz;
+            d[6] = m_->col[k * 3 + 0] / 255.0f;
+            d[7] = m_->col[k * 3 + 1] / 255.0f;
+            d[8] = m_->col[k * 3 + 2] / 255.0f;
+        }
+
+        const int stride = 9 * (int)sizeof(float);
+        vao_->bind();
+        vbo_->bind();
+        vbo_->setUsagePattern(QOpenGLBuffer::StaticDraw);
+        vbo_->allocate(buf.data(), (int)(buf.size() * sizeof(float)));
+        prog_.enableAttributeArray("a_pos");
+        prog_.setAttributeBuffer("a_pos", GL_FLOAT, 0, 3, stride);
+        prog_.enableAttributeArray("a_nrm");
+        prog_.setAttributeBuffer("a_nrm", GL_FLOAT, 3 * (int)sizeof(float), 3, stride);
+        prog_.enableAttributeArray("a_col");
+        prog_.setAttributeBuffer("a_col", GL_FLOAT, 6 * (int)sizeof(float), 3, stride);
+        vbo_->release();
+        ibo_->bind();
+        ibo_->setUsagePattern(QOpenGLBuffer::StaticDraw);
+        ibo_->allocate(m_->idx.data(),
+                       (int)(m_->idx.size() * sizeof(uint32_t)));
+        vao_->release();
+    }
+
+    const SurfaceModel *m_ = nullptr;
+    QOpenGLShaderProgram prog_;
+    QOpenGLBuffer *vbo_ = nullptr;
+    QOpenGLBuffer *ibo_ = nullptr;
+    QOpenGLVertexArrayObject *vao_ = nullptr;
+    bool ok_ = false;
+    bool dirty_ = true;
+};
+#endif /* DYT_HAVE_QT6_OPENGL */
+
+/* The container: one model, both renderers, and whichever of them is usable.
+ * It owns the mouse (the children are transparent to it) so a drag orbits and
+ * the wheel zooms no matter which backend is live. */
+class SurfaceView : public QWidget {
+public:
+    explicit SurfaceView(QWidget *parent = nullptr) : QWidget(parent)
+    {
+        setFocusPolicy(Qt::NoFocus);
+        auto *lay = new QVBoxLayout(this);
+        lay->setContentsMargins(0, 0, 0, 0);
+        lay->setSpacing(0);
+
+        /* The software renderer is always built: it is the fallback, and on a
+         * host without Qt6OpenGLWidgets it is the only one there is. */
+        sw_ = new SoftSurface(this);
+        lay->addWidget(sw_);
+        sw_->set_model(&model_);
+
+#ifdef DYT_HAVE_QT6_OPENGL
+        /* GL is the first choice, laid over the software renderer, which is
+         * already there — so a failed context is a hide, not a rebuild. */
+        gl_ = new GLSurface(this);
+        lay->addWidget(gl_);
+        sw_->setVisible(false);
+        gl_->set_model(&model_);
+        gl_->on_gl_status = [this](bool ok) {
+            use_gl_ = ok;
+            gl_->setVisible(use_gl_);
+            sw_->setVisible(!use_gl_);
+            update();
+        };
+#else
+        use_gl_ = false;
+#endif
+    }
+
+    /* Feed a new frame.  `lo`/`hi` are the display range the canvas is using,
+     * so a vertex's colour matches the pixel it came from. */
+    void set_grid(const float *temps, int w, int h,
+                  const dyt_palette_t &pal, float lo, float hi)
+    {
+        model_.set_grid(temps, w, h, pal, lo, hi);
+        sw_->set_model(&model_);
+        gl_set_model();
+    }
+
+    void set_camera(float yaw, float pitch, float zoom)
+    {
+        model_.yaw = yaw;
+        model_.pitch = pitch;
+        model_.zoom = zoom;
+        sw_->update();
+        gl_update();
+    }
+
+    void reset_camera()
+    {
+        model_.reset_camera();
+        sw_->update();
+        gl_update();
+    }
+
+    const SurfaceModel &model() const { return model_; }
+    bool using_gl() const { return use_gl_; }
+
+    /* Whether a GL context actually came up.  False when Qt6OpenGLWidgets was
+     * absent, the context could not be created, or the shader would not link —
+     * the exact conditions the software renderer exists for. */
+    bool gl_ready() const
+    {
+#ifdef DYT_HAVE_QT6_OPENGL
+        return gl_ && gl_->isValid();
+#else
+        return false;
+#endif
+    }
+
+    /* The software renderer, for the selftest to paint and read back.  It is
+     * always present — it is the fallback — so a check on it holds on any
+     * host, whether or not GL is available. */
+    QWidget *software_view() const { return sw_; }
+
+protected:
+    void mousePressEvent(QMouseEvent *e) override { last_ = e->pos(); }
+
+    void mouseMoveEvent(QMouseEvent *e) override
+    {
+        if (!(e->buttons() & Qt::LeftButton))
+            return;
+        const float dx = (float)(e->pos().x() - last_.x()) * 0.01f;
+        const float dy = (float)(e->pos().y() - last_.y()) * 0.01f;
+        last_ = e->pos();
+        set_camera(model_.yaw + dx,
+                   std::max(-1.4f, std::min(1.4f, model_.pitch + dy)),
+                   model_.zoom);
+    }
+
+    void wheelEvent(QWheelEvent *e) override
+    {
+        const float step = e->angleDelta().y() > 0 ? 1.1f : 1.0f / 1.1f;
+        set_camera(model_.yaw, model_.pitch,
+                   std::max(0.3f, std::min(6.0f, model_.zoom * step)));
+    }
+
+private:
+    /* The GL renderer may not exist at all (no Qt6OpenGLWidgets), so every
+     * call to it goes through these — one #ifdef each instead of one per call
+     * site. */
+    void gl_set_model()
+    {
+#ifdef DYT_HAVE_QT6_OPENGL
+        if (gl_)
+            gl_->set_model(&model_);
+#endif
+    }
+    void gl_update()
+    {
+#ifdef DYT_HAVE_QT6_OPENGL
+        if (gl_)
+            gl_->update();
+#endif
+    }
+
+    SurfaceModel model_;
+    SoftSurface *sw_ = nullptr;
+#ifdef DYT_HAVE_QT6_OPENGL
+    GLSurface   *gl_ = nullptr;
+#endif
+    bool         use_gl_ = true;
+    QPoint       last_;
+};
+
 /* ---------------------------------------------------------- the control panel
  *
  * The Windows counterpart's right panel (manual p.5, /tmp/pdfx/w-08.png): a
@@ -2814,6 +3336,18 @@ public:
         N_Ids
     };
 
+    /* The tabs, in the Windows panel's order (Troubleshoot | 3D Analysis |
+     * Comparison | Circuit Design), with the port's own Super Resolution last
+     * so the vendor's order is preserved and the addition is visibly an
+     * addition.  Named rather than numbered: the rail's Compare item and the
+     * selftest both switch to a tab, and a bare index would drift the moment a
+     * tab is inserted ahead of them — which is exactly what happened when 3D
+     * Analysis landed. */
+    enum Tab {
+        TabTroubleshoot = 0, TabAnalysis3D, TabComparison, TabSuperResolution,
+        TabCount
+    };
+
     explicit ControlPanel(QWidget *parent = nullptr) : QWidget(parent)
     {
         setFixedWidth(kPanelW);
@@ -2825,14 +3359,8 @@ public:
         tabs_->setFocusPolicy(Qt::NoFocus);
         outer->addWidget(tabs_);
         tabs_->addTab(build_troubleshoot(), QStringLiteral("Troubleshoot"));
-        /* The Windows panel's order is Troubleshoot | 3D Analysis | Comparison |
-         * Circuit Design; the port has not built 3D Analysis or Circuit Design
-         * yet, so Comparison follows Troubleshoot directly and the slot is
-         * where the vendor's own panel puts it. */
+        tabs_->addTab(build_analysis_3d(), QStringLiteral("3D Analysis"));
         tabs_->addTab(build_comparison(), QStringLiteral("Comparison"));
-        /* The tab the Windows app does not have.  It is last so the order the
-         * vendor's panel established is preserved and the addition is visibly
-         * an addition. */
         tabs_->addTab(build_super_resolution(),
                       QStringLiteral("Super Resolution"));
     }
@@ -2846,6 +3374,12 @@ public:
         return (i >= 0 && i < N_Ids) ? btn_[i] : nullptr;
     }
     QTabWidget *tabs() const { return tabs_; }
+
+    /* The 3D Analysis view.  The pump owns the session and the per-frame
+     * Celsius plane, so it is the pump that feeds the grid; the panel just
+     * holds the widget.  A NULL return means the page is not built, which the
+     * pump guards for the way it guards every other optional widget. */
+    SurfaceView *surface() const { return surface_; }
 
     /* The Comparison tab's hooks.  The pump (which owns the session and the
      * reference grid) installs these: Load opens a still, Clear drops it,
@@ -3137,6 +3671,51 @@ private:
         scroll->setFocusPolicy(Qt::NoFocus);
         scroll->setFrameShape(QFrame::NoFrame);
         return scroll;
+    }
+
+    /* The 3D Analysis tab.  The centre is the SurfaceView — a GL renderer
+     * with a QPainter fallback, fed the live Celsius grid by the pump.  The
+     * page is deliberately *not* a QScrollArea: a scroll area would eat the
+     * wheel that zooms the view, and the view wants the whole page anyway.
+     * The panel's own sizeHint() already handles a page that is not a scroll
+     * area (it only unwraps one when it is). */
+    QWidget *build_analysis_3d()
+    {
+        auto *page = new QWidget;
+        auto *lay  = new QVBoxLayout(page);
+        lay->setContentsMargins(6, 6, 6, 6);
+        lay->setSpacing(8);
+
+        QGroupBox *view = group(QStringLiteral("Surface"));
+        auto *vlay = qobject_cast<QVBoxLayout *>(view->layout());
+        surface_ = new SurfaceView(view);
+        surface_->setObjectName(QStringLiteral("surface3d"));
+        surface_->setMinimumHeight(240);
+        vlay->addWidget(surface_, 1);
+        lay->addWidget(view, 1);
+
+        QGroupBox *cam = group(QStringLiteral("Camera"));
+        auto *clay = qobject_cast<QVBoxLayout *>(cam->layout());
+        auto *reset = new QPushButton(QStringLiteral("Reset view"), cam);
+        reset->setFocusPolicy(Qt::NoFocus);
+        reset->setObjectName(QStringLiteral("reset3d"));
+        connect(reset, &QPushButton::clicked, [this]() {
+            if (surface_)
+                surface_->reset_camera();
+        });
+        clay->addWidget(reset);
+        lay->addWidget(cam);
+
+        auto *hint = new QLabel(
+            QStringLiteral("Drag to rotate, scroll to zoom.  Height is the "
+                           "temperature and colour is the active palette, so "
+                           "the surface and the canvas agree."), page);
+        hint->setObjectName(QStringLiteral("hint3d"));
+        hint->setWordWrap(true);
+        hint->setFocusPolicy(Qt::NoFocus);
+        lay->addWidget(hint);
+
+        return page;
     }
 
     /* The Comparison tab.  Two thermal boards side by side: a saved reference
@@ -3462,6 +4041,7 @@ private:
     QLabel      *ref_path_  = nullptr;   /* the Comparison tab's reference path */
     QLabel      *ref_stats_ = nullptr;   /* the Comparison tab's difference stats */
     QDoubleSpinBox *ref_thresh_ = nullptr; /* the Comparison tab's threshold */
+    SurfaceView *surface_   = nullptr;   /* the 3D Analysis tab's view */
     /* The mode the last sync reported, so the Off row knows which key means
      * "off" from where the session is.  Kept as the last *synced* mode rather
      * than read live because the panel has no session handle — it reports, it
@@ -3950,9 +4530,11 @@ public:
                 /* Switch the control panel to the Comparison tab.  The tab is
                  * where the reference still, the threshold, and the diff stats
                  * live — the same routing the rail's other items do for their
-                 * own tab or dialog. */
+                 * own tab or dialog.  Named, not numbered: inserting the 3D
+                 * Analysis tab ahead of it is exactly the change that would
+                 * have silently pointed this at the wrong page. */
                 if (panel_ && panel_->tabs())
-                    panel_->tabs()->setCurrentIndex(1);
+                    panel_->tabs()->setCurrentIndex(ControlPanel::TabComparison);
                 break;
             case IconRail::ContactUs: {
                 ContactDialog d(this);
@@ -5033,6 +5615,7 @@ struct pump {
         win->set_frame_status(snap, ds, fps.fps(), mode,
                               msg.empty() ? nullptr : msg.c_str());
         sync_compare_panel(snap, scr.temps, scr.cap);
+        sync_surface(snap, scr.temps, scr.cap);
 
         frames++;                        /* painted frames, for --frames/--png */
         return true;
@@ -5082,6 +5665,22 @@ struct pump {
         }
         win->panel()->sync_compare(
             QString::fromStdString(ref_path), have_ref, stats);
+    }
+
+    /* Feed the 3D Analysis view.  It gets the same Celsius plane the canvas
+     * just drew and the same display range the snapshot resolved for it, so a
+     * peak reads the same colour in the surface as in the 2D view — which is
+     * the whole claim the tab makes.  The widget does the decimation and the
+     * mesh build; the pump only hands over the data, the way sync_compare_panel
+     * hands over a grid rather than formatting pixels itself. */
+    void sync_surface(const dyt_snapshot_t &snap, const float *live, int live_cap)
+    {
+        if (!win || !win->panel() || !win->panel()->surface())
+            return;
+        if (!live || live_cap < snap.width * snap.height)
+            return;
+        win->panel()->surface()->set_grid(live, snap.width, snap.height,
+                                          pal, snap.lo, snap.hi);
     }
 
 private:
@@ -8018,17 +8617,20 @@ static int selftest(const opts &o)
          * to the Comparison tab.  This replaces the old "pending" check that
          * held while Compare had no engine behind it — the engine has landed
          * (src/compare.c), so the button's claim is now "it switches to the
-         * Comparison tab", not "it is greyed out". */
+         * Comparison tab", not "it is greyed out".  The tab is named, not
+         * numbered, because inserting 3D Analysis ahead of it moved the
+         * Comparison page from 1 to 2 — the drift this pins against. */
         const int before_tab = panel ? panel->tabs()->currentIndex() : -1;
         if (cmp)
             cmp->click();
         const int after_tab  = panel ? panel->tabs()->currentIndex() : -1;
         const bool compare_ok = cmp && cmp->isEnabled() &&
-                                before_tab != 1 && after_tab == 1;
+                                before_tab != ControlPanel::TabComparison &&
+                                after_tab == ControlPanel::TabComparison;
         /* Leave the panel where the user would expect it (not on Comparison
          * unless they were already there) so later assertions are not shifted
          * onto the Comparison page. */
-        if (panel && panel->tabs() && before_tab != 1)
+        if (panel && panel->tabs() && before_tab != ControlPanel::TabComparison)
             panel->tabs()->setCurrentIndex(before_tab);
 
         const bool ok = count_ok && mark_ok && low_ok && high_ok &&
@@ -8062,7 +8664,18 @@ static int selftest(const opts &o)
         ControlPanel *panel = win.panel();
         QTabWidget   *tabs  = panel ? panel->tabs() : nullptr;
         QWidget      *page  = nullptr;
-        QScrollArea  *sa    = qobject_cast<QScrollArea *>(
+
+        /* Measure the Troubleshoot page, not whatever a previous assertion
+         * left current.  This is a scroll-area assertion — the 3D Analysis
+         * page is deliberately not one (a scroll area would eat the wheel that
+         * zooms it) — so it has to be looking at a scroll page, and Troubleshoot
+         * is both the default and the tallest.  Named, not numbered, for the
+         * same reason the rail's Compare handler is. */
+        if (tabs)
+            tabs->setCurrentIndex(ControlPanel::TabTroubleshoot);
+        QApplication::processEvents();
+
+        QScrollArea  *sa = qobject_cast<QScrollArea *>(
             tabs ? tabs->currentWidget() : nullptr);
         if (sa)
             page = sa->widget();
@@ -8195,6 +8808,152 @@ static int selftest(const opts &o)
         send_key(Qt::Key_N);                    /* clear, and no tool */
         win.resize(before);
         QApplication::processEvents();
+    }
+
+    /* 60. The 3D Analysis tab.  The vendor's panel has a 3D Analysis page
+     * between Troubleshoot and Comparison, and the port now does too.  The
+     * risk this guards is the one a 3D view hides best: a mesh that is not
+     * built from the frame (so the landscape is fiction), a colour that did
+     * not come from the active palette (so the surface and the canvas disagree
+     * about what a temperature looks like), or a tab that is dead on a machine
+     * without GL.  The software renderer is therefore asserted directly — it is
+     * the fallback and the only path that exists everywhere — while the GL path
+     * is asserted as "the container shows GL exactly when GL is usable", so the
+     * check holds whether or not a context came up. */
+    {
+        ControlPanel *panel = win.panel();
+        SurfaceView  *surf  = panel ? panel->surface() : nullptr;
+        QTabWidget   *tabs  = panel ? panel->tabs() : nullptr;
+
+        /* The tab exists, is named as the vendor names it, and sits where the
+         * vendor's panel puts it. */
+        const bool tab_ok = tabs && surf &&
+                            tabs->count() == ControlPanel::TabCount &&
+                            tabs->tabText(ControlPanel::TabTroubleshoot) ==
+                                QStringLiteral("Troubleshoot") &&
+                            tabs->tabText(ControlPanel::TabAnalysis3D) ==
+                                QStringLiteral("3D Analysis") &&
+                            tabs->tabText(ControlPanel::TabComparison) ==
+                                QStringLiteral("Comparison");
+
+        /* The pump feeds it every painted frame, so one step is enough for the
+         * model to hold the frame the session is showing. */
+        pm.step();
+        dyt_snapshot_t s{};
+        const bool have_snap = dyt_session_snapshot(sess, &s, nullptr, 0) == 0;
+        std::vector<float> src;
+        if (have_snap) {
+            src.resize((size_t)s.width * s.height);
+            dyt_session_snapshot(sess, &s, src.data(), (int)src.size());
+        }
+
+        bool mesh_ok = false, height_ok = false, color_ok = false;
+        bool cam_ok = false, drag_ok = false, wheel_ok = false, paint_ok = false;
+        bool backend_ok = false;
+
+        if (surf) {
+            const SurfaceModel &m = surf->model();
+            const bool ready = have_snap && s.width >= 2 && s.height >= 2 &&
+                               (int)src.size() >= s.width * s.height;
+
+            mesh_ok = !m.empty() && m.w >= 2 && m.h >= 2 &&
+                      m.w <= kSurfaceMaxDim && m.h <= kSurfaceMaxDim &&
+                      m.vertex_count() == (long)m.w * m.h &&
+                      (long)m.idx.size() == (long)(m.w - 1) * (m.h - 1) * 6;
+
+            /* Height is the temperature: the decimation pins both ends, so the
+             * first and last vertices are the first and last source pixels. */
+            height_ok = ready && !m.empty() &&
+                        std::fabs(m.verts.front().z - src.front()) < 1e-4f &&
+                        std::fabs(m.verts.back().z - src.back()) < 1e-4f;
+
+            /* Every colour is the palette's colour for that vertex's
+             * temperature at the frame's display range — the canvas's own
+             * lookup, not a second one. */
+            color_ok = ready && !m.empty();
+            for (size_t k = 0; color_ok && k < m.verts.size(); k++) {
+                const int pi = dyt_palette_index(m.verts[k].z, s.lo, s.hi);
+                color_ok = m.col[k * 3 + 0] == pm.pal.rgb[pi * 3 + 0] &&
+                           m.col[k * 3 + 1] == pm.pal.rgb[pi * 3 + 1] &&
+                           m.col[k * 3 + 2] == pm.pal.rgb[pi * 3 + 2];
+            }
+
+            /* The camera: reset, set, a drag of 30 px right and 15 px down
+             * (0.01 rad per px), and the wheel. */
+            surf->reset_camera();
+            cam_ok = std::fabs(m.yaw - kSurfaceYaw0) < 1e-4f &&
+                     std::fabs(m.pitch - kSurfacePitch0) < 1e-4f &&
+                     std::fabs(m.zoom - kSurfaceZoom0) < 1e-4f;
+
+            surf->set_camera(0.0f, 0.0f, 1.0f);
+            QMouseEvent press(QEvent::MouseButtonPress, QPointF(10, 10),
+                              QPointF(10, 10), Qt::LeftButton, Qt::LeftButton,
+                              Qt::NoModifier);
+            QApplication::sendEvent(surf, &press);
+            QMouseEvent drag(QEvent::MouseMove, QPointF(40, 25),
+                             QPointF(40, 25), Qt::NoButton, Qt::LeftButton,
+                             Qt::NoModifier);
+            QApplication::sendEvent(surf, &drag);
+            drag_ok = std::fabs(m.yaw - 0.30f) < 1e-3f &&
+                      std::fabs(m.pitch - 0.15f) < 1e-3f;
+
+            const float z0 = m.zoom;
+            QWheelEvent we(QPointF(20, 20), QPointF(20, 20), QPoint(0, 0),
+                           QPoint(0, 120), Qt::NoButton, Qt::NoModifier,
+                           Qt::NoScrollPhase, false);
+            QApplication::sendEvent(surf, &we);
+            wheel_ok = m.zoom > z0;
+
+            /* The container shows GL exactly when GL is usable. */
+            backend_ok = surf->using_gl() == surf->gl_ready();
+
+            /* The software renderer paints the surface.  The claim checked is
+             * the one a blank or single-colour widget cannot fake: the
+             * non-background pixels form a sizeable, roughly *square* patch.
+             * Square is the interesting part — the mesh is square, and the
+             * aspect term in the matrix is what keeps it square in a viewport
+             * of any shape, so a stretched footprint would mean the aspect
+             * correction had broken.  The widget's own size is not asserted
+             * (the layout owns it), only the shape of what it drew. */
+            surf->set_camera(kSurfaceYaw0, kSurfacePitch0, kSurfaceZoom0);
+            QWidget *sv = surf->software_view();
+            if (sv) {
+                const QImage img =
+                    sv->grab().toImage().convertToFormat(QImage::Format_RGB32);
+                int  x0 = img.width(), y0 = img.height(), x1 = -1, y1 = -1;
+                QSet<QRgb> shades;
+                for (int y = 0; y < img.height(); y++)
+                    for (int x = 0; x < img.width(); x++) {
+                        const QRgb c = img.pixel(x, y);
+                        if (qRed(c) <= 30 && qGreen(c) <= 30 && qBlue(c) <= 30)
+                            continue;              /* the background */
+                        shades.insert(c);
+                        x0 = std::min(x0, x); x1 = std::max(x1, x);
+                        y0 = std::min(y0, y); y1 = std::max(y1, y);
+                    }
+                const int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+                const double ratio = bh > 0 ? (double)bw / (double)bh : 0.0;
+                paint_ok = bw > 16 && bh > 16 &&
+                           ratio > 0.4 && ratio < 2.5 && shades.size() > 16;
+            }
+        }
+
+        const bool ok = tab_ok && mesh_ok && height_ok && color_ok && cam_ok &&
+                        drag_ok && wheel_ok && backend_ok && paint_ok;
+        std::printf("  %-4s the 3D Analysis tab builds a mesh from the frame, "
+                    "colours it from the palette and orbits "
+                    "(tab %s, mesh %s %dx%d, height %s, colour %s, camera %s, "
+                    "drag %s, wheel %s, backend %s (%s), paint %s)\n",
+                    ok ? "ok" : "FAIL",
+                    tab_ok ? "yes" : "NO", mesh_ok ? "yes" : "NO",
+                    surf ? surf->model().w : -1, surf ? surf->model().h : -1,
+                    height_ok ? "yes" : "NO", color_ok ? "yes" : "NO",
+                    cam_ok ? "yes" : "NO", drag_ok ? "yes" : "NO",
+                    wheel_ok ? "yes" : "NO", backend_ok ? "yes" : "NO",
+                    surf && surf->using_gl() ? "GL" : "software",
+                    paint_ok ? "yes" : "NO");
+        if (!ok)
+            fails++;
     }
 
     /* Leave the view model's state as the rest of the run found it. */
