@@ -901,40 +901,57 @@ the reason explicit thresholds are a later task.
 ### The colour bar and its window handles
 
 The bar beside the picture is a *scale* over the frame's own extremes
-(`stats.lo..stats.hi`), and the two handles inside it drag the **display window**
+(`stats.lo..stats.hi`), and the two handles on it drag the **display window**
 narrower or wider — the Windows panel's `panel_lut_max_but` /
-`panel_lut_min_but` (`CAAnalyzer.decompiled.cs:18577`/`:18517`). The up handle is
-fixed at the bar's **top-right** and the down handle at its **bottom-left**, so
-the top strip of the bar is always the up handle and the bottom strip always the
-down one, however narrow the window has been dragged — that is what makes them
-operable *individually*, which the old nearest-row rule could not do once the two
-ends came close. They are drawn *inside* the bar because the margin above the
-picture is only `kPad` and a triangle outside it would be clipped; a dark
-outline keeps each readable over any palette entry. The strip depth is a **canvas**
-distance, not a widget one: the handles are magnified with the picture, so a
-fixed widget-pixel strip would stop covering the drawn triangle on a large screen
-— past about 2.2× its centre falls outside the strip, the press falls through to
-the picture, and the handle cannot be dragged at all. `bar_handle_at()` converts
-the pointer into canvas coordinates for exactly that reason.
+`panel_lut_min_but` (`CAAnalyzer.decompiled.cs:18577`/`:18517`).
 
-A fixed handle cannot follow the pointer's row, so the drag is **relative** —
-the vendor's own model, where `panel_lut_max_but_MouseMove` keeps `lut_num = e.Y`
-and works from `e.Y - lut_num`. The press records the pointer's y, that end's
-value and the scale's degrees per row; the move adds `(y0 - y) / scale * deg` to
-the recorded value — the pointer's travel is in widget pixels and `deg` is per
-*canvas* row, so it goes through the display scale or the window moves by that
-factor for the same gesture. Pointer *up* is warmer, so dragging the up handle
-down lowers the max and dragging the down handle up raises the min — each end
-moves alone, and the other is passed through untouched. The two may not cross: a
-quarter of a degree of daylight is kept between them.
+**The handles ride the boundaries.** The up handle sits on the bar's right at
+the window's high boundary and the down handle on its left at the low one, and
+both travel with the value — which is what the vendor does: its two buttons live
+in groups that the mouse-move handlers relocate to the boundary's y on every move
+(`panel_lut_top.Location = new Point(10, num2)` at :18595, the bottom group at
+:18535). So at AUTO, where the window *is* the frame, the up handle is at the
+bar's top-right and the down handle at its bottom-left; narrow the window and they
+move inward with it. That is what makes the gesture legible — the thing you are
+holding follows the pointer. Keeping them on *opposite sides* of the bar is what
+keeps them apart when the window is dragged narrow enough that the two boundaries
+meet. A press grabs whichever handle's centre is nearer, within `kHandleHit`
+canvas pixels, and nothing at all in the middle of the bar.
 
-Because the handles no longer travel with the value, the window's position is
-shown by two 1 px **boundary lines** across the bar in the hot/cold colours, and
-its values by the labels at the outer positions beside the handles. The scale's
-own ends sit just inside them and are drawn only once the window has left that
-end, so at AUTO — where the window *is* the frame — the same number is not
-printed twice, one line apart. A double-click anywhere on the bar hands the range
-back to the frame, which is the way out of a window dragged to nothing.
+They are drawn *inside* the bar because the margin above the picture is only
+`kPad` and a triangle outside it would be clipped; a dark outline keeps each
+readable over any palette entry. Both the grab radius and the handle positions
+are **canvas** distances, not widget ones: the handles are magnified with the
+picture, so a fixed widget-pixel region stops covering the drawn triangle on a
+large screen — past about 2.2× its centre falls outside, the press falls through
+to the picture, and the handle cannot be dragged at all. `bar_handle_at()`
+converts the pointer into canvas coordinates for exactly that reason.
+
+The value moves by the pointer's *travel*, not to its absolute row — the vendor's
+own model, where `panel_lut_max_but_MouseMove` keeps `lut_num = e.Y` and works
+from `e.Y - lut_num`. The press records the pointer's y, that end's value and the
+scale's degrees per row; the move adds `(y0 - y) / scale * deg` to the recorded
+value — the travel is in widget pixels and `deg` is per *canvas* row, so it goes
+through the display scale or the window moves by that factor for the same
+gesture. Pointer *up* is warmer, so dragging the up handle down lowers the max and
+dragging the down handle up raises the min — each end moves alone, and the other
+is passed through untouched. The two may not cross: a quarter of a degree of
+daylight is kept between them. The drag also writes the new window into the
+view's own snapshot before asking for a repaint, so the handle and its line
+follow the pointer on that paint instead of waiting for the pump's next frame —
+which never comes when nothing is streaming; the session stays the authority and
+the next `resnap()` overwrites it with the same numbers.
+
+Two 1 px **boundary lines** across the bar, in the hot/cold colours, mark the
+window's edges under the handles, and each window value is labelled beside its
+own handle — so the number stays next to the thing that set it, which is again
+the vendor's arrangement (`label_lut_adjust_max` and `panel_lut_max_but` share
+one group). The scale's own ends stay at the column's top and bottom and are
+drawn only once the window has left that end *and* the window's label is not on
+top of them; the mid label is dropped when a window label comes near it. At AUTO
+the window *is* the scale, so this is exactly the old two-label column. A
+double-click anywhere on the bar hands the range back to the frame, which is the
+way out of a window dragged to nothing.
 
 ### Runtime parameters and the device panel
 
@@ -1455,7 +1472,7 @@ $ ./build/dytqt --selftest
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
   ok   the alarm's threshold field clamps to -20..450 and the session arms at what it holds (clamp yes, pushed yes, follows an armed edit yes)
-  ok   the colour bar's two fixed handles sit at the top-right and bottom-left and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, individual yes, auto yes, scaled yes)
+  ok   the colour bar's two handles ride the window's boundaries — up on the right at the high one, down on the left at the low one — and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, rides yes, individual yes, auto yes, scaled yes)
   ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
@@ -1639,26 +1656,30 @@ worth naming one by one:
   somewhere else while looking entirely plausible.
 
 The last stretch of the parity work — the Windows panel's remaining controls —
-added seven more. **64** is the colour bar's two fixed handles: it reads their
-corners off the widget (the up handle's canvas point is right of and above the
-bar's centre, the down handle's left of and below it), finds each handle's own
-pixel in a render — the probe box is the triangle alone, stopping short of the
-row the window's boundary line is drawn on, because at AUTO that line is the same
-colour and would satisfy the probe by itself — drags each one and requires the
-session to hold the window the drag produced *with the other end untouched* (the
-individual operation the fixed corners exist for), then double-clicks back to
-auto. The tolerance is tight and the direction is asserted outright, because the
+added seven more. **64** is the colour bar's two handles: it reads their
+boundaries off the widget (at AUTO the up handle's canvas point is on the bar's
+right at its top, the down handle's on its left at its bottom, and each is on the
+row `bar_handle_row()` gives for its end), finds each handle's own pixel in a
+render — the probe box is the triangle alone, stopping short of the row the
+window's boundary line is drawn on, because at AUTO that line is the same colour
+and would satisfy the probe by itself — drags each one and requires the session
+to hold the window the drag produced *with the other end untouched* (the
+individual operation the two sides exist for), then double-clicks back to auto.
+The tolerance is tight and the direction is asserted outright, because the
 fixture's whole span is only about a degree: a reversed delta would otherwise
-stay inside a loose bound. Its last half repeats the up-handle drag with the
-canvas magnified, which is the state the real app is always in — the sensor's
-canvas is far smaller than the screen — and pins that both the grab band and the
-value change go through the display scale. They have to: the handles are drawn in
-canvas coordinates and magnified with the picture, so a fixed widget-pixel strip
-stops covering the drawn triangle past about 2.2× (the press falls through to the
-picture and nothing moves, which is what a large screen hit), and an unscaled
-degrees-per-row moves the window by the scale factor. At scale 1 — where the
-rest of the assertion runs — the two are indistinguishable, so without this half
-the bug is invisible to the suite. **65** is Rapid Diagnostics, and its second half is
+stay inside a loose bound. It also pins that the dragged handle **rides** — after
+the up-handle drag the up handle is on the new high boundary and has actually
+moved, while the down handle has not — which is the whole point of the vendor's
+model and what makes the gesture legible. Its last half repeats the up-handle
+drag with the canvas magnified, which is the state the real app is always in —
+the sensor's canvas is far smaller than the screen — and pins that both the grab
+radius and the value change go through the display scale. They have to: the
+handles are drawn in canvas coordinates and magnified with the picture, so a fixed
+widget-pixel region stops covering the drawn triangle past about 2.2× (the press
+falls through to the picture and nothing moves, which is what a large screen hit),
+and an unscaled degrees-per-row moves the window by the scale factor. At scale 1 —
+where the rest of the assertion runs — the two are indistinguishable, so without
+this half the bug is invisible to the suite. **65** is Rapid Diagnostics, and its second half is
 the one that
 bites: pressing it twice must change nothing, because the second press reads the
 *frame's* extremes and not the window the first one latched — at AUTO those are

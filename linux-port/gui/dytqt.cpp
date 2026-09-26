@@ -127,9 +127,10 @@ static const int kBarW   = 22;   /* colour-bar width, px */
 static const int kBarGap = 14;   /* image -> bar gap */
 static const int kLabelW  = 96;  /* room for the bar's labels */
 static const int kPad     = 8;
-/* How deep the strip at each end of the bar is that grabs its fixed handle.
- * The handles sit at opposite corners, so a top-strip grab is always the up
- * handle and a bottom-strip grab always the down one. */
+/* How near, in *canvas* pixels, a press must be to a bar handle's centre to
+ * grab it.  The handles ride the window's boundaries, so this is a radius
+ * around a moving point rather than a strip at a fixed end — and the two sit
+ * on opposite sides of the bar, so the nearer centre decides. */
 static const int kHandleHit = 14;
 
 static const int kLineH   = 16;  /* one status line */
@@ -2004,17 +2005,23 @@ public:
         return (bhi - bl) / (float)h;
     }
 
-    /* The canvas position of a handle's centre: the up handle in the bar's
-     * top-right, the down handle in its bottom-left.  The hit test, the
-     * drawing and --selftest all name this one point, so they cannot disagree
-     * about where a handle is. */
+    /* The canvas position of a handle's centre.  The handles **ride the
+     * window's boundaries** — the up handle on the bar's right at the high
+     * boundary, the down handle on its left at the low one — which is the
+     * vendor's own model: its `panel_lut_max_but`/`panel_lut_min_but` live in
+     * groups that the mouse-move handlers relocate to the boundary's y on
+     * every move (`panel_lut_top.Location = new Point(10, num2)`,
+     * CAAnalyzer.decompiled.cs:18595, and :18535 for the bottom group).  That
+     * is what makes the drag legible: the handle the user is holding visibly
+     * follows the pointer, instead of sitting in a corner while only a line
+     * moves.  Keeping the two on opposite sides of the bar is what keeps them
+     * apart when the window is dragged narrow.  The hit test, the drawing and
+     * --selftest all name this one point, so they cannot disagree. */
     QPoint bar_handle_pos(int which) const
     {
         const int bx = kPad + img_.width() + kBarGap;
-        const int by = kPad;
-        const int bh = img_.height();
-        return which == 0 ? QPoint(bx + kBarW - 6, by + 6)
-                          : QPoint(bx + 6, by + bh - 6);
+        const int y  = bar_row_canvas(which == 0 ? snap_.hi : snap_.lo);
+        return which == 0 ? QPoint(bx + kBarW - 6, y) : QPoint(bx + 6, y);
     }
 
     /* The bar's column, in widget space.  Deliberately not widened sideways:
@@ -2032,44 +2039,44 @@ public:
         return QRect(bx, by, bw, bh);
     }
 
-    /* Which handle a widget-space point grabs.  The two are fixed at the bar's
-     * opposite corners — up at the top-right, down at the bottom-left — so the
-     * top strip is always the up handle and the bottom strip always the down
-     * one, however narrow the window has been dragged.  That is what makes
-     * them operable individually: the old nearest-row rule could not tell them
-     * apart once the window had been narrowed towards them.  -1 is "not on a
-     * handle" (including the middle of the bar, which grabs nothing). */
+    /* Which handle a widget-space point grabs, or -1 for neither.  The handles
+     * ride the boundaries, so the grab region travels with them: a press grabs
+     * whichever handle's centre is nearest, within kHandleHit canvas pixels,
+     * and nothing at all in the middle of the bar.  Nearest-centre rather than
+     * a strip is what keeps the two apart when the window is dragged narrow
+     * enough that their bands meet — and the two sit on opposite sides of the
+     * bar, so a tie can only happen with the pointer between them. */
     int bar_handle_at(const QPoint &wp) const
     {
         if (img_.isNull() || snap_.width <= 0)
             return -1;
-        /* Canvas coordinates — the space the handles are *drawn* in.  The strip
-         * depth is a canvas distance, so the grab band stays over the drawn
-         * triangle however far the display layer has magnified it.  A fixed
-         * widget-pixel strip is correct only at scale 1: past about 2.2x it
-         * stops covering the handle's own centre, the press falls through to
-         * the picture, and the handle cannot be dragged at all — which is
-         * exactly what happens on a large screen. */
+        /* Canvas coordinates — the space the handles are *drawn* in.  A
+         * widget-space region is correct only at scale 1: the handles are
+         * magnified with the picture, so a fixed widget-pixel region stops
+         * covering the drawn triangle on a large screen and the press falls
+         * through to the picture. */
         const double  s   = display_scale();
         const QPointF org = display_origin();
         const QPointF cp((wp.x() - org.x()) / s, (wp.y() - org.y()) / s);
         const QRect   r   = bar_rect();
         if (!r.contains(cp.toPoint()))
             return -1;
-        const int strip = std::min(kHandleHit, r.height() / 3);
-        if (cp.y() - r.top() < strip)
-            return 0;
-        if (r.bottom() - cp.y() < strip)
-            return 1;
-        return -1;
+
+        const QPoint hu = bar_handle_pos(0);
+        const QPoint hd = bar_handle_pos(1);
+        const double du = std::hypot(cp.x() - hu.x(), cp.y() - hu.y());
+        const double dd = std::hypot(cp.x() - hd.x(), cp.y() - hd.y());
+        if (std::min(du, dd) > (double)kHandleHit)
+            return -1;
+        return du <= dd ? 0 : 1;
     }
 
     /* Move the window end the dragged handle owns, from the pointer's travel
      * since the press — the vendor's own model (`panel_lut_max_but_MouseMove`
-     * keeps `lut_num = e.Y` and uses `e.Y - lut_num`).  A fixed handle cannot
-     * follow the pointer's absolute row, so the *delta* is what moves the
-     * value: pointer up is warmer, which lowers the max and raises the min.
-     * The other end is not touched, so the two operate individually. */
+     * keeps `lut_num = e.Y` and uses `e.Y - lut_num`).  The handle rides the
+     * boundary, so the *delta* is what moves the value: pointer up is warmer,
+     * which lowers the max and raises the min.  The other end is not touched,
+     * so the two operate individually. */
     void bar_drag_apply(const QPoint &wp)
     {
         const float  gap = 0.25f;
@@ -2089,20 +2096,30 @@ public:
         else
             lo = std::max(std::min(bar_drag_val0_ + d, hi - gap), bl);
 
+        /* Reflect the drag in the view's own window before asking for a
+         * repaint, so the handle and the boundary line follow the pointer on
+         * this paint rather than waiting for the pump's next snapshot — which
+         * never comes when nothing is streaming.  The session is the
+         * authority and resnap() overwrites this a frame later with the same
+         * numbers. */
+        snap_.lo = lo;
+        snap_.hi = hi;
+        snap_.range_mode = DYT_RANGE_FIXED;
+
         if (on_bar_range_)
             on_bar_range_(lo, hi);
         update();
     }
 
-    /* The two fixed handles, and the window they set.
+    /* The two handles, and the window they set.
      *
-     * The handles are drawn *inside* the bar at its corners — up at the
-     * top-right, down at the bottom-left — because the margin above the picture
-     * is only kPad and a triangle outside the bar would be clipped.  A dark
-     * outline keeps each readable over any palette entry.  The handles no
-     * longer travel with the value, so the window's position is shown by the
-     * two boundary lines instead, and its values by the labels beside the
-     * handles (draw_content). */
+     * Each is a small triangle drawn *inside* the bar at the boundary it
+     * rides — the up handle on the right at the high boundary, the down one on
+     * the left at the low boundary — because the margin above the picture is
+     * only kPad and a triangle outside the bar would be clipped.  A dark
+     * outline keeps each readable over any palette entry.  The window's two
+     * boundary lines are drawn under them, so the position of the window is
+     * readable even where a handle does not cover. */
     void draw_bar_handles(QPainter &p)
     {
         if (img_.isNull() || snap_.width <= 0 || snap_.height <= 0)
@@ -2186,8 +2203,9 @@ protected:
         /* The colour bar's range handles come first: the bar is not part of
          * the picture, so a press on it is never a measurement.  The press
          * records what the *relative* drag is measured from — the pointer's y,
-         * the end's value and the scale's degrees per row — because the handle
-         * itself does not move (see bar_drag_apply). */
+         * the end's value and the scale's degrees per row — because the value
+         * moves by the pointer's travel, not to its absolute row (the vendor's
+         * own `lut_num` model; see bar_drag_apply). */
         const int h = bar_handle_at(e->pos());
         if (h >= 0) {
             bar_drag_     = h;
@@ -2391,16 +2409,20 @@ protected:
         p.drawRect(bx, y0, kBarW - 1, bh - 1);
 
         /* The bar's labels, in one column beside it.  The *window*'s two
-         * values sit at the outer positions, beside the fixed handles that set
-         * them, in the same hot/cold colours as the window's boundary lines.
-         * The scale's own ends — the frame's extremes, which is the range the
-         * bar is a *scale* over — move just inside them and are drawn only
-         * once the window has left that end, so at AUTO the two never print
-         * the same number one line apart.  The mid label has nothing to
-         * collide with and is always drawn. */
+         * values ride with their handles — the vendor's own arrangement, where
+         * `label_lut_adjust_max` and `panel_lut_max_but` share one group that
+         * is relocated to the boundary together — so the number stays beside
+         * the thing that set it.  The scale's own ends (the frame's extremes,
+         * the range the bar is a *scale* over) stay at the column's ends and
+         * are drawn only when the window has left that end *and* the window's
+         * own label is not on top of them; the mid label is dropped when a
+         * window label comes near it.  At AUTO the window *is* the scale, so
+         * this is exactly the old two-label column. */
         float bl = 0.f, bhi = 0.f;
         bar_scale(&bl, &bhi);
-        const int lx = bx + kBarW + 4;
+        const int lx    = bx + kBarW + 4;
+        const int line  = 13;                    /* one label's leading */
+        const int top_y = y0 + 12, bot_y = y0 + bh - 3;
 
         auto label = [&](float c, int yy, const QColor &col) {
             char lbl[32];
@@ -2409,15 +2431,27 @@ protected:
                 p.drawText(lx, yy, QString::fromUtf8(lbl));
             }
         };
-        label(snap_.hi, y0 + 12, QColor(255, 150, 120));       /* window high */
-        if (snap_.hi < bhi - 1e-3f)
-            label(bhi, y0 + 30, QColor(210, 210, 210));        /* scale high */
-        label((bl + bhi) * 0.5f, y0 + bh / 2, QColor(170, 170, 170));
-        if (snap_.lo > bl + 1e-3f)
-            label(bl, y0 + bh - 21, QColor(210, 210, 210));    /* scale low */
-        label(snap_.lo, y0 + bh - 3, QColor(150, 205, 255));   /* window low */
+        auto clamp_y = [&](int yy) {
+            return std::min(std::max(yy, top_y), bot_y);
+        };
+        auto apart = [&](int a, int b) {
+            return (a > b ? a - b : b - a) > line;
+        };
 
-        /* The two fixed handles and the window they set, over the scale. */
+        const int wy_hi  = clamp_y(bar_row_canvas(snap_.hi) + 4);
+        const int wy_lo  = clamp_y(bar_row_canvas(snap_.lo) + 4);
+        const int wy_mid = y0 + bh / 2;
+
+        label(snap_.hi, wy_hi, QColor(255, 150, 120));          /* window high */
+        if (snap_.hi < bhi - 1e-3f && wy_hi > top_y + line)
+            label(bhi, top_y, QColor(210, 210, 210));           /* scale high */
+        if (apart(wy_mid, wy_hi) && apart(wy_mid, wy_lo))
+            label((bl + bhi) * 0.5f, wy_mid, QColor(170, 170, 170));
+        if (snap_.lo > bl + 1e-3f && wy_lo < bot_y - line)
+            label(bl, bot_y, QColor(210, 210, 210));            /* scale low */
+        label(snap_.lo, wy_lo, QColor(150, 205, 255));          /* window low */
+
+        /* The two handles and the window they set, over the scale. */
         draw_bar_handles(p);
 
         /* ---- the measurement overlays --------------------------------
@@ -10955,22 +10989,24 @@ static int selftest(const opts &o)
                 fails++;
         }
 
-        /* 64. The colour bar's two fixed handles.  The bar is a scale over the
+        /* 64. The colour bar's two handles.  The bar is a scale over the
          * frame's own extremes and the two handles — the Windows panel's
          * panel_lut_max_but / panel_lut_min_but — drag the display window
-         * inside it.  The up handle is fixed at the bar's top-right and the
-         * down handle at its bottom-left, and each drags *only its own end*,
-         * by the pointer's travel since the press (the vendor's own relative
-         * model, `panel_lut_max_but_MouseMove`).  A double-click hands the
-         * range back to the frame, which is the way out of a window dragged to
-         * nothing.
+         * inside it.  Each handle *rides* the boundary it sets: the up handle
+         * on the bar's right at the high boundary, the down one on its left at
+         * the low one, exactly as the vendor's mouse-move handlers relocate
+         * their groups.  Each drags *only its own end*, by the pointer's travel
+         * since the press (the vendor's own relative model,
+         * `panel_lut_max_but_MouseMove`).  A double-click hands the range back
+         * to the frame, which is the way out of a window dragged to nothing.
          *
          * The handle colours (255,90,60) and (90,180,255) are checked against
          * every shipped palette: no palette entry is either, so a pixel probe
          * for one is about the handle and not about the picture. */
         {
             bool geom_ok = false, paint_ok = false, drag_ok = false,
-                 indiv_ok = false, auto_ok = false, scaled_ok = false;
+                 indiv_ok = false, auto_ok = false, scaled_ok = false,
+                 ride_ok = false;
             float seen_lo = 0.f, seen_hi = 0.f;
 
             if (view && fv) {
@@ -10981,24 +11017,24 @@ static int selftest(const opts &o)
                 dyt_session_snapshot(sess, &s0, nullptr, 0);
                 const QRect bar = fv->bar_rect();
 
-                /* The handles are fixed at the bar's opposite corners — up at
-                 * the top-right, down at the bottom-left — and at AUTO, where
-                 * the window *is* the frame, its boundary lines sit on the
-                 * bar's ends. */
+                /* The handles ride the window's boundaries — up on the bar's
+                 * right at the high boundary, down on its left at the low one —
+                 * and at AUTO, where the window *is* the frame, those
+                 * boundaries are the bar's own ends. */
                 const QPoint hu = fv->bar_handle_pos(0);
                 const QPoint hd = fv->bar_handle_pos(1);
                 geom_ok = s0.stats.hi > s0.stats.lo && bar.height() > 8 &&
                           bar.width() > 4 &&
                           s0.range_mode == DYT_RANGE_AUTO &&
                           hu.x() > bar.center().x() &&
-                          hu.y() < bar.center().y() &&
                           hd.x() < bar.center().x() &&
-                          hd.y() > bar.center().y() &&
+                          hu.y() == fv->bar_handle_row(s0.hi) &&
+                          hd.y() == fv->bar_handle_row(s0.lo) &&
                           fv->bar_handle_row(s0.hi) == bar.top() &&
                           fv->bar_handle_row(s0.lo) == bar.bottom();
 
-                /* Both handles painted, each at its own corner.  The probe box
-                 * is the *triangle* only — it stops short of the row the
+                /* Both handles painted, each on its own boundary.  The probe
+                 * box is the *triangle* only — it stops short of the row the
                  * window's boundary line is drawn on, because at AUTO that line
                  * is the same colour and would satisfy the probe on its own. */
                 const QImage before = fv->render_canvas();
@@ -11062,6 +11098,18 @@ static int selftest(const opts &o)
                           std::fabs(s1.hi - want_hi) < 0.1f &&
                           std::fabs(seen_lo - s0.lo) < 1e-3f &&
                           std::fabs(s1.lo - s0.lo) < 1e-3f;
+
+                /* The handle the user is holding has to *follow the pointer* —
+                 * that is the point of the vendor's model and what makes the
+                 * gesture legible.  The up handle is now on the new high
+                 * boundary; the down handle has not moved, because its end did
+                 * not.  Read from the view's own snapshot, which the drag
+                 * updates before the repaint, so this holds even with nothing
+                 * streaming. */
+                ride_ok = fv->bar_handle_pos(0).y() ==
+                              fv->bar_handle_row(s1.hi) &&
+                          fv->bar_handle_pos(0).y() != hu.y() &&
+                          fv->bar_handle_pos(1).y() == hd.y();
 
                 /* Let the canvas see the window the first drag set, so the
                  * second drag starts from it rather than from the stale one. */
@@ -11129,16 +11177,17 @@ static int selftest(const opts &o)
             }
 
             const bool ok = geom_ok && paint_ok && drag_ok && indiv_ok &&
-                            auto_ok && scaled_ok;
-            std::printf("  %-4s the colour bar's two fixed handles sit at the "
-                        "top-right and bottom-left and each drags only its own "
+                            auto_ok && scaled_ok && ride_ok;
+            std::printf("  %-4s the colour bar's two handles ride the window's "
+                        "boundaries — up on the right at the high one, down on "
+                        "the left at the low one — and each drags only its own "
                         "end, with a double-click back to auto (geometry %s, "
-                        "painted %s, drag %s, individual %s, auto %s, "
-                        "scaled %s)\n",
+                        "painted %s, drag %s, rides %s, individual %s, "
+                        "auto %s, scaled %s)\n",
                         ok ? "ok" : "FAIL", geom_ok ? "yes" : "NO",
                         paint_ok ? "yes" : "NO", drag_ok ? "yes" : "NO",
-                        indiv_ok ? "yes" : "NO", auto_ok ? "yes" : "NO",
-                        scaled_ok ? "yes" : "NO");
+                        ride_ok ? "yes" : "NO", indiv_ok ? "yes" : "NO",
+                        auto_ok ? "yes" : "NO", scaled_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }
