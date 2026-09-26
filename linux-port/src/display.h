@@ -72,6 +72,15 @@ typedef enum {
     DYT_RANGE_FIXED       /* hold fixed_lo/fixed_hi (the vendor's "locked" bar) */
 } dyt_range_mode_t;
 
+/* The fixed window before anything sets one.  A session starts with this in
+ * fixed_lo/fixed_hi, so a mode that engages the fixed range without the user
+ * having chosen a window still has a usable one.  The values are the vendor's
+ * own configuration defaults for FixedTempMin/FixedTempMax
+ * (CAAnalyzer.decompiled.cs:21151, :21167) — a zeroed window would collapse
+ * the picture instead. */
+#define DYT_FIXED_DEFAULT_LO    0.0f
+#define DYT_FIXED_DEFAULT_HI   80.0f
+
 /* "auto" / "fixed", or "?" for an out-of-range value.  Lives here rather than
  * in the view model for the same reason dyt_fusion_name() lives in fusion.c:
  * the enum is this module's, so the front ends do not each re-spell it. */

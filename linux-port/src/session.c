@@ -119,8 +119,10 @@ dyt_session_t *dyt_session_create(void)
     }
 
     /* Start with the built-in ramps so there is always something to draw
-     * with, even before the caller points us at palettes/. */
-    dyt_display_init(&s->disp, 0.0f, 0.0f, 0);
+     * with, even before the caller points us at palettes/.  The fixed window
+     * gets the vendor's configured default rather than 0/0, so a mode that
+     * engages it without the user having picked one still shows a picture. */
+    dyt_display_init(&s->disp, DYT_FIXED_DEFAULT_LO, DYT_FIXED_DEFAULT_HI, 0);
     dyt_view_transform_init(&s->xform);
     s->unit  = DYT_UNIT_C;
     s->pal_n = DYT_PALETTE_BUILTIN_N;

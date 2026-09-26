@@ -638,6 +638,61 @@ static void test_rapid_window(void)
         fail("rapid: a null, an inverted or a non-finite range is refused", "no");
 }
 
+static void test_leak_effect(void)
+{
+    dyt_leak_effect_t fx;
+    int rc;
+
+    rc = dyt_vm_leak_effect(DYT_LEAK_SHORT, &fx);
+    const bool short_ok = rc == 0 && fx.range == DYT_RANGE_AUTO &&
+                          fx.view_3d == 0;
+
+    rc = dyt_vm_leak_effect(DYT_LEAK_LARGE, &fx);
+    const bool large_ok = rc == 0 && fx.range == DYT_RANGE_FIXED &&
+                          fx.view_3d == 0;
+
+    rc = dyt_vm_leak_effect(DYT_LEAK_SMALL, &fx);
+    const bool small_ok = rc == 0 && fx.range == DYT_RANGE_AUTO &&
+                          fx.view_3d == 1;
+
+    if (short_ok && large_ok && small_ok)
+        ok("leak: the three modes map to the vendor's range and view");
+    else
+        fail("leak: the three modes map to the vendor's range and view",
+             "one of the three is wrong");
+
+    /* The values are the vendor's own circuit_status, and only those three
+     * exist: a fourth is a bug in the caller, not a mode. */
+    const bool vals = (DYT_LEAK_SMALL == 1 && DYT_LEAK_LARGE == 2 &&
+                       DYT_LEAK_SHORT == 3);
+    int i, bad = 0;
+    for (i = -3; i <= 8; i++) {
+        if (i == DYT_LEAK_SMALL || i == DYT_LEAK_LARGE || i == DYT_LEAK_SHORT)
+            continue;
+        if (dyt_vm_leak_effect(i, &fx) != -1)
+            bad++;
+    }
+    rc = dyt_vm_leak_effect(DYT_LEAK_SHORT, NULL);
+    if (vals && bad == 0 && rc == -1)
+        ok("leak: the numbers are the vendor's and nothing else is a mode");
+    else
+        fail("leak: the numbers are the vendor's and nothing else is a mode",
+             "no");
+
+    /* Only Small shows the 3D view — the other two must leave the user where
+     * they were, so a stray mode cannot yank the panel to another tab. */
+    rc = dyt_vm_leak_effect(DYT_LEAK_SMALL, &fx);
+    const bool only_small = rc == 0 && fx.view_3d == 1;
+    rc = dyt_vm_leak_effect(DYT_LEAK_LARGE, &fx);
+    const bool large_flat = rc == 0 && fx.view_3d == 0;
+    rc = dyt_vm_leak_effect(DYT_LEAK_SHORT, &fx);
+    const bool short_flat = rc == 0 && fx.view_3d == 0;
+    if (only_small && large_flat && short_flat)
+        ok("leak: only Small Current Leakage asks for the 3D view");
+    else
+        fail("leak: only Small Current Leakage asks for the 3D view", "no");
+}
+
 /* ------------------------------------------------------------ device panel */
 
 static void test_info(void)
@@ -1905,6 +1960,7 @@ int main(void)
     test_bar();
     test_bar_scale();
     test_rapid_window();
+    test_leak_effect();
     test_info();
     test_param();
     test_isotherm();

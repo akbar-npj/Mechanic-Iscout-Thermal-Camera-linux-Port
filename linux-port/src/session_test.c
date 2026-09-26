@@ -326,6 +326,22 @@ static void test_settings(void)
     /* Range: auto follows the frame; toggling latches it. */
     dyt_session_snapshot(s, &snap, NULL, 0);
     floatcheck("auto range tracks the frame", snap.hi, 60.0f, 1e-4f);
+
+    /* A session starts holding the vendor's configured fixed window rather
+     * than 0/0, so a mode that engages the fixed range without the user having
+     * picked one (the Large Current Leakage mode) still shows a picture.  The
+     * values are FixedTempMin/FixedTempMax's defaults, and this is the first
+     * thing to touch the fixed window, so it is still the initial one. */
+    dyt_session_set_range_mode(s, DYT_RANGE_FIXED);
+    dyt_session_process(s, &fi);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    floatcheck("the default fixed window is lo", snap.lo,
+               DYT_FIXED_DEFAULT_LO, 1e-4f);
+    floatcheck("the default fixed window is hi", snap.hi,
+               DYT_FIXED_DEFAULT_HI, 1e-4f);
+    dyt_session_set_range_mode(s, DYT_RANGE_AUTO);
+    dyt_session_process(s, &fi);
+
     dyt_session_toggle_range(s);
     fill(img, 4, 2, 100.0f);
     dyt_session_process(s, &fi);

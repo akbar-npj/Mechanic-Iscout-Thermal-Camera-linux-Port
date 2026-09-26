@@ -345,6 +345,31 @@ int dyt_vm_rapid_window(float lo, float hi, float *out_lo, float *out_hi)
     return 0;
 }
 
+int dyt_vm_leak_effect(int mode, dyt_leak_effect_t *out)
+{
+    if (!out)
+        return -1;
+
+    switch (mode) {
+    case DYT_LEAK_SHORT:
+        /* Update_fixed_temp(true): back to the frame's own range. */
+        out->range   = DYT_RANGE_AUTO;
+        out->view_3d = 0;
+        return 0;
+    case DYT_LEAK_LARGE:
+        /* Update_fixed_temp(false): hold the fixed window. */
+        out->range   = DYT_RANGE_FIXED;
+        out->view_3d = 0;
+        return 0;
+    case DYT_LEAK_SMALL:
+        out->range   = DYT_RANGE_AUTO;
+        out->view_3d = 1;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 /* ----------------------------------------------------------- device panel */
 
 /* A parameter's effective value: the runtime override if this session sent

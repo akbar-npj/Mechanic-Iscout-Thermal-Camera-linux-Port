@@ -151,6 +151,44 @@ float dyt_vm_bar_temp(float frac, float lo, float hi);
  * inverted range. */
 int dyt_vm_rapid_window(float lo, float hi, float *out_lo, float *out_hi);
 
+/* ------------------------------------------------------------ circuit mode */
+
+/* The Troubleshoot panel's three circuit modes, carrying the vendor's own
+ * `circuit_status` values (CAAnalyzer.decompiled.cs:8058 starts at 3).  The
+ * rows read top to bottom exactly as the shipped labels do — "Short-circuit",
+ * "Large Current Leakage", "Small Current Leakage" — which is also the
+ * declaration order of label_max/label_medium/label_min (:24271-:24282). */
+typedef enum {
+    DYT_LEAK_SMALL = 1,   /* Small Current Leakage */
+    DYT_LEAK_LARGE = 2,   /* Large Current Leakage */
+    DYT_LEAK_SHORT = 3    /* Short-circuit — the default */
+} dyt_leak_mode_t;
+
+/* What picking a mode does.  Both halves come from the vendor's three click
+ * handlers, which differ only in these two lines (:22309, :22321, :22333):
+ *
+ *   Short-circuit   Update_fixed_temp(true)    full range, 2D
+ *   Large leakage   Update_fixed_temp(false)   fixed window, 2D
+ *   Small leakage   Update_fixed_temp(true)    full range, 3D
+ *
+ * `Update_fixed_temp` is misnamed: `true` *releases* the fixed window back to
+ * the frame's own range and `false` engages it, as the method's own body
+ * shows (:20882).  The 3D half is SwitchVision(), which selects the display
+ * tab at index 1 (:20313) — the port's 3D Analysis tab.
+ *
+ * The vendor also hides the measurement and analysis tool groups in the Small
+ * mode (:22345).  The port does not: those rows are the only way back to a 2D
+ * tool, and hiding a control the user needs in order to leave the mode is the
+ * failure the on-screen-controls rule exists to prevent.
+ *
+ * Returns 0, or -1 for a mode that is not one of the three or a null output. */
+typedef struct {
+    dyt_range_mode_t range;    /* what the display range becomes */
+    int              view_3d;  /* 1 = also show the 3D Analysis view */
+} dyt_leak_effect_t;
+
+int dyt_vm_leak_effect(int mode, dyt_leak_effect_t *out);
+
 /* ----------------------------------------------------------- device panel */
 
 #define DYT_VM_INFO_MAX_LINES 8

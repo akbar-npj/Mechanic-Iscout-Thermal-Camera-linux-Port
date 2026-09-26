@@ -37,8 +37,9 @@ MainWindow : QWidget
     │                                 the last with a connection dot, the
     │                                 camera serial and the fps
     └── ControlPanel (stretch 0)  right panel: QTabWidget
-        ├── "Troubleshoot"        Temperature Measurement / Analysis /
-        │                         High Temperature / Image Enhancement / Capture
+        ├── "Troubleshoot"        Circuit Mode / Temperature Measurement /
+        │                         Analysis / High Temperature / Image
+        │                         Enhancement / Capture
         ├── "3D Analysis"         a height-mapped surface of the frame
         ├── "Comparison"          a saved reference vs the live frame
         ├── "Circuit Design"      a board layout overlaid on the frame
@@ -58,15 +59,35 @@ against the session.
 ### The control panel
 
 `ControlPanel` is the Windows counterpart's right column: a `QTabWidget` whose
-**Troubleshoot** tab holds five checkable `QGroupBox`es — Temperature
+**Troubleshoot** tab holds six checkable `QGroupBox`es — Circuit Mode
+(Short-circuit / Large Current Leakage / Small Current Leakage), Temperature
 Measurement (Spot / Line / Rectangle / Polygon / None), Analysis (Line / Chart
 analysis), High Temperature (Tracking / Alarm / Highlight), Image Enhancement
-(the two flips and Fixed range) and Capture (Still / Record / Gallery). The
-first four are the reference's own groups, in its own order; Capture is this
-port's addition. Every group the panel shows is backed by the engine — there is
-no longer a tab that waits for its feature. The **3D Analysis**, **Comparison**
-and **Circuit Design** tabs sit between Troubleshoot and Super Resolution, where
-the Windows panel puts them: see below.
+(the two flips, Fixed range and Rapid Diagnostics) and Capture (Still / Record /
+Gallery). All but Capture are the reference's own groups, in its own order;
+Capture is this port's addition. Every group the panel shows is backed by the
+engine — there is no longer a tab that waits for its feature. The **3D
+Analysis**, **Comparison** and **Circuit Design** tabs sit between Troubleshoot
+and Super Resolution, where the Windows panel puts them: see below.
+
+Circuit Mode is the reference's function-mode selector, which the panel needs
+for the same reason the reference does: it is the one control that changes what
+the rows under it mean. *Short-circuit* is the default and is the plain
+full-range 2D view; *Large Current Leakage* engages the fixed window (the
+vendor's `Update_fixed_temp(false)`, whose name is backwards — `false` is the
+branch that *holds* a window, `true` releases it); *Small Current Leakage*
+returns to the full range and moves the panel to the 3D Analysis tab. Only the
+third moves the tab: a 2D mode that yanked the user off whatever page they were
+reading would be its own bug (assertion 65 pins all three). The keys are the
+shift forms `S`/`L`/`M`, because `s`, `l` and `m` are still, line and tracking.
+
+**Rapid Diagnostics** sits beside Fixed range because it is the same control
+moved by a policy: it reads the frame's own extremes and latches a window that
+brackets them with a margin, so a low-contrast scene gets a range that uses the
+whole palette without the user hunting for one. Its arithmetic is the vendor's
+verbatim, truncating cast and all (see `dyt_vm_rapid_window()` in
+`src/view_model.h`), and pressing it twice changes nothing — the second press
+reads the frame again, not the window the first one latched.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -1226,8 +1247,8 @@ $ ./build/dytqt --selftest
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (1172x731, 64 distinct colours)
-  ok   the canvas is not clipped (660x675, wants 660x400)
+  ok   the canvas painted (1172x877, 64 distinct colours)
+  ok   the canvas is not clipped (660x821, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
         line 2: tool: none (p point, l line, b box, o polygon, n clear)
@@ -1251,7 +1272,7 @@ $ ./build/dytqt --selftest
   ok   the mouse places and drags through the widget (20,15 -> 45,35)
   ok   the polygon is placed a click at a time, and its outline is painted (3 clicks, closed, undone, right-button yes, 276 mark px then 0)
   ok   the Analysis chart plots the line's profile and marks its peak (peak bin 1 of hot x 1, chart analysis, picks line yes, marker 0 px then 20)
-  ok   the alarm key arms the derived band, then disarms (31.7..32.1)
+  ok   the alarm key arms at the threshold field's value, then disarms (-20.0..70.0)
   ok   the isotherm key toggles the overlay
   ok   the strip reports the measurement ("box (10,10)-(60,50) n=2091")
   ok   a parameter key arms its ladder and advances it (arm yes, advance yes, switch yes)
@@ -1259,7 +1280,7 @@ $ ./build/dytqt --selftest
   ok   a key while armed is swallowed and ESC cancels (swallow yes, cancel yes)
   ok   y sends the armed value and a refusal keeps it armed (send yes, keep yes)
   ok   the device panel rows and the override `*` (rows yes, override yes, failed-write yes)
-  ok   the device panel is painted over the image (fill yes, toggle yes, covers yes)
+  ok   the device panel is hidden at start-up and painted over the image when shown (hidden yes, fill yes, toggle yes, covers yes)
   ok   the confirmation is painted only while armed (idle 0, armed 7378, cancelled 0)
   ok   q quits and is never swallowed (idle yes, armed yes)
   ok   the read-back compares in the encoded domain (quantised yes, exact yes, kelvin yes)
@@ -1276,18 +1297,21 @@ $ ./build/dytqt --selftest
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x731 yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x877 yes)
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the control panel cannot take the keyboard (24 control(s), 0 that would)
+  ok   the colour bar's range handles sit on the frame's scale, drag the window and reset to auto (geometry yes, painted yes, drag yes, moved yes, auto yes)
+  ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
+  ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
+  ok   the control panel cannot take the keyboard (28 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
-  ok   the control panel asks for its content's height (panel 731 of 731, page 705 of 705, shrinks yes, keeps yes, scrolls yes)
+  ok   the control panel asks for its content's height (panel 877 of 877, page 851 of 851, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
@@ -1466,6 +1490,21 @@ worth naming one by one:
   pixel the projection put there. It is the assertion that catches a scale
   applied to the paint but not to the pointer, which would place every marker
   somewhere else while looking entirely plausible.
+
+The last stretch of the parity work — the Windows panel's remaining controls —
+added three more. **64** is the colour bar's two range handles: it reads their
+geometry off the widget, finds the hot handle's pixel in a render, drags one and
+requires the session to hold the window the drag produced, then double-clicks
+back to auto. **65** is Rapid Diagnostics, and its second half is the one that
+bites: pressing it twice must change nothing, because the second press reads the
+*frame's* extremes and not the window the first one latched — at AUTO those are
+the same numbers, so nothing weaker separates them. **66** drives all three
+circuit modes and requires each to set the range the vendor's own handler sets,
+that only Small Current Leakage moves the panel to the 3D tab, and that the
+checkmark follows. The alarm's threshold field is pinned where it is defined
+rather than through the window: `a` must arm at the field's value (assertion
+25), the field's clamp and the vendor's rounding are `view_model_test`'s, and
+the fixed window a fresh session starts with is `session_test`'s.
 
 37b is the still writer's 2× case: `save_still()` sizes its buffer from the
 snapshot's factor, so the assertion reads the written PNG's own IHDR back and

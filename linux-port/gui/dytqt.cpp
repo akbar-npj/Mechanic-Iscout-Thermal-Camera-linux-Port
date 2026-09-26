@@ -1476,6 +1476,17 @@ public:
         resnap();
     }
 
+    /* Put the display range into `m` and refresh the scalars.  Small, but it
+     * is the seam the circuit modes need: they set the range from a policy
+     * (dyt_vm_leak_effect) rather than from a key or a drag. */
+    void set_range_mode(dyt_range_mode_t m)
+    {
+        if (!sess_)
+            return;
+        dyt_session_set_range_mode(sess_, m);
+        resnap();
+    }
+
     /* Apply a runtime-parameter key.  `raw` is the *unfolded* character, so
      * the reference's case-sensitive bindings survive: 'e' emissivity, 'A'
      * ambient, 'R' reflected, 'D' distance, and 'y' to send.  The ladder and
@@ -3823,6 +3834,7 @@ public:
         Tracking, Alarm, Highlight,
         FlipH, FlipV, FixedRange,
         RapidDiag,
+        LeakShort, LeakLarge, LeakSmall,
         Still, Record, Gallery,
         SrOff, SrVisible, SrThermal,
         N_Ids
@@ -3857,6 +3869,11 @@ public:
         tabs_->addTab(build_circuit_design(), QStringLiteral("Circuit Design"));
         tabs_->addTab(build_super_resolution(),
                       QStringLiteral("Super Resolution"));
+
+        /* The circuit mode's checkmark is this panel's own state, so it has to
+         * be lit from the same source sync() uses — a frame will not arrive
+         * before the first paint on the fixture path. */
+        sync_leak_marks();
     }
 
     /* A click on the control whose key is `key`.  Set by MainWindow, which owns
@@ -4008,38 +4025,64 @@ public:
                               + 48);
     }
 
+    /* Check a row without letting the button's own signal fire: these are
+     * derived from state, not a user gesture, so a checkmark that ran the row's
+     * action would re-enter the mode it is reporting. */
+    static void set_checked(QPushButton *b, bool on)
+    {
+        if (!b)
+            return;
+        const QSignalBlocker block(b);
+        b->setChecked(on);
+    }
+
+    void sync_leak_marks()
+    {
+        set_checked(btn_[LeakShort], leak_mode_ == DYT_LEAK_SHORT);
+        set_checked(btn_[LeakLarge], leak_mode_ == DYT_LEAK_LARGE);
+        set_checked(btn_[LeakSmall], leak_mode_ == DYT_LEAK_SMALL);
+    }
+
     /* Bring every checkmark up to date with the frame just painted.  The
-     * session-derived states come from `snap`; the three that live on the
-     * canvas or the window (the marker toggle, a running clip, an open gallery)
-     * are passed in, because they are not in the snapshot. */
+     * session-derived states come from `snap`; the four that live on the
+     * canvas, the window or this panel (the marker toggle, a running clip, an
+     * open gallery, the circuit mode) are passed in or held here, because they
+     * are not in the snapshot. */
     void sync(const dyt_snapshot_t &snap, bool hot_shown, bool recording,
               bool gallery_open)
     {
-        auto set = [](QPushButton *b, bool on) {
-            if (!b)
-                return;
-            const QSignalBlocker block(b);
-            b->setChecked(on);
-        };
-        set(btn_[Spot],      snap.tool == DYT_TOOL_POINT);
-        set(btn_[Line],      snap.tool == DYT_TOOL_LINE);
-        set(btn_[Rect],      snap.tool == DYT_TOOL_BOX);
-        set(btn_[Poly],      snap.tool == DYT_TOOL_POLYGON);
-        set(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE);
+        set_checked(btn_[Spot],      snap.tool == DYT_TOOL_POINT);
+        set_checked(btn_[Line],      snap.tool == DYT_TOOL_LINE);
+        set_checked(btn_[Rect],      snap.tool == DYT_TOOL_BOX);
+        set_checked(btn_[Poly],      snap.tool == DYT_TOOL_POLYGON);
+        set_checked(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE);
         /* The Analysis pair tracks the chart's mode, not the tool: "Chart
          * analysis" leaves the line tool selected, so a tool-derived checkmark
          * would light the wrong row. */
-        set(btn_[AnalysisLine],  plot_ && plot_->mode() == ProfilePlot::Line);
-        set(btn_[AnalysisChart], plot_ && plot_->mode() == ProfilePlot::Analysis);
-        set(btn_[Tracking],  hot_shown);
-        set(btn_[Alarm],     snap.alarm_on != 0);
-        set(btn_[Highlight], snap.iso_on != 0);
-        set(btn_[FlipH],     snap.xform.flip_h != 0);
-        set(btn_[FlipV],     snap.xform.flip_v != 0);
-        set(btn_[FixedRange], snap.range_mode != DYT_RANGE_AUTO);
-        set(btn_[Record],    recording);
-        set(btn_[Gallery],   gallery_open);
+        set_checked(btn_[AnalysisLine],  plot_ && plot_->mode() == ProfilePlot::Line);
+        set_checked(btn_[AnalysisChart], plot_ && plot_->mode() == ProfilePlot::Analysis);
+        set_checked(btn_[Tracking],  hot_shown);
+        set_checked(btn_[Alarm],     snap.alarm_on != 0);
+        set_checked(btn_[Highlight], snap.iso_on != 0);
+        set_checked(btn_[FlipH],     snap.xform.flip_h != 0);
+        set_checked(btn_[FlipV],     snap.xform.flip_v != 0);
+        set_checked(btn_[FixedRange], snap.range_mode != DYT_RANGE_AUTO);
+        set_checked(btn_[Record],    recording);
+        set_checked(btn_[Gallery],   gallery_open);
+        sync_leak_marks();
     }
+
+    /* The circuit mode is this panel's own state — nothing in the snapshot
+     * says which of the three rows is lit — so it is held here and the rows
+     * are driven from it.  MainWindow::apply_leak_mode() is the one caller;
+     * it also applies the mode's effect to the session. */
+    void set_leak_mode(int mode)
+    {
+        leak_mode_ = mode;
+        sync_leak_marks();
+    }
+    int leak_mode() const { return leak_mode_; }
+
 
     /* The Super Resolution page.  Both facts it shows are session state, not
      * frame state, so it takes them directly rather than a snapshot: the
@@ -4176,6 +4219,24 @@ private:
         auto *lay  = new QVBoxLayout(page);
         lay->setContentsMargins(6, 6, 6, 6);
         lay->setSpacing(8);
+
+        /* Circuit mode.  First on the page because it governs everything below
+         * it: the vendor's radios sit with the tool buttons for the same
+         * reason, and one of the three (Small Current Leakage) turns the
+         * measurement tools off entirely (:22345).  The labels and their order
+         * are the shipped ones — "Short-circuit", "Large Current Leakage",
+         * "Small Current Leakage" — and the keys are the shift forms, because
+         * 's', 'l' and 'm' are already still/line/tracking. */
+        QGroupBox *cir = group(QStringLiteral("Circuit Mode"));
+        auto *cgrp = new QButtonGroup(this);
+        cgrp->setExclusive(true);
+        cgrp->addButton(row(cir, LeakShort,
+                            QStringLiteral("Short-circuit"), 'S', true));
+        cgrp->addButton(row(cir, LeakLarge,
+                            QStringLiteral("Large Current Leakage"), 'L', true));
+        cgrp->addButton(row(cir, LeakSmall,
+                            QStringLiteral("Small Current Leakage"), 'M', true));
+        lay->addWidget(cir);
 
         /* Temperature Measurement — one tool at a time, so an exclusive group
          * keeps the checkmarks consistent with the session's single `tool`. */
@@ -4745,6 +4806,37 @@ private:
                           << QPointF(cx, cy + 2) << QPointF(cx - 3, cy + 6)
                           << QPointF(cx + 3, cy + 6));
             break;
+        case LeakShort:
+            /* a solid bolt: a short circuit.  Filled, because it is the
+             * whole-conductor fault the other two are partial versions of. */
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx + 2, cy - 7) << QPointF(cx - 5, cy + 1)
+                          << QPointF(cx - 1, cy + 1) << QPointF(cx - 2, cy + 7)
+                          << QPointF(cx + 5, cy - 1) << QPointF(cx + 1, cy - 1));
+            break;
+        case LeakLarge:
+            /* a bolt with a wide gap beside it: most of the current leaking
+             * away.  The gap's width is what distinguishes the two leakage
+             * rows at a glance. */
+            p.setPen(QPen(white, 1.3));
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx - 6, cy - 7) << QPointF(cx - 2, cy - 1)
+                          << QPointF(cx - 5, cy - 1) << QPointF(cx - 3, cy + 7));
+            p.setPen(QPen(cyan, 1.3));
+            p.drawLine(cx + 1, cy - 6, cx + 1, cy + 6);
+            p.drawLine(cx + 5, cy - 6, cx + 5, cy + 6);
+            break;
+        case LeakSmall:
+            /* the same bolt, but the leak is a thin thread. */
+            p.setPen(QPen(white, 1.3));
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx - 6, cy - 7) << QPointF(cx - 2, cy - 1)
+                          << QPointF(cx - 5, cy - 1) << QPointF(cx - 3, cy + 7));
+            p.setPen(QPen(cyan, 1.3));
+            p.drawLine(cx + 3, cy - 6, cx + 3, cy + 6);
+            break;
         case Still:
             /* a camera */
             p.drawRect(cx - 7, cy - 4, 14, 9);
@@ -4796,6 +4888,7 @@ private:
     QTabWidget  *tabs_ = nullptr;
     QPushButton *btn_[N_Ids] = {};
     ProfilePlot *plot_ = nullptr;        /* the Analysis group's chart */
+    int          leak_mode_ = DYT_LEAK_SHORT;  /* the circuit-mode rows */
     QLabel      *sr_status_ = nullptr;   /* the Super Resolution tab's readout */
     QLabel      *ref_path_  = nullptr;   /* the Comparison tab's reference path */
     QLabel      *ref_stats_ = nullptr;   /* the Comparison tab's difference stats */
@@ -5844,6 +5937,26 @@ public:
      * Order matters.  The runtime-parameter ladder goes first, because while a
      * candidate is armed the view model consumes every key except 'q', so a
      * stray palette or tool key cannot slip past a pending confirmation. */
+    /* The Troubleshoot panel's circuit modes.  One function, reached by both
+     * the row (through handle_key) and the keyboard, so the checkmark, the
+     * range and the view cannot disagree: the policy is dyt_vm_leak_effect()'s,
+     * the range goes to the session through the view, and the 3D half switches
+     * the panel's own tab the way the rail's Compare item does. */
+    void apply_leak_mode(int mode)
+    {
+        dyt_leak_effect_t fx;
+
+        if (dyt_vm_leak_effect(mode, &fx) != 0)
+            return;
+        if (view_)
+            view_->set_range_mode(fx.range);
+        if (panel_) {
+            panel_->set_leak_mode(mode);
+            if (fx.view_3d)
+                panel_->tabs()->setCurrentIndex(ControlPanel::TabAnalysis3D);
+        }
+    }
+
     int handle_key(int raw)
     {
         if (view_ && view_->param_key(raw))
@@ -5974,6 +6087,16 @@ public:
          * guarded on view_ so a synthetic press with no canvas is inert. */
         if (raw == 'F' && view_) {
             view_->rapid_diagnostics();
+            return 1;
+        }
+
+        /* The circuit modes, on their shift forms — 's', 'l' and 'm' are still,
+         * line and tracking.  Before the view keys and the fold below, so the
+         * shift is not erased and 'L' cannot fall through to the line tool. */
+        if (raw == 'S' || raw == 'L' || raw == 'M') {
+            apply_leak_mode(raw == 'S' ? DYT_LEAK_SHORT
+                          : raw == 'L' ? DYT_LEAK_LARGE
+                                       : DYT_LEAK_SMALL);
             return 1;
         }
 
@@ -6560,6 +6683,7 @@ static const key_line_t kKeyLines[] = {
     { "the picture", "  1-0 , .       palette        u  unit\n" },
     { "the picture", "  t             range auto/fixed\n" },
     { "the picture", "  F             rapid diagnostics: auto-fit the range\n" },
+    { "the picture", "  S L M         circuit: short / large leak / small leak\n" },
     { "the picture", "  h H           flip horizontally / vertically\n" },
     { "the picture", "  + -           zoom\n" },
     { "the picture", "  z Z           super-resolve the visible / thermal plane\n" },
@@ -10023,7 +10147,7 @@ static int selftest(const opts &o)
                 fails++;
         }
 
-        /* ---- Rapid Diagnostics ------------------------------------------
+        /* ---- 65. Rapid Diagnostics --------------------------------------
          *
          * The panel row and the 'F' key must both latch a fixed window that
          * brackets the frame's own extremes.  Driven through the window's key
@@ -10113,6 +10237,85 @@ static int selftest(const opts &o)
                         mode_ok ? "yes" : "NO", contains_ok ? "yes" : "NO",
                         reframe_ok ? "yes" : "NO", idem_ok ? "yes" : "NO",
                         row_same_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
+        /* ---- 66. The circuit modes ---------------------------------------
+         *
+         * The three rows must set the range the vendor's handlers set, and
+         * only Small Current Leakage may move the panel to the 3D tab — a 2D
+         * mode that yanked the user off whatever tab they were reading would
+         * be its own bug.  The checkmarks are this panel's state, so they are
+         * asserted too: a row that applied the range but left the wrong one
+         * lit is the "dead control" in a different dress. */
+        {
+            bool row_ok = false, def_ok = false, large_ok = false,
+                 small_ok = false, short_ok = false;
+            if (view && panel) {
+                send_char(27);
+                dyt_session_reset_view(sess);
+                pm.step();
+
+                QPushButton *bs = panel->button(ControlPanel::LeakShort);
+                QPushButton *bl = panel->button(ControlPanel::LeakLarge);
+                QPushButton *bm = panel->button(ControlPanel::LeakSmall);
+                row_ok = bs && bl && bm &&
+                         bs->text() == QStringLiteral("Short-circuit") &&
+                         bl->text() == QStringLiteral("Large Current Leakage") &&
+                         bm->text() == QStringLiteral("Small Current Leakage");
+
+                /* The vendor's default is 3 (Short-circuit), which is also the
+                 * port's plain full-range 2D view — so the start-up state must
+                 * be that row lit and an auto range. */
+                def_ok = bs && bs->isChecked() && !bl->isChecked() &&
+                         !bm->isChecked() &&
+                         panel->leak_mode() == DYT_LEAK_SHORT;
+
+                /* Large: a fixed window, and the tab left alone. */
+                panel->tabs()->setCurrentIndex(ControlPanel::TabComparison);
+                send_char('L');
+                dyt_snapshot_t s1{};
+                dyt_session_snapshot(sess, &s1, nullptr, 0);
+                large_ok = s1.range_mode == DYT_RANGE_FIXED && s1.hi > s1.lo &&
+                           panel->tabs()->currentIndex() ==
+                               ControlPanel::TabComparison &&
+                           bl && bl->isChecked() && !bs->isChecked() &&
+                           !bm->isChecked();
+
+                /* Small: back to the full range, and now the 3D tab. */
+                send_char('M');
+                dyt_snapshot_t s2{};
+                dyt_session_snapshot(sess, &s2, nullptr, 0);
+                small_ok = s2.range_mode == DYT_RANGE_AUTO &&
+                           panel->tabs()->currentIndex() ==
+                               ControlPanel::TabAnalysis3D &&
+                           bm && bm->isChecked() && !bs->isChecked() &&
+                           !bl->isChecked();
+
+                /* Short: the full range again, and *not* a tab move — it must
+                 * leave the user on the 3D page they were just sent to. */
+                send_char('S');
+                dyt_snapshot_t s3{};
+                dyt_session_snapshot(sess, &s3, nullptr, 0);
+                short_ok = s3.range_mode == DYT_RANGE_AUTO &&
+                           panel->tabs()->currentIndex() ==
+                               ControlPanel::TabAnalysis3D &&
+                           bs && bs->isChecked() && !bl->isChecked() &&
+                           !bm->isChecked();
+
+                panel->tabs()->setCurrentIndex(ControlPanel::TabTroubleshoot);
+                dyt_session_reset_view(sess);
+                pm.step();
+            }
+
+            const bool ok = row_ok && def_ok && large_ok && small_ok &&
+                            short_ok;
+            std::printf("  %-4s the circuit modes set the range and the view "
+                        "(rows %s, default %s, large %s, small %s, short "
+                        "%s)\n", ok ? "ok" : "FAIL", row_ok ? "yes" : "NO",
+                        def_ok ? "yes" : "NO", large_ok ? "yes" : "NO",
+                        small_ok ? "yes" : "NO", short_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }
