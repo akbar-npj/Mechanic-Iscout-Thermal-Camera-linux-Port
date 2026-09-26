@@ -2153,10 +2153,14 @@ private:
     /* The device identity and the runtime writes made this session, so the
      * panel never shows a stored value a write has superseded.  Indexed by
      * dyt_order_type_t (1..4; index 0 unused), which is what dyt_vm_info()
-     * expects.  Visible by default, as in the reference viewer. */
+     * expects.
+     *
+     * Hidden at start-up.  The Windows app opens on the bare picture — the
+     * info panel is something the user asks for (its 'd', or the Settings
+     * box), not a block of text over the first frame they see. */
     dyt_device_info_t   info_{};
     int                 have_info_   = 0;
-    bool                show_info_   = true;
+    bool                show_info_   = false;
     /* The hottest/coldest markers, on by default (the reference viewer always
      * marks them).  The Windows panel's Tracking switch drives this. */
     bool                show_hot_    = true;
@@ -7222,15 +7226,20 @@ static int selftest(const opts &o)
             fails++;
     }
 
-    /* 33. The device panel is painted.  Its background is opaque and sits at a
-     * fixed spot, so an interior pixel must be the fill colour while it is up;
-     * that is what pins the overlay reaching the canvas, not just the rows.
+    /* 33. The device panel starts hidden and is painted once it is shown.
+     * Its background is opaque and sits at a fixed spot, so an interior pixel
+     * must be the fill colour while it is up; that is what pins the overlay
+     * reaching the canvas, not just the rows.
      *
      * The probe is placed through the display transform, because the canvas is
      * centred whenever the window is wider than it needs — and the check is
      * that the pixels *change* when the panel is hidden, because the letterbox
      * is the same colour as the panel's fill and would otherwise pass this on
-     * its own. */
+     * its own.
+     *
+     * The start-up state is asserted first and left alone at the end: the
+     * Windows app opens on the bare picture, so "hidden until asked for" is
+     * part of the contract rather than an incidental default. */
     {
         /* Sampled through render_canvas(), in canvas coordinates: the overlay's
          * box starts at canvas (kPad+6, kPad+6), so (kPad+7, kPad+7) is just
@@ -7243,18 +7252,23 @@ static int selftest(const opts &o)
                    im.pixelColor(kPad + 7, kPad + 8) == QColor(16, 16, 16);
         };
 
+        /* Hidden at start-up: nothing to probe until it is asked for. */
+        const bool starts_hidden = !fv->info_shown();
+
+        fv->toggle_info();              /* show */
         const QImage on   = fv->render_canvas();
         const bool   fill = fv->info_shown() && fill_at(on);
 
-        fv->toggle_info();              /* hide */
+        fv->toggle_info();              /* hide again */
         const bool   hidden  = !fv->info_shown();
         const QImage off     = fv->render_canvas();
         const bool   covered = !fill_at(off);   /* the picture is under it */
-        fv->toggle_info();              /* show again */
 
-        const bool ok = fill && hidden && covered && fv->info_shown();
-        std::printf("  %-4s the device panel is painted over the image "
-                    "(fill %s, toggle %s, covers %s)\n", ok ? "ok" : "FAIL",
+        const bool ok = starts_hidden && fill && hidden && covered;
+        std::printf("  %-4s the device panel is hidden at start-up and painted "
+                    "over the image when shown "
+                    "(hidden %s, fill %s, toggle %s, covers %s)\n",
+                    ok ? "ok" : "FAIL", starts_hidden ? "yes" : "NO",
                     fill ? "yes" : "NO", hidden ? "yes" : "NO",
                     covered ? "yes" : "NO");
         if (!ok)
