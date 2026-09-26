@@ -29,6 +29,7 @@
 #ifndef DYT_SESSION_H
 #define DYT_SESSION_H
 
+#include <stddef.h>   /* size_t — the palette-name accessors take a buffer size */
 #include <stdint.h>
 
 #include "alarm.h"
@@ -286,8 +287,37 @@ int dyt_session_load_palettes(dyt_session_t *s, const char *dir);
 
 /* Copy palette `idx` into *out — a copy rather than a pointer, so the caller
  * never aliases session state.  Front-ends need it to draw a colour bar.
- * Returns 0 on success, -1 if `idx` is out of range or an argument is NULL. */
+ * `out->name` is the palette's *file-derived* name, never a user alias: it is
+ * what names the vendor asset, so it is what a tooltip shows and what a saved
+ * alias is keyed by (see dyt_session_set_palette_alias).  Returns 0 on success,
+ * -1 if `idx` is out of range or an argument is NULL. */
 int dyt_session_get_palette(dyt_session_t *s, int idx, dyt_palette_t *out);
+
+/* How many palettes are loaded.  At least one — the built-in ramps are the
+ * fallback when no directory could be read — so a caller can walk the set
+ * without probing for the end. */
+int dyt_session_palette_count(dyt_session_t *s);
+
+/* A user-given name for palette `idx`, shown wherever the palette is named —
+ * the picker's entries and the status line's palette segment — in place of the
+ * file-derived one.  `alias` NULL or empty restores the file name, so a rename
+ * is always reversible and the vendor asset is never hidden.  The alias is
+ * purely additive: dyt_session_get_palette() keeps reporting the file's own
+ * name, which is why an alias is saved keyed by that name rather than by the
+ * index (the index moves when the palette set changes).  An out-of-range `idx`
+ * is ignored, and an over-long alias is truncated. */
+void dyt_session_set_palette_alias(dyt_session_t *s, int idx, const char *alias);
+
+/* Copy palette `idx`'s alias into `out` (empty when there is none) and return 1
+ * when one is set, 0 when there is none or `idx` is out of range.  What a
+ * front-end saves; a NULL `out` still reports whether an alias is set. */
+int dyt_session_palette_alias(dyt_session_t *s, int idx, char *out, size_t n);
+
+/* The name to *show* for palette `idx`: its alias when one is set, else the
+ * file-derived name.  The one composition rule, so the picker and the status
+ * line cannot name the same palette differently.  Returns 0 on success, -1 if
+ * `idx` is out of range or an argument is NULL. */
+int dyt_session_palette_name(dyt_session_t *s, int idx, char *out, size_t n);
 
 void dyt_session_set_unit(dyt_session_t *s, dyt_unit_t u);
 

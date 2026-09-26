@@ -26,8 +26,10 @@
 #include <dirent.h>     /* the selftest counts what a capture actually wrote */
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <QAction>
@@ -303,6 +305,11 @@ struct prefs {
      * the enum's numbers, so inserting an item cannot silently hide another. */
     std::string rail_hidden;
     std::string tab_hidden;
+    /* User-given palette names, keyed by the palette's *file-derived* name —
+     * the stable key, since the index moves when the palette set changes (and
+     * a saved alias must not land on a different ramp).  One pair per renamed
+     * palette, so an empty vector means nothing was renamed. */
+    std::vector<std::pair<std::string, std::string>> palette_names;
 };
 
 /* The hidden-key encoding, in one place.  A comma-joined string rather than a
@@ -355,6 +362,19 @@ static void prefs_load(const std::string &path, prefs &p)
         keys_join(s->value(QStringLiteral("view/rail_hidden")).toStringList());
     p.tab_hidden =
         keys_join(s->value(QStringLiteral("view/tab_hidden")).toStringList());
+
+    /* The palette aliases live in their own group, one key per renamed palette.
+     * A group rather than one joined string because both halves are user text:
+     * a name containing the separator (or an '=') would break a single-field
+     * encoding.  The value is still read with toStringList() — QSettings parses
+     * a comma-containing value into a list, and toString() on a list returns an
+     * empty string, so an alias like "hot, cold" would silently vanish. */
+    p.palette_names.clear();
+    s->beginGroup(QStringLiteral("palette_names"));
+    for (const QString &k : s->childKeys())
+        p.palette_names.emplace_back(k.toStdString(),
+                                     keys_join(s->value(k).toStringList()));
+    s->endGroup();
 }
 
 static void prefs_save(const std::string &path, const prefs &p)
@@ -371,6 +391,15 @@ static void prefs_save(const std::string &path, const prefs &p)
                 keys_split(p.rail_hidden));
     s->setValue(QStringLiteral("view/tab_hidden"),
                 keys_split(p.tab_hidden));
+    /* Rewritten whole rather than merged: a name the user cleared must not
+     * survive as a stale key, and the group is small enough that working out
+     * which keys to drop would be more code than writing them all. */
+    s->beginGroup(QStringLiteral("palette_names"));
+    s->remove(QString());
+    for (const auto &kv : p.palette_names)
+        s->setValue(QString::fromStdString(kv.first),
+                    QString::fromStdString(kv.second));
+    s->endGroup();
     s->sync();
 }
 
@@ -6919,21 +6948,41 @@ public:
 
         for (int i = 0; i < snap_.palette_n; i++) {
             dyt_palette_t p{};
+            char          shown[DYT_PALETTE_NAME_MAX];
             if (dyt_session_get_palette(sess_, i, &p) != 0)
                 continue;
+            /* The entry shows the *display* name — the user's alias when there
+             * is one — while the tooltip keeps naming the file the vendor
+             * shipped, so a rename can never hide which asset is in use.  The
+             * key hint key_action() puts in the tooltip is kept: this appends
+             * rather than replaces. */
+            if (dyt_session_palette_name(sess_, i, shown, sizeof shown) != 0)
+                snprintf(shown, sizeof shown, "%s", p.name);
+            const QString file_tip =
+                QStringLiteral("Original file name: %1")
+                    .arg(QString::fromUtf8(p.name));
+
             QAction *a = nullptr;
             if (i < 10) {
                 const int  key    = (i == 9) ? '0' : ('1' + i);
                 const char hint[] = { (char)key, '\0' };
-                a = key_action(QString::fromUtf8(p.name), key, hint, true);
+                a = key_action(QString::fromUtf8(shown), key, hint, true);
             } else {
-                a = plain_action(QString::fromUtf8(p.name),
+                a = plain_action(QString::fromUtf8(shown),
                                  [this, i]() {
                                      if (sess_)
                                          dyt_session_set_palette(sess_, i);
                                  }, true);
             }
             a->setChecked(snap_.palette == i);
+            a->setToolTip(a->toolTip().isEmpty()
+                              ? file_tip
+                              : a->toolTip() + QLatin1Char('\n') + file_tip);
+            /* The index as data, so a right-click can rename the entry the
+             * pointer is actually over rather than the current one.  The two
+             * Next/Previous entries carry no data, which is what tells the
+             * handler below to ignore them. */
+            a->setData(i);
             grp->addAction(a);
             menu->addAction(a);
         }
@@ -6941,7 +6990,73 @@ public:
         menu->addSeparator();
         menu->addAction(key_action(QStringLiteral("Next palette"), '.', "."));
         menu->addAction(key_action(QStringLiteral("Previous palette"), ',', ","));
+        /* Renames the palette the user is *on* — the discoverable route.  A
+         * right-click on any entry is the direct one (below); both reach the
+         * same prompt, so neither can become a second meaning. */
+        {
+            auto *rn = new QAction(QStringLiteral("Rename palette\u2026"), menu);
+            rn->setObjectName(QStringLiteral("paletterename"));
+            rn->setToolTip(QStringLiteral(
+                "Give the current palette a name of your own; leave it empty "
+                "to go back to the file's name"));
+            QObject::connect(rn, &QAction::triggered, this,
+                             [this]() { prompt_palette_rename(snap_.palette); });
+            menu->addAction(rn);
+        }
+        /* A right-click anywhere on the list renames the entry under the
+         * pointer.  QMenu's own context-menu event carries the widget-local
+         * position, so actionAt() names the entry — the same "map it here,
+         * not in MainWindow" split the rail's right-click takes. */
+        menu->setContextMenuPolicy(Qt::CustomContextMenu);
+        QObject::connect(menu, &QWidget::customContextMenuRequested, this,
+                         [this, menu](const QPoint &pos) {
+                             QAction *a = menu->actionAt(pos);
+                             if (a && a->data().isValid())
+                                 prompt_palette_rename(a->data().toInt());
+                         });
         return menu;
+    }
+
+    /* Ask for a palette's new name, then apply it.  The prompt is a hook so
+     * --selftest can drive the whole gesture — the menu entry and the
+     * right-click alike — without a modal dialog, the same split
+     * on_choose_folder_ takes; the model change is rename_palette(), which is
+     * public so a test can also call it directly. */
+    void prompt_palette_rename(int idx)
+    {
+        if (!sess_ || !on_palette_rename_prompt)
+            return;
+        char current[DYT_PALETTE_NAME_MAX];
+        /* Also the range check: an index that names no palette is refused
+         * here rather than reaching the session. */
+        if (dyt_session_palette_name(sess_, idx, current, sizeof current) != 0)
+            return;
+        const std::optional<QString> name =
+            on_palette_rename_prompt(idx, QString::fromUtf8(current));
+        /* Nothing at all is "the user cancelled"; an empty string is "clear
+         * the alias".  They are different outcomes, and the hook's two
+         * possible returns are the only place the difference is spelled —
+         * see on_palette_rename_prompt. */
+        if (!name)
+            return;
+        rename_palette(idx, *name);
+    }
+
+    /* The model change: give palette `idx` the display name `name`, or restore
+     * the file-derived one when `name` is empty.  Public, like palette_menu(),
+     * so --selftest can drive it without the prompt.  Returns true when `idx`
+     * named a palette (so a caller can tell a refusal from a no-op). */
+    bool rename_palette(int idx, const QString &name)
+    {
+        if (!sess_)
+            return false;
+        const int n = dyt_session_palette_count(sess_);
+        if (idx < 0 || idx >= n)
+            return false;
+        const QByteArray a = name.trimmed().toUtf8();
+        dyt_session_set_palette_alias(sess_, idx,
+                                      a.isEmpty() ? nullptr : a.constData());
+        return true;
     }
 
     /* The imaging modes, as the vendor's model switch offers them.
@@ -7083,6 +7198,16 @@ public:
      * reports that it was asked for — the same split as every other callback
      * here. */
     std::function<void()> on_choose_folder_;
+
+    /* The palette rename prompt.  Given the palette's index and its current
+     * display name, it returns the new name, an *empty* string to restore the
+     * file-derived name, or nothing at all when the user cancelled — the three
+     * outcomes the gesture has, kept distinct so a cancelled prompt cannot be
+     * mistaken for "clear the name" (which an empty string means).  A callback
+     * for the same reason on_choose_folder_ is one: the modal lives in the
+     * front end, so --selftest can drive the whole rename without a dialog. */
+    std::function<std::optional<QString>(int, const QString &)>
+        on_palette_rename_prompt;
 
     /* The About box.  A callback so --selftest can see the key without a modal
      * dialog blocking the event loop. */
@@ -10269,6 +10394,7 @@ static int selftest(const opts &o)
         char *dir    = mkdtemp(tmpl);
         std::string path;
         bool round = false, prec = false, from = false, keys = false;
+        bool pal   = false;
 
         if (dir) {
             path = std::string(dir) + "/prefs.ini";
@@ -10280,6 +10406,12 @@ static int selftest(const opts &o)
              * not only the scalar fields. */
             p.rail_hidden = "rotate,contact";
             p.tab_hidden  = "circuit";
+            /* Palette names, one of them with a comma in it: a comma is exactly
+             * what QSettings parses as a list, so an alias like this is the
+             * case that would silently vanish if the value were read back with
+             * toString() instead of toStringList(). */
+            p.palette_names = { { "01-iron-red", "Hot iron" },
+                                { "02-rainbow",   "Rainbow, cold" } };
             prefs_save(path, p);
 
             prefs q;
@@ -10289,6 +10421,26 @@ static int selftest(const opts &o)
                     q.capture_dir == "/tmp/elsewhere" &&
                     q.rail_hidden == "rotate,contact" &&
                     q.tab_hidden == "circuit";
+
+            /* The palette names, keyed by the file-derived name, in order. */
+            pal = q.palette_names.size() == 2 &&
+                  q.palette_names[0].first  == "01-iron-red" &&
+                  q.palette_names[0].second == "Hot iron" &&
+                  q.palette_names[1].first  == "02-rainbow" &&
+                  q.palette_names[1].second == "Rainbow, cold";
+
+            /* Saving again with no names must *drop* the old keys rather than
+             * merge into them, or a cleared alias would come back next run. */
+            {
+                prefs none;
+                prefs_save(path, none);
+                prefs back;
+                prefs_load(path, back);
+                pal = pal && back.palette_names.empty();
+            }
+            /* Put the real values back for the round-trip checks below. */
+            prefs_save(path, p);
+            prefs_load(path, q);
 
             /* The encoding itself: a key list survives a split/join round
              * trip, and an empty list encodes to an empty string rather than
@@ -10308,23 +10460,26 @@ static int selftest(const opts &o)
                    eff.unit == 1 && eff.fusion == 2 && eff.sr == 2;
 
             /* The chrome belongs to the window, not the session, so this must
-             * leave it empty — run_gui is what fills it in from the window. */
+             * leave it empty — run_gui is what fills it in from the window.
+             * The palette names are the same: the session holds the aliases,
+             * but the *file-keyed pairs* are the front end's to build. */
             prefs cur = prefs_from_session(sess, ".");
             from = cur.palette >= 0 && cur.zoom >= 1 &&
                    !cur.capture_dir.empty() &&
-                   cur.rail_hidden.empty() && cur.tab_hidden.empty();
+                   cur.rail_hidden.empty() && cur.tab_hidden.empty() &&
+                   cur.palette_names.empty();
 
             remove(path.c_str());
             rmdir(dir);
         }
 
-        const bool ok = round && prec && from && keys;
+        const bool ok = round && prec && from && keys && pal;
         std::printf("  %-4s preferences round-trip and the command line wins "
                     "(round-trip %s, precedence %s, from session %s, "
-                    "chrome keys %s)\n",
+                    "chrome keys %s, palette names %s)\n",
                     ok ? "ok" : "FAIL", round ? "yes" : "NO",
                     prec ? "yes" : "NO", from ? "yes" : "NO",
-                    keys ? "yes" : "NO");
+                    keys ? "yes" : "NO", pal ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -11526,6 +11681,164 @@ static int selftest(const opts &o)
                     rail_hid ? "yes" : "NO", tab_hid ? "yes" : "NO",
                     guard ? "yes" : "NO", list_ok ? "yes" : "NO",
                     restored ? "yes" : "NO");
+        if (!ok)
+            fails++;
+    }
+
+    /* 53j. The palette rename.  A rename is a *display* name: the picker's
+     * entries and the status line show it, while the palette's file-derived
+     * name — what the tooltip names and what a saved preference is keyed by —
+     * is never touched.  Three routes are pinned (the popup's own entry, a
+     * right-click on an entry, and the model call the two share), because the
+     * two gestures exist only to reach the model and a test that drove only the
+     * model would leave them unproven.  The prompt is a stub, so the whole
+     * gesture runs without a modal dialog. */
+    {
+        pm.step();          /* so snap_ (which the picker marks from) is fresh */
+
+        dyt_snapshot_t s0{};
+        dyt_session_snapshot(sess, &s0, nullptr, 0);
+        const int idx = s0.palette;
+        dyt_palette_t p0{};
+        dyt_session_get_palette(sess, idx, &p0);
+        char file0[DYT_PALETTE_NAME_MAX];
+        snprintf(file0, sizeof file0, "%s", p0.name);
+        const QString file0s = QString::fromUtf8(file0);
+        /* The tooltip's own phrase, not just the file name: for an entry under
+         * the tenth the key hint already contains the name, so a "contains the
+         * name" check would pass with no tooltip of ours at all. */
+        const QString tip0 = QStringLiteral("Original file name: ") + file0s;
+
+        auto entry_for = [](QMenu *m, int want) -> QAction * {
+            for (QAction *a : m ? m->actions() : QList<QAction *>())
+                if (a->data().isValid() && a->data().toInt() == want)
+                    return a;
+            return nullptr;
+        };
+        auto rename_action = [](QMenu *m) -> QAction * {
+            for (QAction *a : m ? m->actions() : QList<QAction *>())
+                if (a->objectName() == QStringLiteral("paletterename"))
+                    return a;
+            return nullptr;
+        };
+
+        /* What the prompt answers, and whether it was asked at all. */
+        QString answer;
+        bool    cancelled = false;
+        int     asked     = 0;
+        win.on_palette_rename_prompt =
+            [&](int, const QString &) -> std::optional<QString> {
+                asked++;
+                if (cancelled)
+                    return std::nullopt;
+                return answer;
+            };
+
+        /* Before: the entry shows the file's own name, carries its index as
+         * data (so a right-click can name the entry it is over), and its
+         * tooltip names the file. */
+        QMenu   *m0 = win.palette_menu();
+        QAction *e0 = entry_for(m0, idx);
+        const bool before_ok = e0 && rename_action(m0) &&
+            e0->text() == file0s &&
+            e0->toolTip().contains(tip0) &&
+            e0->data().toInt() == idx;
+        if (m0)
+            m0->deleteLater();
+
+        /* Route 1 — the popup's "Rename palette…" entry, which renames the
+         * palette the picker is on. */
+        answer = QStringLiteral("Hot iron");
+        QMenu *m1 = win.palette_menu();
+        if (QAction *rn = rename_action(m1))
+            rn->trigger();
+        char           shown[DYT_PALETTE_NAME_MAX];
+        dyt_palette_t  p1{};
+        dyt_snapshot_t s1{};
+        dyt_session_palette_name(sess, idx, shown, sizeof shown);
+        dyt_session_get_palette(sess, idx, &p1);
+        dyt_session_snapshot(sess, &s1, nullptr, 0);
+        QMenu   *m2 = win.palette_menu();
+        QAction *e2 = entry_for(m2, idx);
+        const bool via_entry =
+            asked == 1 &&
+            strcmp(shown, "Hot iron") == 0 &&                    /* display name */
+            strcmp(p1.name, file0) == 0 &&                       /* file untouched */
+            strcmp(s1.palette_name, "Hot iron") == 0 &&          /* status line */
+            e2 && e2->text() == QStringLiteral("Hot iron") &&
+            e2->toolTip().contains(tip0);                        /* tooltip keeps it */
+        if (m1)
+            m1->deleteLater();
+        if (m2)
+            m2->deleteLater();
+
+        /* Route 2 — a right-click on an entry, and deliberately on one that is
+         * NOT the palette the picker is on: the gesture must rename the entry
+         * under the pointer, which is the whole reason the index rides on the
+         * action.  Driven through the menu's own context-menu event, so the
+         * actionAt() mapping is under test and not only the handler behind it. */
+        const int other = (idx == 0) ? 1 : 0;
+        answer = QStringLiteral("Cold iron");
+        QMenu   *m3 = win.palette_menu();
+        QAction *e3 = entry_for(m3, other);
+        bool     via_right = false;
+        if (m3 && e3) {
+            m3->popup(QPoint(0, 0));
+            QApplication::processEvents();
+            const QRect  r  = m3->actionGeometry(e3);
+            const QPoint at = r.isEmpty() ? QPoint(2, 2) : r.center();
+            QContextMenuEvent ce(QContextMenuEvent::Mouse, at,
+                                 m3->mapToGlobal(at));
+            QApplication::sendEvent(m3, &ce);
+            QApplication::processEvents();
+            m3->close();
+            char other_name[DYT_PALETTE_NAME_MAX];
+            dyt_session_palette_name(sess, other, other_name, sizeof other_name);
+            dyt_session_palette_name(sess, idx, shown, sizeof shown);
+            via_right = asked == 2 &&
+                        strcmp(other_name, "Cold iron") == 0 &&  /* the one clicked */
+                        strcmp(shown, "Hot iron") == 0;          /* not the current */
+        }
+        if (m3)
+            m3->deleteLater();
+
+        /* Cancelling leaves the name alone — which is *not* the same as an
+         * empty answer, and is why the hook returns an optional rather than a
+         * string. */
+        cancelled = true;
+        QMenu *m4 = win.palette_menu();
+        if (QAction *rn = rename_action(m4))
+            rn->trigger();
+        dyt_session_palette_name(sess, idx, shown, sizeof shown);
+        const bool cancel_ok = asked == 3 && strcmp(shown, "Hot iron") == 0;
+        if (m4)
+            m4->deleteLater();
+
+        /* Route 3 — the model call both gestures share, including the empty
+         * name that restores the file's.  An out-of-range index is refused
+         * rather than clamped onto a neighbouring palette. */
+        cancelled = false;
+        const bool model_ok =
+            win.rename_palette(idx, QString()) &&
+            dyt_session_palette_name(sess, idx, shown, sizeof shown) == 0 &&
+            strcmp(shown, file0) == 0 &&
+            dyt_session_palette_alias(sess, idx, nullptr, 0) == 0 &&
+            !win.rename_palette(-1, QStringLiteral("x")) &&
+            !win.rename_palette(s0.palette_n, QStringLiteral("x"));
+        /* Leave the palette the right-click touched as it was found. */
+        win.rename_palette(other, QString());
+
+        win.on_palette_rename_prompt = nullptr;
+
+        const bool ok = before_ok && via_entry && via_right && cancel_ok &&
+                        model_ok;
+        std::printf("  %-4s the palette picker renames a palette without "
+                    "touching the file (entry %s, popup route %s, right-click "
+                    "route %s, cancel keeps %s, model %s)\n",
+                    ok ? "ok" : "FAIL",
+                    before_ok ? "yes" : "NO", via_entry ? "yes" : "NO",
+                    via_right ? "yes" : "NO", cancel_ok ? "yes" : "NO",
+                    model_ok ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -13569,6 +13882,21 @@ static int run_gui(const opts &o_in, QApplication &app)
         return 1;
     setup_super_resolution(sess, o);
 
+    /* The palette names the user gave last run, matched by each palette's own
+     * file-derived name so a saved alias cannot land on a different ramp when
+     * the set changes.  Applied to the session before the window exists, so
+     * the first picker and the first status line already show them. */
+    if (!o.no_prefs) {
+        for (int i = 0; i < dyt_session_palette_count(sess); i++) {
+            dyt_palette_t pal{};
+            if (dyt_session_get_palette(sess, i, &pal) != 0)
+                continue;
+            for (const auto &kv : p.palette_names)
+                if (kv.first == pal.name)
+                    dyt_session_set_palette_alias(sess, i, kv.second.c_str());
+        }
+    }
+
     MainWindow win;
     win.set_session(sess);
     /* The chrome the last run ended with, applied before the window is first
@@ -13996,6 +14324,22 @@ static int run_gui(const opts &o_in, QApplication &app)
         pm.notice("gallery folder: " + o.capture_dir, 150);
     };
 
+    /* The palette rename prompt.  A dialog rather than a fixed name, because
+     * the point is the user's own label.  Cancelling returns nothing, which
+     * prompt_palette_rename() reads as "leave it alone"; an empty input is a
+     * present-but-empty string, which restores the file-derived name. */
+    win.on_palette_rename_prompt =
+        [&](int, const QString &current) -> std::optional<QString> {
+            bool ok = false;
+            const QString t = QInputDialog::getText(
+                &win, QStringLiteral("Rename palette"),
+                QStringLiteral("New name (leave empty to use the file's name):"),
+                QLineEdit::Normal, current, &ok);
+            if (!ok)
+                return std::nullopt;
+            return t.trimmed();
+        };
+
     win.on_about_ = [&]() {
         /* Read the model state now rather than remembering it from start-up:
          * a failed upscale withdraws the capability (session.c), and the box
@@ -14291,6 +14635,20 @@ static int run_gui(const opts &o_in, QApplication &app)
         p = prefs_from_session(sess, o.capture_dir);
         p.rail_hidden = keys_join(win.rail_hidden());
         p.tab_hidden  = keys_join(win.tab_hidden());
+        /* The palette names, keyed by each palette's own file-derived name so
+         * the pair survives a change to the palette set.  An alias equal to
+         * the file's name is not saved: it is what an un-renamed palette
+         * already shows, so the key would say nothing. */
+        p.palette_names.clear();
+        for (int i = 0; i < dyt_session_palette_count(sess); i++) {
+            dyt_palette_t pal{};
+            char alias[DYT_PALETTE_NAME_MAX];
+            if (dyt_session_get_palette(sess, i, &pal) != 0)
+                continue;
+            if (dyt_session_palette_alias(sess, i, alias, sizeof alias) &&
+                std::strcmp(alias, pal.name) != 0)
+                p.palette_names.emplace_back(pal.name, alias);
+        }
         prefs_save(prefs_path(o), p);
     }
 

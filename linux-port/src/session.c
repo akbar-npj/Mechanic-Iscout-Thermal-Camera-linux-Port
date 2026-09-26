@@ -75,6 +75,11 @@ struct dyt_session {
     int       have_raw;
 
     dyt_palette_t pal[DYT_PALETTE_MAX];
+    /* A user-given name per palette, parallel to `pal` and keyed by index only
+     * in memory — the empty string means "no alias", so the file-derived name
+     * in `pal[i].name` is always the fallback.  Cleared by load_palettes(),
+     * because a reload changes what each index points at. */
+    char          pal_alias[DYT_PALETTE_MAX][DYT_PALETTE_NAME_MAX];
     int           pal_n;
 
     /* Super-resolution (the optional 2x model).  `sr_mode` is what the user
@@ -102,6 +107,18 @@ struct dyt_session {
 /* Defined with the rest of the super-resolution code below; the snapshot needs
  * the factor the next render will use, and the render needs it first. */
 static int sr_factor_locked(const dyt_session_t *s);
+
+/* The name to *show* for palette `idx`: the user's alias when one is set, else
+ * the file-derived name.  The one composition rule — the snapshot and
+ * dyt_session_palette_name() both come through here, so the picker and the
+ * status line cannot name the same palette differently.  The lock must be held.
+ * Never NULL for a valid index; "" for one out of range. */
+static const char *pal_name_locked(const dyt_session_t *s, int idx)
+{
+    if (idx < 0 || idx >= s->pal_n)
+        return "";
+    return s->pal_alias[idx][0] ? s->pal_alias[idx] : s->pal[idx].name;
+}
 
 dyt_session_t *dyt_session_create(void)
 {
@@ -379,7 +396,7 @@ int dyt_session_snapshot(dyt_session_t *s, dyt_snapshot_t *out,
     snprintf(out->sr_name, sizeof out->sr_name, "%s",
              dyt_sr_name(s->sr_mode));
     snprintf(out->palette_name, sizeof out->palette_name, "%s",
-             s->pal[s->disp.palette].name);
+             pal_name_locked(s, s->disp.palette));
 
     out->centre_x = s->width / 2;
     out->centre_y = s->height / 2;
@@ -801,6 +818,11 @@ int dyt_session_load_palettes(dyt_session_t *s, const char *dir)
 
     pthread_mutex_lock(&s->m);
     memcpy(s->pal, loaded, (size_t)n * sizeof loaded[0]);
+    /* The aliases are per-index in memory, so a reload must drop them: index 3
+     * may be a different palette now, and a stale alias would attach the old
+     * name to the new ramp.  A front end that wants them back re-applies them
+     * by the palette's own file name (see dyt_session_set_palette_alias). */
+    memset(s->pal_alias, 0, sizeof s->pal_alias);
     s->pal_n = n;
     /* Set the count *before* re-clamping the index: if the new set is smaller
      * than the old one, clamping against the old count would leave the index
@@ -822,6 +844,75 @@ int dyt_session_get_palette(dyt_session_t *s, int idx, dyt_palette_t *out)
     pthread_mutex_lock(&s->m);
     if (idx >= 0 && idx < s->pal_n) {
         *out = s->pal[idx];
+        rc = 0;
+    }
+    pthread_mutex_unlock(&s->m);
+    return rc;
+}
+
+int dyt_session_palette_count(dyt_session_t *s)
+{
+    int n;
+
+    if (!s)
+        return 0;
+
+    pthread_mutex_lock(&s->m);
+    n = s->pal_n;
+    pthread_mutex_unlock(&s->m);
+    return n;
+}
+
+void dyt_session_set_palette_alias(dyt_session_t *s, int idx, const char *alias)
+{
+    if (!s)
+        return;
+
+    pthread_mutex_lock(&s->m);
+    if (idx >= 0 && idx < s->pal_n) {
+        if (!alias || !alias[0])
+            s->pal_alias[idx][0] = '\0';   /* back to the file-derived name */
+        else
+            /* Truncated rather than overflowed: a name is a label, and a
+             * front end that hands in something longer still gets a usable
+             * one instead of a crash or a silent no-op. */
+            snprintf(s->pal_alias[idx], sizeof s->pal_alias[idx], "%s", alias);
+    }
+    pthread_mutex_unlock(&s->m);
+}
+
+int dyt_session_palette_alias(dyt_session_t *s, int idx, char *out, size_t n)
+{
+    int have = 0;
+
+    if (!s)
+        return 0;
+
+    pthread_mutex_lock(&s->m);
+    if (idx >= 0 && idx < s->pal_n && s->pal_alias[idx][0]) {
+        have = 1;
+        if (out && n)
+            snprintf(out, n, "%s", s->pal_alias[idx]);
+    }
+    pthread_mutex_unlock(&s->m);
+
+    /* Cleared outside the lock and whether or not there was one, so a caller
+     * that reuses its buffer cannot read a stale name after a rename-back. */
+    if (!have && out && n)
+        out[0] = '\0';
+    return have;
+}
+
+int dyt_session_palette_name(dyt_session_t *s, int idx, char *out, size_t n)
+{
+    int rc = -1;
+
+    if (!s || !out || !n)
+        return -1;
+
+    pthread_mutex_lock(&s->m);
+    if (idx >= 0 && idx < s->pal_n) {
+        snprintf(out, n, "%s", pal_name_locked(s, idx));
         rc = 0;
     }
     pthread_mutex_unlock(&s->m);

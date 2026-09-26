@@ -296,6 +296,132 @@ static void test_palettes(void)
     dyt_session_free(s);
 }
 
+/* The user-given palette names.  Two things are being pinned: that an alias is
+ * purely *additive* (the file-derived name in dyt_session_get_palette() is
+ * never overwritten, which is what a tooltip and a saved key rely on), and that
+ * the display name — the one the picker and the status line both read — follows
+ * the alias exactly.  Built-ins are used throughout, so this needs no
+ * palettes/ directory. */
+static void test_palette_alias(void)
+{
+    dyt_session_t  *s = dyt_session_create();
+    dyt_snapshot_t  snap;
+    dyt_frame_info_t fi;
+    dyt_palette_t   p;
+    char  buf[DYT_PALETTE_NAME_MAX];
+    char  file1[DYT_PALETTE_NAME_MAX];
+    float img[4 * 2];
+    int   n, hits;
+
+    printf("-- palette aliases --\n");
+
+    /* A snapshot is only valid once a frame has arrived. */
+    fill(img, 4, 2, 30.0f);
+    fi.temps = img; fi.width = 4; fi.height = 2;
+    dyt_session_process(s, &fi);
+
+    n = dyt_session_palette_count(s);
+    intcheck("count matches the snapshot",
+             dyt_session_snapshot(s, &snap, NULL, 0) == 0 ? snap.palette_n : -1, n);
+    if (n < 2) {
+        fail("need two palettes", "fewer loaded");
+        dyt_session_free(s);
+        return;
+    }
+
+    /* No alias to begin with: the display name IS the file name, and the
+     * accessor says there is none rather than handing back a stale buffer. */
+    memset(buf, 'Z', sizeof buf);
+    intcheck("get_palette", dyt_session_get_palette(s, 1, &p), 0);
+    snprintf(file1, sizeof file1, "%s", p.name);
+    intcheck("no alias yet", dyt_session_palette_alias(s, 1, buf, sizeof buf), 0);
+    intcheck("empty buffer when there is none", buf[0] == '\0', 1);
+    intcheck("palette_name", dyt_session_palette_name(s, 1, buf, sizeof buf), 0);
+    intcheck("name is the file name", strcmp(buf, file1) == 0, 1);
+
+    /* Set one: the display name changes, the file name does not. */
+    dyt_session_set_palette_alias(s, 1, "My ramp");
+    intcheck("alias reported", dyt_session_palette_alias(s, 1, buf, sizeof buf), 1);
+    intcheck("alias text", strcmp(buf, "My ramp") == 0, 1);
+    intcheck("display name is the alias",
+             dyt_session_palette_name(s, 1, buf, sizeof buf), 0);
+    intcheck("display name text", strcmp(buf, "My ramp") == 0, 1);
+    intcheck("get_palette still works", dyt_session_get_palette(s, 1, &p), 0);
+    intcheck("file name is never overwritten", strcmp(p.name, file1) == 0, 1);
+
+    /* The status line reads the display name, and only for the *active*
+     * palette — so this is also the check that an alias is not global. */
+    dyt_session_set_palette(s, 1);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("status line shows the alias",
+             strcmp(snap.palette_name, "My ramp") == 0, 1);
+    dyt_session_set_palette(s, 0);
+    dyt_session_snapshot(s, &snap, NULL, 0);
+    intcheck("a different palette is unaffected",
+             strcmp(snap.palette_name, "My ramp") != 0, 1);
+
+    /* An over-long name is truncated into the buffer, not overflowed, and the
+     * truncation is exactly the buffer's bound. */
+    {
+        char longname[128];
+        memset(longname, 'x', sizeof longname - 1);
+        longname[sizeof longname - 1] = '\0';
+        dyt_session_set_palette_alias(s, 1, longname);
+        intcheck("over-long alias is accepted",
+                 dyt_session_palette_name(s, 1, buf, sizeof buf), 0);
+        intcheck("over-long alias is truncated",
+                 (int)strlen(buf), DYT_PALETTE_NAME_MAX - 1);
+    }
+
+    /* A short caller buffer truncates too. */
+    dyt_session_set_palette_alias(s, 1, "My ramp");
+    memset(buf, 'Z', sizeof buf);
+    intcheck("short buffer", dyt_session_palette_name(s, 1, buf, 4), 0);
+    intcheck("short buffer is truncated", strcmp(buf, "My ") == 0, 1);
+
+    /* Clearing restores the file name — by empty string and by NULL alike. */
+    dyt_session_set_palette_alias(s, 1, "");
+    intcheck("cleared by an empty string",
+             dyt_session_palette_alias(s, 1, buf, sizeof buf), 0);
+    dyt_session_set_palette_alias(s, 1, NULL);
+    intcheck("cleared by NULL", dyt_session_palette_alias(s, 1, buf, sizeof buf), 0);
+    intcheck("display name is the file name again",
+             dyt_session_palette_name(s, 1, buf, sizeof buf), 0);
+    intcheck("restored name", strcmp(buf, file1) == 0, 1);
+
+    /* Out-of-range indices are ignored, not written into a neighbour. */
+    dyt_session_set_palette_alias(s, -1, "bad");
+    dyt_session_set_palette_alias(s, n, "bad");
+    intcheck("out-of-range alias is ignored",
+             dyt_session_palette_alias(s, n, buf, sizeof buf), 0);
+    intcheck("out-of-range display name",
+             dyt_session_palette_name(s, n, buf, sizeof buf), -1);
+    intcheck("NULL out buffer", dyt_session_palette_name(s, 0, NULL, 0), -1);
+    intcheck("a NULL out still reports an alias",
+             dyt_session_palette_alias(s, 0, NULL, 0), 0);
+
+    /* A reload drops the aliases: index 1 may be a different ramp now, and a
+     * stale alias would name the new ramp after the old one. */
+    dyt_session_set_palette_alias(s, 1, "My ramp");
+    intcheck("alias set before the reload",
+             dyt_session_palette_alias(s, 1, buf, sizeof buf), 1);
+    dyt_session_load_palettes(s, NULL);
+    intcheck("alias dropped by a reload",
+             dyt_session_palette_alias(s, 1, buf, sizeof buf), 0);
+
+    /* The aliases are per-index, not one shared name. */
+    dyt_session_set_palette_alias(s, 0, "Zero");
+    dyt_session_set_palette_alias(s, 1, "One");
+    hits = 0;
+    dyt_session_palette_name(s, 0, buf, sizeof buf);
+    hits += strcmp(buf, "Zero") == 0;
+    dyt_session_palette_name(s, 1, buf, sizeof buf);
+    hits += strcmp(buf, "One") == 0;
+    intcheck("aliases are per-index", hits, 2);
+
+    dyt_session_free(s);
+}
+
 /* --- settings ----------------------------------------------------------- */
 
 static void test_settings(void)
@@ -1379,6 +1505,7 @@ int main(void)
     test_filler();
     test_render();
     test_palettes();
+    test_palette_alias();
     test_settings();
     test_measurement();
     test_roi_edit();

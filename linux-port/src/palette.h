@@ -38,9 +38,15 @@ extern "C" {
  * 27, but 5 duplicate an Android one).  See palettes/README.md. */
 #define DYT_PALETTE_MAX 32
 
+/* Storage bound for a palette's name (the file's basename, or a built-in's
+ * stand-in name).  Named rather than repeated as a literal so the palette's
+ * own field and the session's alias array cannot drift apart — an alias longer
+ * than this is truncated, not overflowed. */
+#define DYT_PALETTE_NAME_MAX 32
+
 typedef struct {
     uint8_t rgb[DYT_PALETTE_BYTES];      /* 256 × R,G,B; index 0 = coldest */
-    char    name[32];                    /* for window titles / --list */
+    char    name[DYT_PALETTE_NAME_MAX];  /* for window titles / --list */
 } dyt_palette_t;
 
 /* Load a vendor palette file.  Requires exactly DYT_PALETTE_BYTES and no

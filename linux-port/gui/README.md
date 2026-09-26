@@ -485,6 +485,28 @@ painting, and the button can be driven in a test. The menu deletes itself when
 dismissed. Assertion 53g pins both pick routes (a digit-keyed entry and a keyless
 one), the mark, and that the button opens the picker at all.
 
+The picker also carries a **rename** option, because the vendor ships the palettes
+under file names (`Iron2.dat`, `Rainbow.dat`) that are not always the name a user
+would look for. A **"Rename palette…"** entry at the bottom of the popup renames
+the palette the picker is currently on, and a **right-click on any entry** renames
+that entry — the two gestures exist only to reach the model, so both are pinned.
+The new name is a *display* name: the popup's entries and the status line show it,
+while the file-derived name is never touched — it is what the tooltip names ("Original
+file name: …") and what a saved preference is keyed by, so a rename can never hide
+which asset is in use or break a preference on reload. An empty answer restores the
+file's name. The prompt is a hook (`on_palette_rename_prompt`) so `--selftest` can
+drive the whole gesture without a modal dialog; it returns an
+`std::optional<QString>` rather than a plain string so a *cancelled* prompt (restore
+nothing, leave the name alone) is not mistaken for an *empty* one (clear the alias)
+— those are two different outcomes, and the hook's return type is the only place
+the difference is spelled. Assertion 53j pins the entry's text/tooltip/data before,
+route 1 (the popup's own entry renames the current palette, the file is untouched,
+the status line shows the alias, the tooltip keeps the file), route 2 (a right-click
+on a *different* entry, driven through the menu's own context-menu event so the
+`actionAt()` mapping is under test), a cancelled prompt leaving the name alone,
+and route 3 (the model call both gestures share, including the empty-name restore
+and an out-of-range refusal).
+
 The **Fusion picker** sits between Palette and Mark, and is the same kind of
 popup for the same reason. It used to be a combo box in the Settings dialog's
 Display group; it moved here because the imaging mode is a *view* choice, and
@@ -1574,6 +1596,7 @@ $ ./build/dytqt --selftest
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, 6 fusion patterns yes, fusion mark yes, fusion pick yes, fusion popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
   ok   the control panel asks for its content's height (panel 1050 of 1050, page 1024 of 1024, shrinks yes, keeps yes, scrolls yes)
   ok   the Settings Toolbar section hides and shows the rail and the tabs (labels yes, seeded yes, rail yes, tab yes, Setting kept yes, whole-list yes, restored yes)
+  ok   the palette picker renames a palette without touching the file (entry yes, popup route yes, right-click route yes, cancel keeps yes, model yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
@@ -1772,6 +1795,20 @@ worth naming one by one:
   failure modes are mutations that drop the guard, drop the `setVisible()` call,
   drop the `setTabVisible()` call, or make the sync a no-op. Described under
   [The control panel](#the-control-panel).
+* **53j** covers the palette rename. It requires the picker's entry to show the
+  display name while the tooltip keeps the file's, the popup's "Rename palette…"
+  entry to rename the current palette without touching the file (the status line
+  follows), a right-click on a *different* entry to rename that entry (driven
+  through the menu's own context-menu event so the `actionAt()` mapping is under
+  test, not only the handler behind it), a cancelled prompt to leave the name
+  alone, and the model call both gestures share to restore the file's name on an
+  empty input and refuse an out-of-range index. The cancel/empty distinction is
+  why the prompt hook returns an `std::optional<QString>` rather than a string:
+  `std::nullopt` is "cancelled, leave it alone" and an empty string is "clear the
+  alias" — two outcomes a null-QString convention could not tell apart. Its failure
+  modes are mutations that make the entry use the file name, drop the tooltip, make
+  the right-click rename the current palette instead of the one under the pointer,
+  or treat a cancel as an empty string. Described under [The rail](#the-rail).
 * **54** grows the window and requires the canvas to be 1:1 before, scaled and
   centred after, and 1:1 again when it shrinks back; the first half is what keeps
   the pixel assertions honest, since at the natural size the scale is exactly 1
