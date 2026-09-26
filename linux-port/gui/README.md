@@ -1950,6 +1950,7 @@ make deb                              # build/dytqt_<version>_<arch>.deb
 |---|---|
 | `$(BINDIR)/dytqt` | the binary |
 | `$(DATADIR)/applications/dytqt.desktop` | the desktop entry |
+| `$(PREFIX)/lib/udev/rules.d/Mechanic-iScout-Thermal-Camera.rules` | the camera-access rule (below) |
 | `$(DATADIR)/icons/hicolor/<N>x<N>/apps/dytqt.png` | 16, 24, 32, 48, 64, 128, 256 |
 | `$(DATADIR)/dytqt/palettes/*.dat` | the 28 vendor palettes |
 | `$(DATADIR)/dytqt/models/zoom2.mnn` | the super-resolution model (13 KB) |
@@ -1988,6 +1989,43 @@ The icon is rasterised from `packaging/dytqt.svg` at install time, at 8-bit
 RGBA (the default was 16-bit, which some icon loaders handle poorly), so
 `make install` needs ImageMagick (`magick` or `convert`).
 
+### The udev rule
+
+The camera is a plain USB device that only root may open, so the port ships
+`packaging/Mechanic-iScout-Thermal-Camera.rules` — the six `VID:PID` pairs the
+app probes for (`tools/probe.c`'s `known[]`), each with `MODE="0666"`. It is
+installed to `$(PREFIX)/lib/udev/rules.d/`, deliberately **not** under
+`$(LIBDIR)`: udev's rules directory is always `lib/udev/rules.d` beneath the
+prefix, so a 64-bit Fedora still uses `lib/` there, not `lib64/`. Both
+`/usr/lib/udev/rules.d` and `/usr/local/lib/udev/rules.d` are in udev's search
+path, so either prefix works.
+
+`make install` copies the file but does **not** reload udev — a developer's own
+install should not change running system state. The packages' post-install
+scripts do the reload: `packaging/deb/postinst` runs on `configure`, and the
+spec's `%post` does the same. Both call `udevadm` **directly**, because the
+packaging macro that would normally do it (`%udev_rules_update`) expands to
+`%{nil}` on this host — relying on it would silently do nothing. Each guards
+with `[ -x /usr/bin/udevadm ]` so the scriptlet cannot fail on a system without
+udev.
+
+The rule's name matters for an administrator who already has one: a rule with a
+**different** name in `/etc/udev/rules.d/` coexists (both are applied, and
+duplicate `MODE=` settings are harmless), while one with the **same** name
+shadows the packaged file completely — which is the intended override. A
+package upgrade replaces the `/usr/lib` copy in place and never touches `/etc`.
+
+The `MODE="0666"` versus `TAG+="uaccess"` trade-off is recorded in the file's
+own header comment: `uaccess` is stricter but needs systemd-logind to honour
+the tag, so it fails in a container or over a serial console.
+
+No `uvcvideo` blacklist is needed. The vendored libuvc detaches the kernel
+driver itself in `uvc_claim_if` (`third_party/libuvc/src/device.c`) and
+re-attaches it on close — verified live — so the older blacklist advice would
+only remove the camera's V4L2 node. That node (`/dev/videoN`, "USB Camera") is
+the *visible* half as a normal webcam, which matters for an overlay that
+expects the thermal image there; `dytqt` itself uses libusb, not V4L2.
+
 Both packagers wrap that same layout, so neither file list can drift from
 `install`: `rpm` stages through `make install` and hands the tree to `rpmbuild`,
 `deb` stages through `make install` and hands it to `dpkg-deb`.
@@ -2018,7 +2056,10 @@ those, and `%build`/`%install` only copy files). Details worth knowing:
   spec does not list fails the build rather than being silently dropped. The
   window chrome added nothing to it: the rail, the panel, the dialogs and the
   Help text are all built in the binary — the icons are `QPainter` vectors, not
-  assets — so `make install` stages no new file and `%files` is unchanged.
+  assets — so `make install` staged no new file. The udev rule *is* a new
+  staged file, and is listed as
+  `%{_udevrulesdir}/Mechanic-iScout-Thermal-Camera.rules` (only the file, never
+  the directory, which belongs to the udev package).
 
 `_topdir` and the stage default to `~/.cache/dytqt/{rpmbuild,stage}` — absolute
 and space-free by design, because this tree's path contains a space. A
@@ -2074,6 +2115,15 @@ re-verification is `make deb && make rpm`, then `dpkg-deb -x` / `rpm2cpio` into
 a scratch tree and run its `usr/bin/dytqt --selftest` **from the project
 directory**, because the default fixture path is relative to the cwd.
 
+The udev rule was verified through the same path: `make install` stages it at
+`$(PREFIX)/lib/udev/rules.d/` (checked by staging into a scratch `DESTDIR`),
+`dpkg-deb --contents` shows it in the deb with a `postinst` in the control
+archive, and `rpm -qpl` plus `rpm -qp --scripts` show the same file in the rpm
+with the `%post` that reloads udev. Both extracted binaries still pass
+`--selftest`. `packaging/check.sh` was mutation-tested for the new check:
+deleting one `VID:PID` line from the rule turns it into a `FAIL` with both
+lists printed.
+
 The RPM was then installed for real — `sudo dnf install ./build/dytqt-*.rpm` —
 and the **GUI launched from `/usr/bin/dytqt`**, which is exactly what the
 staged-tree `--selftest` could not catch: the default source was the
@@ -2093,13 +2143,16 @@ that the entry's `Name` and the window title are one string (they share the
 entry that opens a window titled something else),
 that the icon rasterises to something non-blank at 16 and 256 px, that the model
 ships where the app's own search looks, that a binary linking `libMNN.so` carries
-an rpath covering both packaged layouts and no path into the build tree, and that
+an rpath covering both packaged layouts and no path into the build tree, that
 the spec agrees with the Makefile about the library's directory, the MNN switch
-and the version. Each of those fails *silently* otherwise: a typo in any of the
-metadata entries validates cleanly and still launches nothing, a model in the
-wrong place looks exactly like a build without a runtime, a bad rpath makes the
-installed app not start at all, and a spec that disagrees with `make install`
-builds a package that cannot find its own library.
+and the version, and that the udev rule lists exactly the devices `probe.c`
+probes for and is shipped *and reloaded* by both packages. Each of those fails
+*silently* otherwise: a typo in any of the metadata entries validates cleanly and
+still launches nothing, a model in the wrong place looks exactly like a build
+without a runtime, a bad rpath makes the installed app not start at all, a spec
+that disagrees with `make install` builds a package that cannot find its own
+library, and a rule whose device list has drifted — or that is installed but
+never reloaded — leaves a camera the app supports unopenable.
 
 The version is single-sourced: the Makefile's `VERSION` feeds `-DDYT_VERSION`
 for the GUI, names the deb, and is passed to the spec as `_dytqt_version`, so the

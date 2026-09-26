@@ -717,6 +717,13 @@ MODELDIR = $(DATADIR)/dytqt/models
 # must not be changed one without the other.
 MNNDIR = $(LIBDIR)/dytqt
 
+# The udev rule that makes the camera usable without root.  It is NOT under
+# $(LIBDIR): udev's rules directory is always lib/udev/rules.d beneath the
+# prefix — a 64-bit Fedora still uses lib/ here, not lib64/ — so this one path
+# is spelled out from $(PREFIX) rather than following LIBDIR.
+RULESDIR  = $(PREFIX)/lib/udev/rules.d
+RULES_NAME = Mechanic-iScout-Thermal-Camera.rules
+
 # The hicolor sizes this icon is installed at.  The SVG alone is not enough:
 # several desktops still do not read scalable icons, so the Makefile rasterises
 # it with ImageMagick at install time and ships no PNG in the source tree.
@@ -753,7 +760,7 @@ DEB_DEPENDS ?= libc6, libstdc++6, libgcc-s1, libusb-1.0-0, \
 DEB_ROOT := $(BUILD)/deb/$(DEB_NAME)_$(VERSION)_$(DEB_ARCH)
 DEB_FILE := $(BUILD)/$(DEB_NAME)_$(VERSION)_$(DEB_ARCH).deb
 
-install: $(BUILD)/dytqt
+install: $(BUILD)/dytqt packaging/$(RULES_NAME)
 	@test -n "$(ICON_TOOL)" || { \
 	    echo "install: ImageMagick (magick or convert) is needed for the icon" >&2; \
 	    exit 1; }
@@ -761,6 +768,12 @@ install: $(BUILD)/dytqt
 	install -m 0755 $(BUILD)/dytqt "$(DESTDIR)$(BINDIR)/dytqt"
 	install -d "$(DESTDIR)$(APPDIR)"
 	install -m 0644 packaging/dytqt.desktop "$(DESTDIR)$(APPDIR)/dytqt.desktop"
+# The udev rule makes the camera accessible to the desktop user.  It is a plain
+# file install; nothing here reloads udev — the package post-install scripts do
+# that (packaging/deb/postinst, the spec's %post), because a `make install` on a
+# developer's own machine should not silently change running system state.
+	install -d "$(DESTDIR)$(RULESDIR)"
+	install -m 0644 packaging/$(RULES_NAME) "$(DESTDIR)$(RULESDIR)/$(RULES_NAME)"
 	install -d "$(DESTDIR)$(PALETTEDIR)"
 	install -m 0644 palettes/*.dat "$(DESTDIR)$(PALETTEDIR)/"
 	install -d "$(DESTDIR)$(MODELDIR)"
@@ -785,6 +798,7 @@ endif
 uninstall:
 	rm -f "$(DESTDIR)$(BINDIR)/dytqt"
 	rm -f "$(DESTDIR)$(APPDIR)/dytqt.desktop"
+	rm -f "$(DESTDIR)$(RULESDIR)/$(RULES_NAME)"
 	rm -rf "$(DESTDIR)$(PALETTEDIR)"
 	rm -rf "$(DESTDIR)$(MODELDIR)"
 # Only the app's own subdirectory: $(LIBDIR) may hold libraries this package did
@@ -795,7 +809,8 @@ uninstall:
 	done
 	@echo "removed dytqt from $(DESTDIR)$(PREFIX)"
 
-deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
+deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright \
+	packaging/deb/postinst
 	@command -v dpkg-deb >/dev/null 2>&1 || { \
 	    echo "deb: dpkg-deb is required (install dpkg)" >&2; exit 1; }
 	rm -rf $(DEB_ROOT)
@@ -822,6 +837,9 @@ deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright
 	    -e 's|@MAINTAINER@|$(DEB_MAINTAINER)|g' \
 	    packaging/deb/control.in > $(DEB_ROOT)/DEBIAN/control; \
 	chmod 0644 $(DEB_ROOT)/DEBIAN/control
+# The maintainer script must be executable inside the package, or dpkg ignores
+# it — and the rule it reloads would then only take effect after a reboot.
+	install -m 0755 packaging/deb/postinst $(DEB_ROOT)/DEBIAN/postinst
 	install -d $(DEB_ROOT)/usr/share/doc/$(DEB_NAME)
 	install -m 0644 packaging/deb/copyright \
 	    $(DEB_ROOT)/usr/share/doc/$(DEB_NAME)/copyright

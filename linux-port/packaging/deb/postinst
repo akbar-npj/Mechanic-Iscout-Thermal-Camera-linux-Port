@@ -1,0 +1,19 @@
+#!/bin/sh
+# Debian maintainer script for dytqt.
+#
+# The package ships a udev rule (Mechanic-iScout-Thermal-Camera.rules) so the
+# camera is accessible without root.  udev does not re-read /usr/lib/udev/rules.d
+# on its own, so the rule is applied here, after the files are in place.
+#
+# $1 is the action: "configure" on install and on upgrade, "abort-*"/"triggered"
+# in other situations.  Only "configure" has new files to pick up.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if [ -x /usr/bin/udevadm ]; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=usb || true
+    fi
+fi
+
+exit 0

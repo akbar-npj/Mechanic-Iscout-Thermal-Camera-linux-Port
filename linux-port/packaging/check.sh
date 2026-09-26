@@ -231,6 +231,72 @@ else
     skip "the RPM spec ships" "packaging/rpm/dytqt.spec absent"
 fi
 
+# --- the udev rule ---
+#
+# The rule is what lets a non-root desktop user open the camera, and it ships
+# in both packages.  Three things can rot silently: the rule's device list can
+# drift from the one the code actually probes for (tools/probe.c's known[]), so
+# a camera the app supports stays unopenable; the file can be installed but
+# never claimed by a package's file list, so rpm leaves it behind on uninstall;
+# and neither package can reload udev, so the rule only takes effect after a
+# reboot.  None of these is a build error, which is why they are checked here.
+rules=packaging/Mechanic-iScout-Thermal-Camera.rules
+if [ -f "$rules" ]; then
+    # The device list, normalised to "vid:pid" and sorted, from both sides.
+    # probe.c's known[] is the authority: it is what the app offers to open.
+    from_probe=$(sed -n \
+        's/^[[:space:]]*{[[:space:]]*0x\([0-9a-fA-F]*\),[[:space:]]*0x\([0-9a-fA-F]*\),.*/\1:\2/p' \
+        tools/probe.c | tr '[:upper:]' '[:lower:]' | sort)
+    from_rules=$(sed -n \
+        's/.*idVendor}=="\([0-9a-fA-F]*\)".*idProduct}=="\([0-9a-fA-F]*\)".*/\1:\2/p' \
+        "$rules" | tr '[:upper:]' '[:lower:]' | sort)
+    if [ -n "$from_rules" ] && [ "$from_probe" = "$from_rules" ]; then
+        n=$(printf '%s\n' "$from_rules" | wc -l | tr -d ' ')
+        ok "the udev rule lists the same $n devices the code probes for"
+    else
+        fail "the udev rule lists the same devices the code probes for"
+        printf '       probe.c: %s\n' "$(printf '%s' "$from_probe" | tr '\n' ' ')"
+        printf '       rule:    %s\n' "$(printf '%s' "$from_rules" | tr '\n' ' ')"
+    fi
+
+    # `make install` is the one staging path both packages share, so the rule
+    # has to be in it — that is what puts it in the deb and in the rpm's stage.
+    if grep -q 'RULES_NAME' Makefile && grep -q 'udev/rules\.d' Makefile \
+       && grep -q 'packaging/\$(RULES_NAME)' Makefile; then
+        ok "install ships the udev rule"
+    else
+        fail "install ships the udev rule"
+    fi
+
+    # rpm refuses to own a file it was not told about, but a file staged and
+    # *not* listed is only a build failure because Fedora's unpackaged-files
+    # check is fatal; on a laxer host it would install an unowned file.
+    if [ -f "$spec" ] \
+       && grep -q '%{_udevrulesdir}/Mechanic-iScout-Thermal-Camera\.rules' "$spec"; then
+        ok "the spec claims the udev rule in its file list"
+    else
+        fail "the spec claims the udev rule in its file list"
+    fi
+
+    # A rule that is installed but never reloaded is inert until reboot, and
+    # the packaging macro that would do it expands to nothing on Fedora, so
+    # both packages must call udevadm themselves.
+    if [ -f "$spec" ] && grep -q 'udevadm control --reload-rules' "$spec"; then
+        ok "the spec reloads udev after installing the rule"
+    else
+        fail "the spec reloads udev after installing the rule"
+    fi
+    if [ -f packaging/deb/postinst ] \
+       && grep -q 'udevadm control --reload-rules' packaging/deb/postinst \
+       && grep -q 'install -m 0755 packaging/deb/postinst' Makefile; then
+        ok "the deb reloads udev after installing the rule"
+    else
+        fail "the deb reloads udev after installing the rule"
+    fi
+else
+    skip "the udev rule ships" "$rules absent"
+fi
+
 # --- the optional Qt OpenGL module ---
 #
 # The 3D Analysis view compiles a GL renderer only when the Makefile found

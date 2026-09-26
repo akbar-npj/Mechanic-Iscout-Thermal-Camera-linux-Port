@@ -44,18 +44,15 @@ make clean
 byte-compares the frame pipeline against frozen vendor ground truth for all four sensor
 widths in both `fix_mode` configurations. It needs no camera attached.
 
-Requires `cc`, `make`, and `ar`. Three dependencies are **optional**, each detected at
-build time:
+`cc`, `make` and `ar` are all that is required. `libusb-1.0`, OpenCV, Qt6 and MNN are
+each **optional** and detected at build time — each one only adds a tool or a feature,
+and the engine and its tests build without any of them.
 
-| | with it | without it |
-|---|---|---|
-| `libusb-1.0` | the live-capture tools `capture_demo` and `probe`, and the vendored libuvc they build on | the byte-verified pipeline and its unit tests still build and `make check` still passes; only the live-capture tools are omitted |
-| OpenCV | the live viewer `dytview` and the mp4 recorder `dytrec` | both tools are omitted |
-| MNN | the Phase 8 super-resolution upscale; set `MNN_ROOT` to an install (recipe in `linux-port/third_party/README.md`) | `dyt_mnn_zoom2()` reports unavailable and refuses rather than inventing a frame |
-
-The JPEG backend is the vendored stb, so it is always present; `make JPEG=libjpeg`
-selects libjpeg as an accelerator instead. No network access is needed — libuvc and stb
-are vendored and built from source.
+**See [`BUILDING.md`](BUILDING.md)** for the per-distribution package lists (Fedora and
+Debian/Ubuntu), the install targets, the udev rule that gives the app access to the
+camera, and packaging. The JPEG backend is the vendored stb, so it is always present;
+`make JPEG=libjpeg` selects libjpeg as an accelerator instead. No network access is
+needed — libuvc and stb are vendored and built from source.
 
 ## Where to start reading
 

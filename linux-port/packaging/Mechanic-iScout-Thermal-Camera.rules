@@ -1,0 +1,34 @@
+# Mechanic iScout Thermal Camera — USB access for the DYT/Mechanic-Ti family.
+#
+# Installed to /usr/lib/udev/rules.d/.  A file of the SAME NAME in
+# /etc/udev/rules.d/ shadows this one completely (that is the admin override);
+# a file with a different name there coexists and is applied in name order.
+# An upgrade replaces this file in place and never touches /etc.
+#
+# MODE="0666" is world-writable, which is what a single-user workstation wants
+# but not a shared machine.  The stricter alternative is
+#
+#     TAG+="uaccess"
+#
+# which grants access only to the logged-in seat's user.  It requires that the
+# uaccess tag is honoured by the session (systemd-logind), so it does not work
+# in a container or over a plain serial console — hence the explicit mode here.
+#
+# After editing this file, reload and re-apply it:
+#
+#     sudo udevadm control --reload-rules
+#     sudo udevadm trigger --subsystem-match=usb
+#
+# The VID:PID list must stay in step with tools/probe.c (known[]); the
+# packaging check cross-checks the two.
+#
+# DYT — full radiometric (mode 0x44c)
+SUBSYSTEM=="usb", ATTR{idVendor}=="1514", ATTR{idProduct}=="0001", MODE="0666"
+# Realtek — direct AD (mode 1000)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="5840", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="5830", MODE="0666"
+# Realtek — variant (mode 0x3eb)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="5846", MODE="0666"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="31da", MODE="0666"
+# vendor — variant (mode 0x3eb)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0581", ATTR{idProduct}=="0b00", MODE="0666"

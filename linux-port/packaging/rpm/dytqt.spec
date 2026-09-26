@@ -74,6 +74,13 @@ install -m 0644 "%{_license}" "%{buildroot}%{_datadir}/licenses/%{name}/LICENSE"
 %{_bindir}/dytqt
 %{_datadir}/applications/dytqt.desktop
 
+# The rule that lets the desktop user open the camera.  Only the file is listed:
+# the rules directory belongs to the udev package, so claiming it here would
+# make rpm refuse to remove either package on its own.  The macro expands to
+# /usr/lib/udev/rules.d on both 32- and 64-bit systems, which is where `make
+# install` puts it, so the two agree despite the lib/lib64 split elsewhere.
+%{_udevrulesdir}/Mechanic-iScout-Thermal-Camera.rules
+
 # The palettes are not decoration: the engine falls back to six built-in ramps
 # when it cannot find them, so a package missing them would silently offer 6 of
 # the 28.  dyt_vm_find_data_dir() looks under datadir/dytqt/<leaf> in each
@@ -110,8 +117,22 @@ install -m 0644 "%{_license}" "%{buildroot}%{_datadir}/licenses/%{name}/LICENSE"
 %{_libdir}/dytqt/libMNN.so
 %endif
 
+%post
+# udev does not notice a new file in the rules directory by itself, so the rule
+# installed above would stay inert until the next reboot.  Reloading is done
+# here rather than in `make install`, so a developer's own install does not
+# change running system state.
+#
+# udevadm is called directly, not through the packaging macro: that macro
+# expands to nothing on this distribution, so relying on it would silently do
+# nothing.  The guard keeps the scriptlet from failing on a system without udev.
+if [ -x /usr/bin/udevadm ]; then
+    /usr/bin/udevadm control --reload-rules || :
+    /usr/bin/udevadm trigger --subsystem-match=usb || :
+fi
+
 %changelog
 * Fri Sep 25 2026 dytqt port <noreply@example.invalid> - 0.1.0-1
 - Initial RPM: packages what `make install` stages — the binary, desktop entry,
-  icons, the 28 vendor palettes, the super-resolution model, and (when built
-  with MNN) the private libMNN.so under the libdir.
+  the udev rule, icons, the 28 vendor palettes, the super-resolution model, and
+  (when built with MNN) the private libMNN.so under the libdir.
