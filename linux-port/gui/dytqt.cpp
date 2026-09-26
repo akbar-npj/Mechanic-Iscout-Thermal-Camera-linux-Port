@@ -1993,22 +1993,9 @@ public:
         return kPad + (int)std::lround((1.0 - u) * (h - 1));
     }
 
-    /* The temperature a widget-space y on the bar means — the inverse of the
-     * above, and what a dragged handle's new position reads back as. */
-    float bar_temp_at_widget(int wy) const
-    {
-        float bl = 0.f, bhi = 0.f;
-        bar_scale(&bl, &bhi);
-        const double  s   = display_scale();
-        const QPointF org = display_origin();
-        const int     h   = img_.height() > 1 ? img_.height() - 1 : 1;
-        const double  cy  = (wy - org.y()) / s - kPad;   /* canvas y */
-        return dyt_vm_bar_temp((float)(1.0 - cy / h), bl, bhi);
-    }
-
     /* The degrees one canvas row of the bar is worth — the scale's span over
-     * its height.  The handles are fixed, so a drag is *relative*: this is
-     * what turns the pointer's travel into a change of value. */
+     * its height.  The handles are fixed, so a drag is *relative*:
+     * `bar_drag_apply` turns the pointer's travel into rows of this. */
     float bar_deg_per_row() const
     {
         float bl = 0.f, bhi = 0.f;
@@ -2056,13 +2043,23 @@ public:
     {
         if (img_.isNull() || snap_.width <= 0)
             return -1;
-        const QRect r = bar_hit_rect_widget();
-        if (!r.contains(wp))
+        /* Canvas coordinates — the space the handles are *drawn* in.  The strip
+         * depth is a canvas distance, so the grab band stays over the drawn
+         * triangle however far the display layer has magnified it.  A fixed
+         * widget-pixel strip is correct only at scale 1: past about 2.2x it
+         * stops covering the handle's own centre, the press falls through to
+         * the picture, and the handle cannot be dragged at all — which is
+         * exactly what happens on a large screen. */
+        const double  s   = display_scale();
+        const QPointF org = display_origin();
+        const QPointF cp((wp.x() - org.x()) / s, (wp.y() - org.y()) / s);
+        const QRect   r   = bar_rect();
+        if (!r.contains(cp.toPoint()))
             return -1;
         const int strip = std::min(kHandleHit, r.height() / 3);
-        if (wp.y() - r.top() < strip)
+        if (cp.y() - r.top() < strip)
             return 0;
-        if (r.bottom() - wp.y() < strip)
+        if (r.bottom() - cp.y() < strip)
             return 1;
         return -1;
     }
@@ -2075,8 +2072,14 @@ public:
      * The other end is not touched, so the two operate individually. */
     void bar_drag_apply(const QPoint &wp)
     {
-        const float gap = 0.25f;
-        const float d   = (float)(bar_drag_y0_ - wp.y()) * bar_drag_deg_;
+        const float  gap = 0.25f;
+        /* The pointer's travel is in widget pixels and `bar_drag_deg_` is
+         * degrees per *canvas* row, so convert through the display scale: the
+         * handle is magnified with the picture, and without this the window
+         * moves by the scale factor (2.7x on a large screen) for the same
+         * gesture. */
+        const float  d   = (float)(bar_drag_y0_ - wp.y())
+                           / (float)display_scale() * bar_drag_deg_;
         float bl = 0.f, bhi = 0.f;
         bar_scale(&bl, &bhi);
         float lo = snap_.lo, hi = snap_.hi;
@@ -10967,7 +10970,7 @@ static int selftest(const opts &o)
          * for one is about the handle and not about the picture. */
         {
             bool geom_ok = false, paint_ok = false, drag_ok = false,
-                 indiv_ok = false, auto_ok = false;
+                 indiv_ok = false, auto_ok = false, scaled_ok = false;
             float seen_lo = 0.f, seen_hi = 0.f;
 
             if (view && fv) {
@@ -11088,6 +11091,37 @@ static int selftest(const opts &o)
                 dyt_session_snapshot(sess, &s3, nullptr, 0);
                 auto_ok = s3.range_mode == DYT_RANGE_AUTO;
 
+                /* The same handles with the canvas magnified to fill a bigger
+                 * window — the state the real app is always in, since the
+                 * sensor's canvas is far smaller than the screen.  The handles
+                 * are drawn in *canvas* coordinates and magnified with the
+                 * picture, so both the grab band and the value change have to
+                 * go through the display scale: a fixed widget-pixel strip
+                 * stops covering the drawn triangle (the press falls through
+                 * to the picture and nothing moves), and an unscaled
+                 * degrees-per-row moves the window by the scale factor.  At
+                 * scale 1 — where the assertions above run — the two are
+                 * indistinguishable, which is why this half exists. */
+                pm.step();               /* let the view see the AUTO window */
+                const QSize win_before = win.size();
+                /* Wide enough that the display scale passes the point where a
+                 * fixed 14-px strip stops covering the drawn handle — the real
+                 * app on a large screen is well past it. */
+                win.resize(win_before + QSize(700, 460));
+                QApplication::processEvents();
+                const double ss   = fv->display_scale();
+                const float  deg2 = fv->bar_deg_per_row();
+                dyt_snapshot_t t0{};
+                dyt_session_snapshot(sess, &t0, nullptr, 0);
+                drag(hu, dy);
+                dyt_snapshot_t t1{};
+                dyt_session_snapshot(sess, &t1, nullptr, 0);
+                const float want_scaled = t0.hi - (float)dy / (float)ss * deg2;
+                scaled_ok = ss > 1.2 && t1.range_mode == DYT_RANGE_FIXED &&
+                            std::fabs(t1.hi - want_scaled) < 0.02f;
+                win.resize(win_before);
+                QApplication::processEvents();
+
                 fv->on_bar_range_ = nullptr;
                 fv->on_bar_auto_  = nullptr;
                 dyt_session_reset_view(sess);
@@ -11095,14 +11129,16 @@ static int selftest(const opts &o)
             }
 
             const bool ok = geom_ok && paint_ok && drag_ok && indiv_ok &&
-                            auto_ok;
+                            auto_ok && scaled_ok;
             std::printf("  %-4s the colour bar's two fixed handles sit at the "
                         "top-right and bottom-left and each drags only its own "
                         "end, with a double-click back to auto (geometry %s, "
-                        "painted %s, drag %s, individual %s, auto %s)\n",
+                        "painted %s, drag %s, individual %s, auto %s, "
+                        "scaled %s)\n",
                         ok ? "ok" : "FAIL", geom_ok ? "yes" : "NO",
                         paint_ok ? "yes" : "NO", drag_ok ? "yes" : "NO",
-                        indiv_ok ? "yes" : "NO", auto_ok ? "yes" : "NO");
+                        indiv_ok ? "yes" : "NO", auto_ok ? "yes" : "NO",
+                        scaled_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }

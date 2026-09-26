@@ -910,16 +910,23 @@ down one, however narrow the window has been dragged — that is what makes them
 operable *individually*, which the old nearest-row rule could not do once the two
 ends came close. They are drawn *inside* the bar because the margin above the
 picture is only `kPad` and a triangle outside it would be clipped; a dark
-outline keeps each readable over any palette entry.
+outline keeps each readable over any palette entry. The strip depth is a **canvas**
+distance, not a widget one: the handles are magnified with the picture, so a
+fixed widget-pixel strip would stop covering the drawn triangle on a large screen
+— past about 2.2× its centre falls outside the strip, the press falls through to
+the picture, and the handle cannot be dragged at all. `bar_handle_at()` converts
+the pointer into canvas coordinates for exactly that reason.
 
 A fixed handle cannot follow the pointer's row, so the drag is **relative** —
 the vendor's own model, where `panel_lut_max_but_MouseMove` keeps `lut_num = e.Y`
 and works from `e.Y - lut_num`. The press records the pointer's y, that end's
-value and the scale's degrees per row; the move adds `(y0 - y) * deg` to the
-recorded value. Pointer *up* is warmer, so dragging the up handle down lowers the
-max and dragging the down handle up raises the min — each end moves alone, and
-the other is passed through untouched. The two may not cross: a quarter of a
-degree of daylight is kept between them.
+value and the scale's degrees per row; the move adds `(y0 - y) / scale * deg` to
+the recorded value — the pointer's travel is in widget pixels and `deg` is per
+*canvas* row, so it goes through the display scale or the window moves by that
+factor for the same gesture. Pointer *up* is warmer, so dragging the up handle
+down lowers the max and dragging the down handle up raises the min — each end
+moves alone, and the other is passed through untouched. The two may not cross: a
+quarter of a degree of daylight is kept between them.
 
 Because the handles no longer travel with the value, the window's position is
 shown by two 1 px **boundary lines** across the bar in the hot/cold colours, and
@@ -1448,7 +1455,7 @@ $ ./build/dytqt --selftest
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
   ok   the alarm's threshold field clamps to -20..450 and the session arms at what it holds (clamp yes, pushed yes, follows an armed edit yes)
-  ok   the colour bar's two fixed handles sit at the top-right and bottom-left and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, individual yes, auto yes)
+  ok   the colour bar's two fixed handles sit at the top-right and bottom-left and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, individual yes, auto yes, scaled yes)
   ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
@@ -1642,7 +1649,16 @@ session to hold the window the drag produced *with the other end untouched* (the
 individual operation the fixed corners exist for), then double-clicks back to
 auto. The tolerance is tight and the direction is asserted outright, because the
 fixture's whole span is only about a degree: a reversed delta would otherwise
-stay inside a loose bound. **65** is Rapid Diagnostics, and its second half is
+stay inside a loose bound. Its last half repeats the up-handle drag with the
+canvas magnified, which is the state the real app is always in — the sensor's
+canvas is far smaller than the screen — and pins that both the grab band and the
+value change go through the display scale. They have to: the handles are drawn in
+canvas coordinates and magnified with the picture, so a fixed widget-pixel strip
+stops covering the drawn triangle past about 2.2× (the press falls through to the
+picture and nothing moves, which is what a large screen hit), and an unscaled
+degrees-per-row moves the window by the scale factor. At scale 1 — where the
+rest of the assertion runs — the two are indistinguishable, so without this half
+the bug is invisible to the suite. **65** is Rapid Diagnostics, and its second half is
 the one that
 bites: pressing it twice must change nothing, because the second press reads the
 *frame's* extremes and not the window the first one latched — at AUTO those are
