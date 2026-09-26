@@ -61,7 +61,7 @@ against the session.
 `ControlPanel` is the Windows counterpart's right column: a `QTabWidget` whose
 **Troubleshoot** tab holds seven checkable `QGroupBox`es — Circuit Mode
 (Short-circuit / Large Current Leakage / Small Current Leakage), Temperature
-Measurement (Spot / Line / Rectangle / Polygon / None), Mark (Text), Analysis
+Measurement (Spot / Line / Rectangle / Polygon / None), Mark (Text / Arrow), Analysis
 (Line / Chart analysis), High Temperature (Tracking / Alarm / Highlight), Image
 Enhancement (the two flips, Fixed range and Rapid Diagnostics) and Capture (Still
 / Record / Gallery). All but Capture and Mark are the reference's own groups, in
@@ -92,12 +92,15 @@ reads the frame again, not the window the first one latched.
 
 **Mark** is the reference's annotation tool — `DRAW_CODE.Label` and
 `DRAW_CODE.Arrow` (`CAAnalyzer.decompiled.cs:7159`) — and only the annotation
-half of it lives here: the label, with the arrow to follow. A Mark is not a
-measurement, so there is no engine call behind it and no `DYT_TOOL_*` for it; the
-list of labels is the front end's, held on `FrameView` in **source pixels** for
-the same reason the measurement overlay is, so a zoom, a flip or a rotation
-carries a label with the pixel it names. `T` arms the Text tool, a click in the
-picture asks for the string through `on_mark_text_` (a `QInputDialog` in the
+half of it lives here: the label and the arrow, the two items the reference's
+own right-click menu offers (`contextMenuStrip_comment`, `:25667`, which adds
+exactly `toolStripMenuItem_label` and `toolStripMenuItem_arrow` — not the six
+the plan paraphrased). A Mark is not a measurement, so there is no engine call
+behind it and no `DYT_TOOL_*` for it; the list of labels and arrows is the front
+end's, held on `FrameView` in **source pixels** for the same reason the
+measurement overlay is, so a zoom, a flip or a rotation carries a mark with the
+pixel it names. `T` arms the Text tool, `w` arms the Arrow tool, and a click in
+the picture asks for the string through `on_mark_text_` (a `QInputDialog` in the
 window, a stub under `--selftest`, exactly as `on_about_` is), and the label
 lands on the pixel the click names — `widget_to_source()` is `pointer()`'s own
 inverse, factored out so a label and a point placed by the same click cannot
@@ -109,15 +112,37 @@ a label on the last row is pulled back rather than drawn half off the canvas —
 the vendor fills a rectangle behind its own label for the same reason
 (`M_DarwString`, `:14002`).
 
+The Arrow is a press-drag-release, the vendor's own `panel_but_label` route:
+press sets `start_point` (`:10285`), move sets `end_point` (`:10554`), and
+release calls `AddArrow` (`:11132`) — guarded by `end_point != (0,0)`, which a
+press with no drag never satisfies, so a degenerate arrow cannot be committed.
+`AddArrow` stores both ends through `rawToBit` (source pixels) with
+`arrow_color = Color.White`, and `DrawUArrowF` (`:18386`) is the geometry: head
+length `num = (penWidth-1)*5 + 10` = 10 for a 1px pen, half-width 5, notch
+`num/3.5`, guard `Math.Sqrt(…) > 5.0`; the six-point polygon `{start, pointF3,
+pointF, end, pointF2, pointF4}` is filled and a 1px centre line is drawn over
+it. The port follows that geometry verbatim — a dark 3px under-stroke, a yellow
+fill, a yellow 1px centre line — and draws the live rubber band before the
+release commits, so the drag is visible while it happens. The head is only
+meaningful on a segment longer than itself; below the guard the port draws a
+bare stub shaft, as the vendor's `DrawUArrowF` does.
+
 A Mark is a *tool*, so it shares one exclusive button group with the measurement
 rows: arming one clears the session's tool and picking a measurement tool clears
 the Mark, mirroring the vendor's single `cursor_code`. That is why the Mark rows
 are a separate group *box* but not a separate button group — two groups would
 have needed the `None` row unchecked while the Mark row was checked, and Qt
-refuses to uncheck the checked button of an exclusive group. Assertion 68 pins
-the whole path: the row, the key, the placement pixel, the painted chip (by
-difference against the same canvas with no mark), the disarm, the off-image
-refusal, the cancelled prompt and the one-tool rule in both directions.
+refuses to uncheck the checked button of an exclusive group. The rail's Mark
+button has its own right-click menu (`mark_menu()`, two items: Text and Arrow),
+the reference's `contextMenuStrip_comment` route — a left-click on the rail
+button re-arms the last active tool, a right-click offers the two kinds.
+Assertion 68 pins the Text path: the row, the key, the placement pixel, the
+painted chip (by difference against the same canvas with no mark), the disarm,
+the off-image refusal, the cancelled prompt and the one-tool rule in both
+directions. Assertion 69 pins the Arrow path: the row and the key, the drag's
+stored endpoints, the live rubber band, the head painted (before/mid/after, by
+pixel difference), the no-drag refusal, and the rail menu's policy, popup, two
+items and key routing.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -365,7 +390,10 @@ that open a dialog or a popup, and the one whose engine has not landed.
 The **top group** acts on the picture. **Palette** opens its picker; **Mark**
 re-arms the tool the user last had — `sync_actions()` remembers the last
 *active* tool, so `n` clearing the tool does not erase it, and Mark brings it
-back rather than always choosing Spot; **Rotate** turns the picture a quarter
+back rather than always choosing Spot; a *right-click* on the Mark button opens
+the two-item popup (Text / Arrow, the reference's `contextMenuStrip_comment`),
+so the rail's Mark button is the one place the two kinds come from without the
+keyboard; **Rotate** turns the picture a quarter
 clockwise per click; **Reset** calls `dyt_session_reset_view`, one session
 operation rather than five GUI setters, so a caller cannot forget one of the five
 things a reset undoes (zoom to the floor, both mirrors off, the rotation back to
@@ -797,7 +825,7 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 |---|---|
 | `p` / `l` / `b` / `o` | point / line / box / polygon |
 | `n` | no tool, and forget the placed points and the polygon outline |
-| `T` | Mark: arm the text tool (a second press puts it away) |
+| `T` / `w` | Mark: arm the text tool / the arrow tool (a second press puts it away) |
 | Enter / right button | finish the polygon outline |
 | Backspace | take back the last polygon vertex |
 | `c` | chart analysis: annotate the line's profile (picks up the line tool) |
@@ -1301,8 +1329,8 @@ $ ./build/dytqt --selftest
   ok   the frame is 256x192 (got 256x192)
   ok   the frame converted to real temperatures (min 31.41 C, max 32.41 C)
   ok   the status line is populated ("mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames")
-  ok   the canvas painted (1172x942, 64 distinct colours)
-  ok   the canvas is not clipped (660x886, wants 660x400)
+  ok   the canvas painted (1172x969, 64 distinct colours)
+  ok   the canvas is not clipped (660x913, wants 660x400)
   ok   the strip has three populated lines
         line 1: mode 1000 | fusion ir | 01-iron-red.dat 1/28 | C | x2- | 25 frames
         line 2: tool: none (p point, l line, b box, o polygon, n clear)
@@ -1351,7 +1379,7 @@ $ ./build/dytqt --selftest
   ok   the About text names the app and its version (0.1.0), the SR keys, the model state and the shared key list (about yes, guide yes)
   ok   the super-resolution keys route, keep their case and post a notice ('z'->visible, 'Z'->thermal, "sr:thermal x2")
   ok   a 2x render maps a click back to the native pixel (both corners)
-  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x942 yes)
+  ok   F11 is full screen, and leaving it re-fits the window (entered yes, left yes, back to 1172x969 yes)
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
@@ -1360,14 +1388,15 @@ $ ./build/dytqt --selftest
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
   ok   the Mark Text tool places a label at the clicked pixel and paints it there (row yes, key yes, place yes, painted yes, disarms yes, off-image yes, cancel yes, one tool yes)
-  ok   the control panel cannot take the keyboard (31 control(s), 0 that would)
+  ok   the Mark Arrow tool drags an arrow between the pixels and the rail's Mark menu offers both kinds (row yes, key yes, drag yes, live yes, head yes, no-drag yes, menu yes, menu keys yes)
+  ok   the control panel cannot take the keyboard (32 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
   ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
   ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
-  ok   the control panel asks for its content's height (panel 942 of 942, page 916 of 916, shrinks yes, keeps yes, scrolls yes)
+  ok   the control panel asks for its content's height (panel 969 of 969, page 943 of 943, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
   ok   the 3D Analysis tab builds a mesh from the frame, colours it from the palette and orbits (tab yes, mesh yes 96x96, height yes, colour yes, camera yes, drag yes, wheel yes, backend yes (GL), paint yes)
@@ -1548,7 +1577,7 @@ worth naming one by one:
   somewhere else while looking entirely plausible.
 
 The last stretch of the parity work — the Windows panel's remaining controls —
-added five more. **64** is the colour bar's two range handles: it reads their
+added six more. **64** is the colour bar's two range handles: it reads their
 geometry off the widget, finds the hot handle's pixel in a render, drags one and
 requires the session to hold the window the drag produced, then double-clicks
 back to auto. **65** is Rapid Diagnostics, and its second half is the one that
@@ -1567,7 +1596,18 @@ chip is painted at that pixel's projection — asserted by *difference* against 
 same canvas with no mark, so an overlay that was already there cannot satisfy it
 — that the tool disarms after a placement, that a click off the picture places
 nothing, that a cancelled prompt leaves the tool armed, and that the Mark and the
-measurement tools clear each other in both directions. The alarm's threshold
+measurement tools clear each other in both directions. **69** is the Mark Arrow
+tool: the row and the key, that `w` arms the Arrow tool and clears the session's
+tool (the one-tool rule again), that a drag's stored endpoints are the source
+pixels the press and release name (asserted through the same mapping the
+placement uses), that the rubber band is live while the drag is in flight and
+nothing is stored until the release commits it, that the head is painted at the
+head's own projection — asserted by pixel difference before, during and after
+the drag, so a head that was never drawn cannot satisfy it — that a press with
+no drag places nothing and leaves the tool armed (the vendor's own
+`end_point != (0,0)` guard), and that the rail's right-click menu has the
+right policy, opens on a sent context event, offers exactly the two items
+(Text / Arrow) and routes each through the same key its row does. The alarm's threshold
 field is pinned where it is defined rather than through the window: `a` must arm
 at the field's value (assertion 25), the field's clamp and the vendor's rounding
 are `view_model_test`'s, the height ranges are `surface_test`'s, and the fixed

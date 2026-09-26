@@ -38,6 +38,7 @@
 #include <QCloseEvent>
 #include <QColor>
 #include <QComboBox>
+#include <QContextMenuEvent>
 #include <QDialog>
 #include <QDoubleSpinBox>
 #include <QEventLoop>
@@ -139,7 +140,7 @@ static const int kDotGap  = 6;   /* dot -> line 3's text */
  * the device, so the whole feature lives in the front end.  A front-end enum
  * rather than a DYT_TOOL_*: the engine has no notion of a label, and adding
  * one it can never act on would be a lie in the session's state. */
-enum MarkKind { MarkNone = 0, MarkText, MarkArrow };
+enum MarkKind { MarkKindNone = 0, MarkKindText, MarkKindArrow };
 
 /* How far a Mark's chip is kept inside the picture.  A label placed on the
  * last row or column would otherwise have its plate drawn half off the canvas
@@ -1415,7 +1416,7 @@ public:
          * away, exactly as the vendor's single `cursor_code` does.  The alarm
          * and isotherm keys are not tools, so they leave it alone. */
         if (k != 'a' && k != 'i')
-            mark_mode_ = MarkNone;
+            mark_mode_ = MarkKindNone;
         resnap();
         return 1;
     }
@@ -1530,36 +1531,83 @@ public:
     void set_mark_mode(int m)
     {
         mark_mode_ = m;
-        if (m != MarkNone && sess_) {
+        if (m != MarkKindNone && sess_) {
             dyt_session_set_tool(sess_, DYT_TOOL_NONE);
             resnap();
         }
+        /* A drag belongs to the tool that started it, so switching tools cannot
+         * leave a rubber band on the canvas. */
+        arrow_drag_ = false;
         update();
     }
     int mark_mode() const { return mark_mode_; }
 
+    /* An arrow: the two source pixels it runs between.  The vendor stores the
+     * same pair in bit coordinates — `AddArrow` converts both ends through
+     * `rawToBit` (:14017) — so a zoom, a flip or a rotation carries it the way
+     * a label is carried, and the two kinds of mark share one coordinate rule.
+     */
+    struct MarkArrow {
+        float x0 = 0.0f, y0 = 0.0f;   /* the tail, in source pixels */
+        float x1 = 0.0f, y1 = 0.0f;   /* the head */
+    };
+
+    /* A source coordinate pulled into the frame.  Both kinds of mark clamp on
+     * the way in, so nothing can be stored where project() would refuse to
+     * draw it. */
+    static float clamp_src(double v, int n)
+    {
+        return (float)std::max(0.0, std::min((double)n - 1, v));
+    }
+
     /* Place a label at a source pixel.  Empty text is refused rather than
      * stored: a chip with nothing in it is a mark the user cannot read or
-     * find again.  The pixel is clamped into the frame so a label can never
-     * be stored somewhere project() would refuse to draw it. */
+     * find again. */
     bool add_mark(const QPointF &src, const QString &text)
     {
         if (text.isEmpty() || snap_.width <= 0 || snap_.height <= 0)
             return false;
         MarkLabel m;
-        m.x = (float)std::max(0.0, std::min((double)snap_.width - 1,
-                                            (double)src.x()));
-        m.y = (float)std::max(0.0, std::min((double)snap_.height - 1,
-                                            (double)src.y()));
+        m.x = clamp_src(src.x(), snap_.width);
+        m.y = clamp_src(src.y(), snap_.height);
         m.text = text;
         marks_.push_back(m);
         update();
         return true;
     }
 
-    void clear_marks() { marks_.clear(); update(); }
+    /* Place an arrow between two source pixels.  A zero-length one is refused
+     * for the same reason empty text is: a mark that draws nothing is one the
+     * user cannot find again. */
+    bool add_arrow(const QPointF &a, const QPointF &b)
+    {
+        if (snap_.width <= 0 || snap_.height <= 0)
+            return false;
+        MarkArrow m;
+        m.x0 = clamp_src(a.x(), snap_.width);
+        m.y0 = clamp_src(a.y(), snap_.height);
+        m.x1 = clamp_src(b.x(), snap_.width);
+        m.y1 = clamp_src(b.y(), snap_.height);
+        if (m.x0 == m.x1 && m.y0 == m.y1)
+            return false;
+        arrows_.push_back(m);
+        update();
+        return true;
+    }
+
+    void clear_marks()
+    {
+        marks_.clear();
+        arrows_.clear();
+        update();
+    }
     size_t mark_count() const { return marks_.size(); }
     const MarkLabel &mark_at(size_t i) const { return marks_[i]; }
+    size_t arrow_count() const { return arrows_.size(); }
+    const MarkArrow &arrow_at(size_t i) const { return arrows_[i]; }
+    /* Whether an arrow drag is in progress — the rubber band the canvas draws
+     * before the release commits it. */
+    bool arrow_dragging() const { return arrow_drag_; }
 
     /* Asked for a label's text at a source pixel.  A callback rather than the
      * dialog inline, so --selftest can place a label without a modal window —
@@ -2050,15 +2098,33 @@ protected:
          * disarms the tool (one label per click, as the vendor's
          * `cursor_code = None` does); a cancelled one leaves it armed so the
          * next click can try again. */
-        if (mark_mode_ == MarkText) {
+        if (mark_mode_ == MarkKindText) {
             QPointF src;
             if (!widget_to_source(e->position(), &src)) {
-                set_mark_mode(MarkNone);
+                set_mark_mode(MarkKindNone);
             } else {
                 const QString t = on_mark_text_ ? on_mark_text_(src)
                                                 : QString();
                 if (add_mark(src, t))
-                    set_mark_mode(MarkNone);
+                    set_mark_mode(MarkKindNone);
+            }
+            e->accept();
+            return;
+        }
+        /* The Arrow is a press-drag-release, as the vendor's is: the press
+         * sets `start_point` (:10285), the move `end_point` (:10554) and the
+         * release commits it (:11132).  The drag starts on the pixel the press
+         * names and is drawn as it goes, so the shape on screen is the shape
+         * the release stores. */
+        if (mark_mode_ == MarkKindArrow) {
+            QPointF src;
+            if (!widget_to_source(e->position(), &src)) {
+                set_mark_mode(MarkKindNone);
+            } else {
+                arrow_drag_ = true;
+                arrow_a_    = src;
+                arrow_b_    = src;
+                update();
             }
             e->accept();
             return;
@@ -2074,6 +2140,18 @@ protected:
             e->accept();
             return;
         }
+        /* A drag in progress: the head follows the pointer.  A pointer that
+         * leaves the picture leaves the head where it last was inside it,
+         * rather than storing a pixel project() could not draw. */
+        if (arrow_drag_) {
+            QPointF src;
+            if (widget_to_source(e->position(), &src)) {
+                arrow_b_ = src;
+                update();
+            }
+            e->accept();
+            return;
+        }
         pointer(DYT_VM_MOUSE_MOVE, e->position());
         e->accept();
     }
@@ -2086,6 +2164,18 @@ protected:
         }
         if (bar_drag_ >= 0) {
             bar_drag_ = -1;
+            e->accept();
+            return;
+        }
+        /* The arrow's release.  A drag that moved places the arrow and puts the
+         * tool away (one mark per gesture, as the Text tool does); a press with
+         * no drag places nothing and leaves the tool armed, which is what the
+         * vendor's own "end point still (0,0)" test amounts to. */
+        if (arrow_drag_) {
+            arrow_drag_ = false;
+            if (add_arrow(arrow_a_, arrow_b_))
+                set_mark_mode(MarkKindNone);
+            update();
             e->accept();
             return;
         }
@@ -2392,19 +2482,37 @@ protected:
             }
         }
 
-        /* The Mark labels.  Over the measurement shapes — a label is the
-         * user's own note, and hiding it behind a box it happens to sit in
-         * would be the wrong way round — and under the two panels.  Each is
-         * projected with the same lambda the measurements use, so a label and
-         * a marker placed on the same pixel cannot land apart, and the chip is
-         * clamped into the picture so a label at the edge stays readable. */
-        if (!marks_.empty()) {
+        /* The Mark labels, then the arrows — the arrows last, so a head is
+         * never hidden behind a plate.  Both are the user's own notes, so they
+         * sit over the measurement shapes and under the two panels; each is
+         * projected with the same lambda the measurements use, so a mark and a
+         * marker placed on the same pixel cannot land apart.  An arrow still
+         * being dragged is drawn with them, so the gesture shows the shape the
+         * release will store. */
+        if (!marks_.empty() || !arrows_.empty() || arrow_drag_) {
             const QRect bounds(x0, y0, dw, dh);
             for (const MarkLabel &m : marks_) {
                 QPoint q;
                 if (!proj((int)std::lround(m.x), (int)std::lround(m.y), q))
                     continue;
                 draw_mark_chip(p, q, m.text, bounds);
+            }
+            auto arrow = [&](const MarkArrow &m) {
+                QPoint a, b;
+                if (!proj((int)std::lround(m.x0), (int)std::lround(m.y0), a) ||
+                    !proj((int)std::lround(m.x1), (int)std::lround(m.y1), b))
+                    return;
+                draw_mark_arrow(p, a, b);
+            };
+            for (const MarkArrow &m : arrows_)
+                arrow(m);
+            if (arrow_drag_) {
+                MarkArrow live;
+                live.x0 = arrow_a_.x();
+                live.y0 = arrow_a_.y();
+                live.x1 = arrow_b_.x();
+                live.y1 = arrow_b_.y();
+                arrow(live);
             }
         }
 
@@ -2532,6 +2640,60 @@ private:
         p.drawEllipse(anchor, 2, 2);
 
         p.restore();
+    }
+
+    /* One Mark arrow, drawn the way the vendor's `DrawUArrowF` draws it
+     * (:18386): a filled head with a notched tail, its shaft running back to
+     * the tail pixel.  The head's length (10), half-width (5) and notch
+     * (length / 3.5) are the vendor's own constants, and so is the refusal to
+     * draw a head on a segment shorter than 5 px.  A dark under-stroke is
+     * added, as every other tool here has, so the shape reads on a bright
+     * picture — the vendor draws white on white and relies on its own
+     * background instead. */
+    void draw_mark_arrow(QPainter &p, const QPoint &a, const QPoint &b)
+    {
+        const double dx = (double)b.x() - a.x();
+        const double dy = (double)b.y() - a.y();
+        const double len = std::sqrt(dx * dx + dy * dy);
+
+        /* The head is only meaningful on a segment longer than itself; below
+         * that the vendor draws nothing at all, and a bare shaft is a better
+         * answer than a head that swallows its own tail. */
+        if (len <= 5.0) {
+            p.setPen(QPen(QColor(0, 0, 0), 3));
+            p.drawLine(a, b);
+            p.setPen(QPen(QColor(255, 255, 0), 1));
+            p.drawLine(a, b);
+            return;
+        }
+
+        const double ux = dx / len, uy = dy / len;   /* along the shaft */
+        const double nx = -uy, ny = ux;              /* across it */
+
+        const double head = 10.0, half = 5.0, notch = head / 3.5;
+        const QPointF b1(b.x() - head * ux + half * nx,
+                         b.y() - head * uy + half * ny);
+        const QPointF b2(b.x() - head * ux - half * nx,
+                         b.y() - head * uy - half * ny);
+        /* The two notch points, pulled back towards the axis: they are what
+         * makes the tail concave rather than a plain triangle. */
+        const QPointF c1(b1.x() - notch * nx, b1.y() - notch * ny);
+        const QPointF c2(b2.x() + notch * nx, b2.y() + notch * ny);
+
+        QPolygonF poly;
+        poly << QPointF(a) << c1 << b1 << QPointF(b) << b2 << c2;
+
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(0, 0, 0), 3, Qt::SolidLine, Qt::RoundCap,
+                      Qt::RoundJoin));
+        p.drawPolygon(poly);
+        p.drawLine(a, b);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(255, 255, 0));
+        p.drawPolygon(poly);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(255, 255, 0), 1));
+        p.drawLine(a, b);
     }
 
     /* The device panel: the module serial, the decoded user serial, the four
@@ -2683,9 +2845,14 @@ private:
     bool                      layout_shown_ = false;
 
     /* The Mark annotations and the tool that places them (see set_mark_mode).
-     * `mark_mode_` is a MarkKind; the list is in source pixels. */
+     * `mark_mode_` is a MarkKind; both lists are in source pixels.  The arrow
+     * drag's two ends are the in-progress one — the committed arrows live in
+     * `arrows_`. */
     std::vector<MarkLabel>    marks_;
-    int                       mark_mode_ = MarkNone;
+    std::vector<MarkArrow>    arrows_;
+    int                       mark_mode_ = MarkKindNone;
+    bool                      arrow_drag_ = false;
+    QPointF                   arrow_a_, arrow_b_;
 };
 
 /* --------------------------------------------------------------- the strip */
@@ -3123,6 +3290,13 @@ public:
      * needing MainWindow's complete definition here. */
     std::function<void(RailItem)> on_action;
 
+    /* A right-click on `item`, with the global position a menu should open at.
+     * Only Mark has one today: the vendor's own Mark button carries a
+     * two-item menu (`panel_but_label.ContextMenuStrip`,
+     * CAAnalyzer.decompiled.cs:25660).  The rest report nothing, so a
+     * right-click on them is inert rather than a second, undocumented route. */
+    std::function<void(RailItem, const QPoint &)> on_context;
+
     /* A button the front end can re-parent into a popup (Palette) or drive
      * the same way a QAction would.  Returns nullptr for an out-of-range item. */
     QPushButton *button(RailItem i) const
@@ -3266,6 +3440,12 @@ private:
         b->setFocusPolicy(Qt::NoFocus);   /* see the class comment */
         b->setCheckable(true);
         b->setText(QString::fromUtf8(kLabels[i]));
+        /* The one button with two gestures needs to say so: its left-click is
+         * the way back to the last tool, and the two Mark kinds are on its
+         * right-click menu. */
+        if (i == Mark)
+            b->setToolTip(QStringLiteral("Mark — left-click: back to the last "
+                                         "tool; right-click: Text / Arrow"));
         b->setIconSize(QSize(24, 24));
         b->setMinimumHeight(48);
         /* Paint the icon into a pixmap once — the glyph never changes. */
@@ -3290,6 +3470,16 @@ private:
             if (on_action)
                 on_action((RailItem)i);
         });
+        /* The right-click, for the one item that has a menu (see on_context).
+         * Qt's own context-menu event carries the widget-local position, so it
+         * is mapped here rather than in MainWindow, which does not know which
+         * button was clicked. */
+        b->setContextMenuPolicy(Qt::CustomContextMenu);
+        b->connect(b, &QWidget::customContextMenuRequested,
+                   [this, i, b](const QPoint &p) {
+                       if (on_context)
+                           on_context((RailItem)i, b->mapToGlobal(p));
+                   });
         btn_[i] = b;
         return b;
     }
@@ -4083,7 +4273,7 @@ public:
         RapidDiag,
         LeakShort, LeakLarge, LeakSmall,
         SurfShape, SurfColor,
-        MarkTextRow,
+        MarkTextRow, MarkArrowRow,
         Still, Record, Gallery,
         SrOff, SrVisible, SrThermal,
         N_Ids
@@ -4125,7 +4315,7 @@ public:
          * on the fixture path. */
         sync_leak_marks();
         sync_surface_marks();
-        sync_mark_marks(MarkNone);
+        sync_mark_marks(MarkKindNone);
     }
 
     /* A click on the control whose key is `key`.  Set by MainWindow, which owns
@@ -4309,7 +4499,8 @@ public:
     void sync_mark_marks(int mode)
     {
         mark_mode_ = mode;
-        set_checked(btn_[MarkTextRow], mode == MarkText);
+        set_checked(btn_[MarkTextRow],  mode == MarkKindText);
+        set_checked(btn_[MarkArrowRow], mode == MarkKindArrow);
     }
 
     /* The 3D page's height mode.  Held by the SurfaceView (it is an input to
@@ -4341,7 +4532,7 @@ public:
          * exclusive group, and the Mark row was set above, so this only has to
          * decline to light Tool None. */
         set_checked(btn_[ToolNone],  snap.tool == DYT_TOOL_NONE &&
-                                     mark_mode_ == MarkNone);
+                                     mark_mode_ == MarkKindNone);
         /* The Analysis pair tracks the chart's mode, not the tool: "Chart
          * analysis" leaves the line tool selected, so a tool-derived checkmark
          * would light the wrong row. */
@@ -4538,14 +4729,18 @@ private:
          * the shape and point editors (:7159).  Its own *group box*, because
          * nothing about a label is measured or written to the device, but the
          * same exclusive button group as the tools above: the vendor has a
-         * single `cursor_code`, so exactly one of the six rows is lit and
+         * single `cursor_code`, so exactly one of the seven rows is lit and
          * arming a Mark clears the measurement tool (see set_mark_mode).  Two
          * groups would have needed the Tool None row *unchecked* while the Mark
          * row was checked, and Qt refuses to uncheck the checked button of an
-         * exclusive group — which is why this is one group and not two. */
+         * exclusive group — which is why this is one group and not two.  The
+         * two rows and their order are the vendor's own Mark menu
+         * (`contextMenuStrip_comment`, :25667): Text, then Arrow. */
         QGroupBox *mark = group(QStringLiteral("Mark"));
         mgrp->addButton(row(mark, MarkTextRow, QStringLiteral("Text"),
                             'T', true));
+        mgrp->addButton(row(mark, MarkArrowRow, QStringLiteral("Arrow"),
+                            'w', true));
         lay->addWidget(mark);
 
         /* Analysis — one chart, two presentations of it, in the reference's
@@ -5185,6 +5380,15 @@ private:
             p.setPen(Qt::NoPen);
             p.drawEllipse(QPointF(cx - 3, cy + 6), 1.6, 1.6);
             break;
+        case MarkArrowRow:
+            /* a shaft with an arrowhead, pointing up-right. */
+            p.drawLine(cx - 7, cy + 7, cx + 3, cy - 3);
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx + 7, cy - 7) << QPointF(cx - 1, cy - 5)
+                          << QPointF(cx + 5, cy + 1));
+            break;
         case Still:
             /* a camera */
             p.drawRect(cx - 7, cy - 4, 14, 9);
@@ -5240,7 +5444,7 @@ private:
     /* The Mark tool the canvas is holding, as the last sync reported it.  A
      * MarkKind; it decides the Tool None row, because arming a Mark puts the
      * session's tool to NONE. */
-    int          mark_mode_ = MarkNone;
+    int          mark_mode_ = MarkKindNone;
     QLabel      *sr_status_ = nullptr;   /* the Super Resolution tab's readout */
     QLabel      *ref_path_  = nullptr;   /* the Comparison tab's reference path */
     QLabel      *ref_stats_ = nullptr;   /* the Comparison tab's difference stats */
@@ -5740,7 +5944,9 @@ public:
                  * Measurement radio is the selector; this is the rail's way
                  * back to it after 'n' cleared it, which is what the reference
                  * Mark button does.  Spot is the default — it is the tool a
-                 * first-time user gets, and the cheapest to place. */
+                 * first-time user gets, and the cheapest to place.  The two
+                 * Mark kinds are on the right-click menu, as the vendor's own
+                 * Mark button has them (show_mark_popup). */
                 handle_key(last_tool_ == DYT_TOOL_LINE ? 'l'
                          : last_tool_ == DYT_TOOL_BOX  ? 'b' : 'p');
                 break;
@@ -5790,6 +5996,14 @@ public:
             case IconRail::N_RailItems:
                 break;
             }
+        };
+
+        /* The rail's right-click, for the one item that has a menu: Mark's two
+         * kinds.  Routed through the same handle_key the items' left-click and
+         * the panel rows use, so the menu cannot become a third meaning. */
+        rail_->on_context = [this](IconRail::RailItem i, const QPoint &pos) {
+            if (i == IconRail::Mark)
+                show_mark_popup(pos);
         };
 
         auto *centre = new QWidget(this);
@@ -5973,6 +6187,21 @@ public:
         menu->addSeparator();
         menu->addAction(key_action(QStringLiteral("Next palette"), '.', "."));
         menu->addAction(key_action(QStringLiteral("Previous palette"), ',', ","));
+        return menu;
+    }
+
+    /* The Mark kinds, as the vendor's own Mark button offers them: its
+     * `contextMenuStrip_comment` holds exactly two items, Text and Arrow
+     * (:25667), wired to `label_but_remark_Click` (:20701) and
+     * `panel_arrow_Click` (:22399).  Each item runs the same key the panel row
+     * does, so the menu is a third route to the same two actions and not a
+     * second set.  Public, like palette_menu(), so --selftest can inspect it
+     * without a nested loop. */
+    QMenu *mark_menu()
+    {
+        auto *menu = new QMenu(this);
+        menu->addAction(key_action(QStringLiteral("Text"),  'T', "T"));
+        menu->addAction(key_action(QStringLiteral("Arrow"), 'w', "w"));
         return menu;
     }
 
@@ -6462,13 +6691,14 @@ public:
         }
 
         /* The Mark annotations, on their shift forms — 't' is the fixed-range
-         * toggle, so the Text tool is 'T'.  Above the fold, or the shift would
-         * be erased and the range would flip instead of a label being armed.
-         * A second press puts the tool away, so the key that armed it also
-         * disarms it (the vendor's label button toggles the same way). */
-        if (raw == 'T' && view_) {
-            view_->set_mark_mode(view_->mark_mode() == MarkText ? MarkNone
-                                                                : MarkText);
+         * toggle, so the Text tool is 'T'; the Arrow is 'w', which nothing else
+         * binds.  Above the fold, or the shift would be erased and the range
+         * would flip instead of a label being armed.  A second press puts the
+         * tool away, so the key that armed it also disarms it (the vendor's
+         * label button toggles the same way). */
+        if ((raw == 'T' || raw == 'w' || raw == 'W') && view_) {
+            const int want = (raw == 'T') ? MarkKindText : MarkKindArrow;
+            view_->set_mark_mode(view_->mark_mode() == want ? MarkKindNone : want);
             sync_actions();
             return 1;
         }
@@ -6613,6 +6843,18 @@ private:
         menu->popup(btn->mapToGlobal(QPoint(0, btn->height())));
     }
 
+    /* The Mark kinds menu, under whatever position the rail's button reports.
+     * The builder is public (see mark_menu); this is the show half, which only
+     * the rail's right-click uses. */
+    void show_mark_popup(const QPoint &global)
+    {
+        QMenu *menu = mark_menu();
+        if (!menu)
+            return;
+        menu->setAttribute(Qt::WA_DeleteOnClose);
+        menu->popup(global);
+    }
+
     /* Bring the on-screen checkmarks up to date with the frame that was just
      * painted.
      *
@@ -6633,7 +6875,7 @@ private:
             panel_->sync(snap_, view_ && view_->hot_shown(),
                          strip_ && !strip_->recording_label().isEmpty(),
                          gal_.open != 0,
-                         view_ ? view_->mark_mode() : MarkNone);
+                         view_ ? view_->mark_mode() : MarkKindNone);
 
         /* The Analysis chart.  The profile is read here rather than in the
          * panel, so the widget stays free of the session and its lock — and
@@ -6650,13 +6892,16 @@ private:
          * click that unchecked it would leave the mark disagreeing with the
          * session until the next frame put it right.  Recording the last
          * *active* tool is what lets Mark re-arm it rather than always
-         * choosing Spot. */
+         * choosing Spot.  An armed Mark tool lights it too: a Mark puts the
+         * session's tool to NONE, so reading the session alone would leave the
+         * button dark while a label or an arrow was armed. */
         if (snap_.tool != DYT_TOOL_NONE)
             last_tool_ = snap_.tool;
         if (rail_) {
             if (QPushButton *b = rail_->button(IconRail::Mark)) {
                 const QSignalBlocker block(b);
-                b->setChecked(snap_.tool != DYT_TOOL_NONE);
+                b->setChecked(snap_.tool != DYT_TOOL_NONE ||
+                              (view_ && view_->mark_mode() != MarkKindNone));
             }
             /* Rotate is a *mode* rather than an action, so its lit state is
              * worth showing: it says the picture is turned, and it goes out
@@ -7044,7 +7289,7 @@ struct key_line_t {
 
 static const key_line_t kKeyLines[] = {
     { "measurement", "  p l b o n     point / line / box / polygon / clear\n" },
-    { "measurement", "  T             Mark: place a text label\n" },
+    { "measurement", "  T w           Mark: place a text label / drag an arrow\n" },
     { "measurement", "  enter bksp    polygon: finish the outline / undo a vertex\n" },
     { "measurement", "  c             Analysis: annotate the line's chart\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
@@ -7090,6 +7335,26 @@ static std::string key_list_text()
  * every key the About list does. */
 static std::string about_text(bool have_model = false);
 static std::string help_text();
+
+/* How many pixels of the Mark colour sit in a 9x9 box centred on (cx, cy).
+ * The two annotation assertions use it to ask "was the mark painted at the
+ * pixel it names?" by comparing the count before and after — a *difference*, so
+ * an overlay that happened to be there already cannot satisfy it.  The box is
+ * wider than the 2-px dot and the 1-px leader but narrower than the gap to the
+ * label's plate, so it counts the anchor and not the chip. */
+static int mark_px_near(const QImage &im, int cx, int cy)
+{
+    int n = 0;
+    for (int y = cy - 4; y <= cy + 4; y++)
+        for (int x = cx - 4; x <= cx + 4; x++) {
+            if (x < 0 || y < 0 || x >= im.width() || y >= im.height())
+                continue;
+            const QRgb c = im.pixel(x, y);
+            if (qRed(c) == 255 && qGreen(c) == 255 && qBlue(c) == 0)
+                n++;
+        }
+    return n;
+}
 
 static int selftest(const opts &o)
 {
@@ -10873,7 +11138,7 @@ static int selftest(const opts &o)
                  * claim two at once.  The arm came from the keyboard, so a
                  * checkmark that only tracked the *click* would stay dark. */
                 QPushButton *bn = panel->button(ControlPanel::ToolNone);
-                key_ok = view->mark_mode() == MarkText && mapped &&
+                key_ok = view->mark_mode() == MarkKindText && mapped &&
                          sa.range_mode == sb.range_mode &&
                          bt && bt->isChecked() && bn && !bn->isChecked();
 
@@ -10886,27 +11151,12 @@ static int selftest(const opts &o)
                            view->mark_at(0).text == QStringLiteral("T1");
                 /* One label per click, as the vendor's `cursor_code = None`
                  * after a placement does. */
-                disarm_ok = view->mark_mode() == MarkNone;
+                disarm_ok = view->mark_mode() == MarkKindNone;
 
                 /* The chip is on the canvas at the pixel's own projection: the
                  * dot beside the plate is the mark colour, and none of it was
-                 * there before.  A 9x9 window around the anchor, because the
-                 * dot is a 2px-radius ellipse. */
+                 * there before. */
                 const QImage after = view->render_canvas();
-                auto yellow_near = [](const QImage &im, int cx, int cy) {
-                    int n = 0;
-                    for (int y = cy - 4; y <= cy + 4; y++)
-                        for (int x = cx - 4; x <= cx + 4; x++) {
-                            if (x < 0 || y < 0 ||
-                                x >= im.width() || y >= im.height())
-                                continue;
-                            const QRgb c = im.pixel(x, y);
-                            if (qRed(c) == 255 && qGreen(c) == 255 &&
-                                qBlue(c) == 0)
-                                n++;
-                        }
-                    return n;
-                };
                 int ox = 0, oy = 0;
                 const bool proj_ok =
                     dyt_view_transform_project(&sa.xform, sa.width, sa.height,
@@ -10914,8 +11164,8 @@ static int selftest(const opts &o)
                                                ex, ey, &ox, &oy) == 0;
                 const int ax = kPad + ox, ay = kPad + oy;
                 pixel_ok = proj_ok &&
-                           yellow_near(before, ax, ay) == 0 &&
-                           yellow_near(after,  ax, ay) >= 6;
+                           mark_px_near(before, ax, ay) == 0 &&
+                           mark_px_near(after,  ax, ay) >= 6;
 
                 /* Off the picture: the tool is put away and nothing placed,
                  * rather than a label stored where project() could never draw
@@ -10923,7 +11173,7 @@ static int selftest(const opts &o)
                 send_char('T');
                 send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
                            Qt::LeftButton, 100, -8);
-                off_ok = view->mark_mode() == MarkNone &&
+                off_ok = view->mark_mode() == MarkKindNone &&
                          view->mark_count() == 1 && prompts == 1;
 
                 /* A cancelled prompt refuses the click and leaves the tool
@@ -10936,17 +11186,17 @@ static int selftest(const opts &o)
                 send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
                            Qt::LeftButton, lx, ly);
                 cancel_ok = view->mark_count() == 1 && prompts == 2 &&
-                            view->mark_mode() == MarkText;
+                            view->mark_mode() == MarkKindText;
 
                 /* One tool at a time, both ways: the measurement tool and the
                  * Mark tool are the vendor's single `cursor_code`, so arming
                  * one puts the other away. */
-                view->set_mark_mode(MarkNone);
+                view->set_mark_mode(MarkKindNone);
                 send_char('p');
                 pm.step();
                 dyt_snapshot_t s_p{};
                 dyt_session_snapshot(sess, &s_p, nullptr, 0);
-                const bool had_spot = view->mark_mode() == MarkNone &&
+                const bool had_spot = view->mark_mode() == MarkKindNone &&
                                       s_p.tool == DYT_TOOL_POINT;
 
                 send_char('T');
@@ -10954,17 +11204,17 @@ static int selftest(const opts &o)
                 dyt_snapshot_t s_m{};
                 dyt_session_snapshot(sess, &s_m, nullptr, 0);
                 const bool cleared_mark_tool =
-                    view->mark_mode() == MarkText && s_m.tool == DYT_TOOL_NONE;
+                    view->mark_mode() == MarkKindText && s_m.tool == DYT_TOOL_NONE;
 
                 send_char('p');
                 pm.step();
-                const bool cleared_mark = view->mark_mode() == MarkNone;
+                const bool cleared_mark = view->mark_mode() == MarkKindNone;
 
                 one_tool_ok = had_spot && cleared_mark_tool && cleared_mark;
 
                 view->clear_marks();
                 view->on_mark_text_ = nullptr;
-                view->set_mark_mode(MarkNone);
+                view->set_mark_mode(MarkKindNone);
                 send_char('n');
                 dyt_session_reset_view(sess);
                 pm.step();
@@ -10981,6 +11231,175 @@ static int selftest(const opts &o)
                         pixel_ok ? "yes" : "NO", disarm_ok ? "yes" : "NO",
                         off_ok ? "yes" : "NO", cancel_ok ? "yes" : "NO",
                         one_tool_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
+        /* ---- 69. The Mark Arrow annotation --------------------------------
+         *
+         * The vendor's other Mark kind: a press-drag-release, with the press
+         * setting `start_point` (:10285), the move `end_point` (:10554) and the
+         * release committing it through `AddArrow` (:11132), drawn the way
+         * `DrawUArrowF` draws it (:18386).  What is pinned is that path — the
+         * row, the key, the two stored ends, the head painted at the head's own
+         * projection while the drag is live *and* after it commits, and that a
+         * press with no drag places nothing and leaves the tool armed (which is
+         * what the vendor's "end point still (0,0)" test amounts to).
+         *
+         * It also pins the rail's right-click menu, because that is the route
+         * the vendor's own Mark button offers its two kinds on: the button must
+         * carry the custom context-menu policy, the event must actually open a
+         * popup, and the two items must run the same keys the rows do. */
+        {
+            bool rows_ok = false, key_ok = false, drag_ok = false,
+                 rubber_ok = false, head_ok = false, nodrag_ok = false,
+                 menu_ok = false, menu_key_ok = false;
+
+            if (view && fv && panel) {
+                send_char(27);
+                panel->tabs()->setCurrentIndex(ControlPanel::TabTroubleshoot);
+                send_char('n');
+                dyt_session_reset_view(sess);
+                pm.step();
+
+                view->clear_marks();
+
+                QPushButton *ba = panel->button(ControlPanel::MarkArrowRow);
+                rows_ok = ba && ba->text() == QStringLiteral("Arrow") &&
+                          ba->isEnabled();
+
+                /* The two pixels the drag below names, through the mapping the
+                 * placement itself uses. */
+                const QSize is = view->imageSize();
+                /* The fixture image is 256x192 (the bottom-half plane the
+                 * engine renders), so both ends must lie inside that —
+                 * the raw payload is 256x384 but the displayed frame is
+                 * half of it, and dyt_view_transform_map returns -1 for
+                 * any pixel at or beyond dst_h. */
+                const int   t0x = 60, t0y = 120, t1x = 150, t1y = 60;
+                dyt_snapshot_t s0{};
+                dyt_session_snapshot(sess, &s0, nullptr, 0);
+                int e0x = -1, e0y = -1, e1x = -1, e1y = -1;
+                const bool mapped =
+                    dyt_view_transform_map(&s0.xform, s0.width, s0.height,
+                                           is.width(), is.height(),
+                                           t0x, t0y, &e0x, &e0y) == 0 &&
+                    dyt_view_transform_map(&s0.xform, s0.width, s0.height,
+                                           is.width(), is.height(),
+                                           t1x, t1y, &e1x, &e1y) == 0;
+
+                dyt_snapshot_t sb{};
+                dyt_session_snapshot(sess, &sb, nullptr, 0);
+                send_char('w');
+                dyt_snapshot_t sa{};
+                dyt_session_snapshot(sess, &sa, nullptr, 0);
+                QPushButton *bn = panel->button(ControlPanel::ToolNone);
+                key_ok = view->mark_mode() == MarkKindArrow && mapped &&
+                         sa.range_mode == sb.range_mode &&
+                         ba && ba->isChecked() && bn && !bn->isChecked();
+
+                const QImage before = view->render_canvas();
+
+                send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
+                           Qt::LeftButton, t0x, t0y);
+                send_mouse(QEvent::MouseMove, Qt::NoButton, Qt::LeftButton,
+                           t1x, t1y);
+                /* Mid-drag the band is live and nothing is stored: the release
+                 * is what commits it, as the vendor's is. */
+                const bool   live  = view->arrow_dragging();
+                const size_t mid_n = view->arrow_count();
+                const QImage mid   = view->render_canvas();
+
+                send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton,
+                           Qt::NoButton, t1x, t1y);
+                const QImage after = view->render_canvas();
+
+                drag_ok = mapped && view->arrow_count() == 1 &&
+                          (int)std::lround(view->arrow_at(0).x0) == e0x &&
+                          (int)std::lround(view->arrow_at(0).y0) == e0y &&
+                          (int)std::lround(view->arrow_at(0).x1) == e1x &&
+                          (int)std::lround(view->arrow_at(0).y1) == e1y &&
+                          view->mark_mode() == MarkKindNone;
+                rubber_ok = live && mid_n == 0;
+
+                /* The head, at its own projection: absent before, present
+                 * while the drag is live and after it commits. */
+                int hx = 0, hy = 0;
+                const bool head_proj =
+                    dyt_view_transform_project(&sa.xform, sa.width, sa.height,
+                                               is.width(), is.height(),
+                                               e1x, e1y, &hx, &hy) == 0;
+                head_ok = head_proj &&
+                          mark_px_near(before, kPad + hx, kPad + hy) == 0 &&
+                          mark_px_near(mid,    kPad + hx, kPad + hy) >= 6 &&
+                          mark_px_near(after,  kPad + hx, kPad + hy) >= 6;
+
+                /* A press with no drag places nothing and leaves the tool
+                 * armed, so the gesture cannot commit a degenerate arrow. */
+                send_char('w');
+                send_mouse(QEvent::MouseButtonPress, Qt::LeftButton,
+                           Qt::LeftButton, t0x, t0y);
+                send_mouse(QEvent::MouseButtonRelease, Qt::LeftButton,
+                           Qt::NoButton, t0x, t0y);
+                nodrag_ok = view->arrow_count() == 1 && !view->arrow_dragging() &&
+                            view->mark_mode() == MarkKindArrow;
+
+                /* The rail's right-click menu.  The event is sent to the button
+                 * rather than the menu being opened by hand, so the wiring —
+                 * policy, signal, callback — is what this half pins. */
+                view->set_mark_mode(MarkKindNone);
+                QPushButton *mb = win.rail()
+                                      ? win.rail()->button(IconRail::Mark)
+                                      : nullptr;
+                const bool policy_ok =
+                    mb && mb->contextMenuPolicy() == Qt::CustomContextMenu;
+                bool opened_ok = false;
+                if (mb) {
+                    const QPoint lp(4, 4);
+                    QContextMenuEvent ce(QContextMenuEvent::Mouse, lp,
+                                         mb->mapToGlobal(lp));
+                    QApplication::sendEvent(mb, &ce);
+                    QWidget *pop = QApplication::activePopupWidget();
+                    opened_ok = pop != nullptr;
+                    if (pop)
+                        pop->close();
+                }
+
+                QMenu *mm = win.mark_menu();
+                const QList<QAction *> items = mm ? mm->actions()
+                                                  : QList<QAction *>();
+                menu_ok = policy_ok && opened_ok && items.size() == 2 &&
+                          items[0]->text() == QStringLiteral("Text") &&
+                          items[1]->text() == QStringLiteral("Arrow");
+
+                /* Each item runs the same key its row does, so the menu is a
+                 * third route and not a second set. */
+                if (items.size() == 2) {
+                    items[1]->trigger();
+                    const bool armed_arrow = view->mark_mode() == MarkKindArrow;
+                    items[0]->trigger();
+                    const bool armed_text  = view->mark_mode() == MarkKindText;
+                    menu_key_ok = armed_arrow && armed_text;
+                }
+
+                view->set_mark_mode(MarkKindNone);
+                view->clear_marks();
+                send_char('n');
+                dyt_session_reset_view(sess);
+                pm.step();
+            }
+
+            const bool ok = rows_ok && key_ok && drag_ok && rubber_ok &&
+                            head_ok && nodrag_ok && menu_ok && menu_key_ok;
+            std::printf("  %-4s the Mark Arrow tool drags an arrow between the "
+                        "pixels and the rail's Mark menu offers both kinds "
+                        "(row %s, key %s, drag %s, live %s, head %s, no-drag "
+                        "%s, menu %s, menu keys %s)\n",
+                        ok ? "ok" : "FAIL", rows_ok ? "yes" : "NO",
+                        key_ok ? "yes" : "NO", drag_ok ? "yes" : "NO",
+                        rubber_ok ? "yes" : "NO", head_ok ? "yes" : "NO",
+                        nodrag_ok ? "yes" : "NO", menu_ok ? "yes" : "NO",
+                        menu_key_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }
