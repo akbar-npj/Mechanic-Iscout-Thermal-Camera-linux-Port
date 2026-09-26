@@ -58,9 +58,11 @@ Measurement (Spot / Line / Rectangle / Polygon / None), Analysis (Line / Chart
 analysis), High Temperature (Tracking / Alarm / Highlight), Image Enhancement
 (the two flips and Fixed range) and Capture (Still / Record / Gallery). The
 first four are the reference's own groups, in its own order; Capture is this
-port's addition. Only groups the engine backs are present — the 3D Analysis,
-Comparison and Circuit Design tabs wait for their features (Track B) — so
-nothing on screen is a control that does nothing.
+port's addition. Only groups the engine backs are present — the 3D Analysis
+and Circuit Design tabs wait for their features (Track B) — so nothing on
+screen is a control that does nothing. The **Comparison** tab (between
+Troubleshoot and Super Resolution, where the Windows panel puts it) is the
+one Track B feature that has landed: see below.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -144,6 +146,24 @@ With no model the three radios are disabled rather than left clickable and
 silently ineffective. Assertion 53c pins the radios, the status line and the
 `Off` row, on both a model-present and a model-absent run.
 
+**Comparison** is the tab the Windows panel puts between Troubleshoot and
+Circuit Design. The engine is `src/compare.c` — a pure-C, no-allocation module
+that takes two Celsius grids (a reference saved still + the live frame) and
+produces a signed difference grid, per-pixel stats, and a 50/50 blend preview
+reusing `fusion.c`'s `(a + b + 1) / 2` rounding. The tab is the view; the
+pump (which owns the session and the per-frame temps) is the model: it loads
+the reference still through `dyt_frame_source_open_still` +
+`dyt_frame_source_temps` — the same pipeline a gallery still uses — and runs
+`dyt_compare_stats()` on every painted frame, pushing the path and the
+formatted stats into `ControlPanel::sync_compare()`. The "Load reference…"
+button opens a file dialog (or `--reference PATH` loads one at start-up); a
+threshold spin box sets the "beyond threshold" count; "Clear reference"
+drops it. A size mismatch (the reference is a different resolution than the
+live frame) leaves the stats box empty rather than handing the engine a
+mismatched pair. The rail's **Compare** button is now live (it was greyed
+while the engine waited) and switches the panel to this tab — assertion 53g
+flipped from "Compare is disabled" to "Compare switches the tab".
+
 A `QTabWidget` whose tabs do not fit hides the overflow behind scroll arrows —
 the "control the user cannot reach" failure, and a live risk here because the tab
 count only grows. The tab style therefore carries `font-size: 9px` (matching the
@@ -195,9 +215,10 @@ operation rather than five GUI setters, so a caller cannot forget one of the fiv
 things a reset undoes (zoom to the floor, both mirrors off, the rotation back to
 0, range back to AUTO — palette, unit and fusion are deliberately left alone,
 since they are how the picture is rendered rather than how it is framed).
-**Compare** is **disabled**: the two-board comparison lands in a later step, and
-a greyed button reads as "not yet" where a live button that does nothing reads
-as broken. The click handler keeps its case, so enabling it is a one-line change.
+**Compare** switches the control panel to the **Comparison** tab, where the
+two-board difference engine (src/compare.c) lives — the reference still,
+the threshold, and the difference stats. The button was greyed while the
+engine waited; it is live now that the engine has landed.
 
 **Rotate** is a session call rather than a GUI flag, because the rotation is part
 of the transform the pointer mapping inverts — a copy kept in the window would

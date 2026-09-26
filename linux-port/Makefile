@@ -244,7 +244,7 @@ LIB_OBJS := $(BUILD)/thermometry.o $(BUILD)/frame.o \
             $(BUILD)/visible.o $(BUILD)/fusion.o $(BUILD)/session_capture.o \
             $(BUILD)/jpeg.o $(BUILD)/stb_impl.o $(BUILD)/dytjpeg.o \
             $(BUILD)/mnn.o $(BUILD)/sr.o $(BUILD)/view_model.o \
-            $(BUILD)/frame_ready.o
+            $(BUILD)/frame_ready.o $(BUILD)/compare.o
 
 # The MNN runtime object belongs *in* the archive, beside mnn.o.  mnn.o is a
 # member of libdyt.a and, when a runtime is present, references
@@ -268,7 +268,7 @@ TESTS := $(BUILD)/control_test $(BUILD)/serial_test $(BUILD)/frame_test \
          $(BUILD)/visible_test $(BUILD)/fusion_test $(BUILD)/jpeg_test \
          $(BUILD)/dytjpeg_test $(BUILD)/imgwrite_test $(BUILD)/mnn_test \
          $(BUILD)/sr_test $(BUILD)/view_model_test $(BUILD)/frame_ready_test \
-         $(BUILD)/poll_model_test
+         $(BUILD)/poll_model_test $(BUILD)/compare_test
 TOOLS := $(BUILD)/dumpframe $(BUILD)/taucmp
 # capture_demo and probe talk to the device directly through libusb — only
 # buildable with it.  capture_demo's prereq on $(UVC_LIB) is what pulls the
@@ -405,6 +405,12 @@ $(BUILD)/display_test: src/display_test.c $(LIB) | $(BUILD)
 # measure_test drives the point/ROI/line/isotherm geometry over a synthetic
 # ramp, so every expected statistic is checkable by hand.  No hardware.
 $(BUILD)/measure_test: src/measure_test.c $(LIB) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
+
+# compare_test drives the two-board difference engine over a pair of synthetic
+# ramps (one pixel lifted), so the diff grid's hot pixel and the stats are
+# checkable by hand, and the swap is the mutation-verify.  No hardware.
+$(BUILD)/compare_test: src/compare_test.c $(LIB) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDLIBS) -o $@
 
 # alarm_test covers the high/low Schmitt triggers: the in-band non-clear and
@@ -601,6 +607,7 @@ check: all
 	@$(BUILD)/units_test
 	@$(BUILD)/display_test
 	@$(BUILD)/measure_test
+	@$(BUILD)/compare_test
 	@$(BUILD)/alarm_test
 	@$(BUILD)/session_test
 	@$(BUILD)/view_model_test

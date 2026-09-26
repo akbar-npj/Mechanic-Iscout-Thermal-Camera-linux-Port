@@ -72,6 +72,7 @@
 #include <QWidget>
 
 #include "capture.h"
+#include "compare.h"
 #include "frame_source.h"
 #include "imgwrite.h"    /* dyt_write_png — the still's shareable half */
 #include "mnn.h"         /* the optional super-resolution model */
@@ -189,6 +190,7 @@ struct opts {
     std::string shot;                /* save the whole window here, then exit */
     std::string capture_dir = ".";   /* where 's' and 'v' put their files */
     std::string model;               /* --model: the super-resolution model */
+    std::string reference;           /* --reference: a saved still to diff against */
     int  width   = 256;
     int  palette = 1;
     int  zoom    = 2;
@@ -344,6 +346,8 @@ static void usage(const char *prog)
         "  --fusion N       fusion pattern index (default 0 = ir)\n"
         "  --model PATH     super-resolution model (default: search for\n"
         "                   zoom2.mnn in the tree or beside the installed app)\n"
+        "  --reference PATH a saved still (.dyt.jpg) to diff against in the\n"
+        "                   Comparison tab (default: none)\n"
         "  --sr MODE        super-resolution: off|visible|thermal (default off)\n"
         "  --frames N       stop after N frames (default: run until closed)\n"
         "  --fps N          timer rate (default 25)\n"
@@ -428,6 +432,7 @@ static bool parse_args(int argc, char **argv, opts &o)
         else if (a == "--unit")                    { const char *v = next("--unit"); if (!v) return false; o.unit = std::atoi(v); }
         else if (a == "--fusion")                  { const char *v = next("--fusion"); if (!v) return false; o.fusion = std::atoi(v); }
         else if (a == "--model")                   { const char *v = next("--model"); if (!v) return false; o.model = v; }
+        else if (a == "--reference")               { const char *v = next("--reference"); if (!v) return false; o.reference = v; }
         else if (a == "--sr") {
             const char *v = next("--sr");
             if (!v) return false;
@@ -2377,14 +2382,10 @@ public:
         for (int i = Tutorials; i < N_RailItems; i++)
             lay->addWidget(make_button((RailItem)i));
 
-        /* Compare has no engine behind it yet — the two-board comparison lands
-         * in a later step.  Disabled rather than silently inert: a greyed
-         * button reads as "not yet", where a live button that does nothing
-         * reads as broken.  The click handler keeps its case, so enabling it is
-         * a one-line change here. */
-        for (RailItem i : { Compare })
-            if (btn_[i])
-                btn_[i]->setEnabled(false);
+        /* Compare is now live — the two-board comparison engine (src/compare.c)
+         * has landed.  Clicking it switches the control panel to the Comparison
+         * tab, the same way the rail's other items route to their tab or
+         * dialog. */
     }
 
     /* A click on `item`.  Set by MainWindow, which owns the session and the
@@ -2824,6 +2825,11 @@ public:
         tabs_->setFocusPolicy(Qt::NoFocus);
         outer->addWidget(tabs_);
         tabs_->addTab(build_troubleshoot(), QStringLiteral("Troubleshoot"));
+        /* The Windows panel's order is Troubleshoot | 3D Analysis | Comparison |
+         * Circuit Design; the port has not built 3D Analysis or Circuit Design
+         * yet, so Comparison follows Troubleshoot directly and the slot is
+         * where the vendor's own panel puts it. */
+        tabs_->addTab(build_comparison(), QStringLiteral("Comparison"));
         /* The tab the Windows app does not have.  It is last so the order the
          * vendor's panel established is preserved and the addition is visibly
          * an addition. */
@@ -2840,6 +2846,36 @@ public:
         return (i >= 0 && i < N_Ids) ? btn_[i] : nullptr;
     }
     QTabWidget *tabs() const { return tabs_; }
+
+    /* The Comparison tab's hooks.  The pump (which owns the session and the
+     * reference grid) installs these: Load opens a still, Clear drops it,
+     * and Threshold is read live on each frame.  The panel is the view; the
+     * pump is the model — the same split on_key takes. */
+    std::function<void()> on_load_reference_;
+    std::function<void()> on_clear_reference_;
+    std::function<void()> on_threshold_changed_;
+
+    /* Push the reference path and the pre-computed difference stats into the
+     * page.  The text is the pump's to format: it owns the session and the
+     * reference grid, so it runs dyt_compare_stats() and hands the result in
+     * as a string, exactly the way sync_sr() takes a mode the session holds. */
+    void sync_compare(const QString &path, bool have_ref, const QString &stats)
+    {
+        if (ref_path_)
+            ref_path_->setText(path.isEmpty() ? QStringLiteral("(none)")
+                                             : path);
+        if (ref_stats_)
+            ref_stats_->setText(stats);
+        /* The threshold spin is always live — the pump recomputes on change —
+         * but the stats box is empty until a reference is loaded, so a user
+         * sees the controls are there, not a page that looks broken. */
+        (void)have_ref;
+    }
+
+    double compare_threshold() const
+    {
+        return ref_thresh_ ? ref_thresh_->value() : 2.0;
+    }
 
     /* The panel is as tall as its current page's content.
      *
@@ -3103,6 +3139,94 @@ private:
         return scroll;
     }
 
+    /* The Comparison tab.  Two thermal boards side by side: a saved reference
+     * still and the live frame, a difference grid between them, and the stats
+     * that name where they differ most.  The engine is src/compare.c; this
+     * page is the view, the pump (which owns the session) computes the stats
+     * and hands them in as text — the same split the Super Resolution page
+     * takes (it reports, it does not act on the engine directly). */
+    QWidget *build_comparison()
+    {
+        auto *page = new QWidget;
+        auto *lay  = new QVBoxLayout(page);
+        lay->setContentsMargins(6, 6, 6, 6);
+        lay->setSpacing(8);
+
+        QGroupBox *ref = group(QStringLiteral("Reference"));
+        ref_path_ = new QLabel(QStringLiteral("(none)"), ref);
+        ref_path_->setWordWrap(true);
+        ref_path_->setFocusPolicy(Qt::NoFocus);
+        ref_path_->setObjectName(QStringLiteral("refpath"));
+        auto *ref_lay = qobject_cast<QVBoxLayout *>(ref->layout());
+        ref_lay->addWidget(ref_path_);
+        auto *load = new QPushButton(QStringLiteral("Load reference…"), ref);
+        load->setFocusPolicy(Qt::NoFocus);
+        load->setObjectName(QStringLiteral("loadref"));
+        connect(load, &QPushButton::clicked, [this]() {
+            if (on_load_reference_)
+                on_load_reference_();
+        });
+        ref_lay->addWidget(load);
+        auto *clear = new QPushButton(QStringLiteral("Clear reference"), ref);
+        clear->setFocusPolicy(Qt::NoFocus);
+        clear->setObjectName(QStringLiteral("clearref"));
+        connect(clear, &QPushButton::clicked, [this]() {
+            if (on_clear_reference_)
+                on_clear_reference_();
+        });
+        ref_lay->addWidget(clear);
+        lay->addWidget(ref);
+
+        QGroupBox *diff = group(QStringLiteral("Difference"));
+        auto *diff_lay = qobject_cast<QVBoxLayout *>(diff->layout());
+        auto *th_lay = new QHBoxLayout;
+        th_lay->setContentsMargins(0, 0, 0, 0);
+        th_lay->setSpacing(6);
+        auto *th_lbl = new QLabel(QStringLiteral("Threshold (°C):"), diff);
+        th_lbl->setFocusPolicy(Qt::NoFocus);
+        th_lay->addWidget(th_lbl);
+        ref_thresh_ = new QDoubleSpinBox(diff);
+        ref_thresh_->setFocusPolicy(Qt::NoFocus);
+        ref_thresh_->setRange(0.0, 100.0);
+        ref_thresh_->setSingleStep(0.5);
+        ref_thresh_->setDecimals(1);
+        ref_thresh_->setValue(2.0);
+        ref_thresh_->setObjectName(QStringLiteral("refthresh"));
+        connect(ref_thresh_,
+                qOverload<double>(&QDoubleSpinBox::valueChanged),
+                [this](double) {
+                    if (on_threshold_changed_)
+                        on_threshold_changed_();
+                });
+        th_lay->addWidget(ref_thresh_);
+        diff_lay->addLayout(th_lay);
+        ref_stats_ = new QLabel(diff);
+        ref_stats_->setWordWrap(true);
+        ref_stats_->setFocusPolicy(Qt::NoFocus);
+        ref_stats_->setObjectName(QStringLiteral("refstats"));
+        diff_lay->addWidget(ref_stats_);
+        lay->addWidget(diff);
+
+        auto *hint = new QLabel(
+            QStringLiteral("The reference is a saved still (.dyt.jpg).  "
+                           "Load one with the button above or --reference PATH. "
+                           " The stats name the largest absolute change and "
+                           "how many pixels exceed the threshold."), this);
+        hint->setObjectName(QStringLiteral("cmphint"));
+        hint->setWordWrap(true);
+        hint->setFocusPolicy(Qt::NoFocus);
+        lay->addWidget(hint);
+
+        lay->addStretch(1);
+
+        auto *scroll = new QScrollArea(this);
+        scroll->setWidget(page);
+        scroll->setWidgetResizable(true);
+        scroll->setFocusPolicy(Qt::NoFocus);
+        scroll->setFrameShape(QFrame::NoFrame);
+        return scroll;
+    }
+
     /* The Super Resolution tab.  Off / Visible plane (2x) / Thermal plane
      * (2x), one at a time, each routed through the same dispatch as the 'z'
      * and 'Z' keys.  The page is ours, not the vendor's: super-resolution is a
@@ -3335,6 +3459,9 @@ private:
     QPushButton *btn_[N_Ids] = {};
     ProfilePlot *plot_ = nullptr;        /* the Analysis group's chart */
     QLabel      *sr_status_ = nullptr;   /* the Super Resolution tab's readout */
+    QLabel      *ref_path_  = nullptr;   /* the Comparison tab's reference path */
+    QLabel      *ref_stats_ = nullptr;   /* the Comparison tab's difference stats */
+    QDoubleSpinBox *ref_thresh_ = nullptr; /* the Comparison tab's threshold */
     /* The mode the last sync reported, so the Off row knows which key means
      * "off" from where the session is.  Kept as the last *synced* mode rather
      * than read live because the panel has no session handle — it reports, it
@@ -3820,7 +3947,13 @@ public:
                     on_help_();
                 break;
             case IconRail::Compare:
-                break;      /* the engine behind it lands in a later step */
+                /* Switch the control panel to the Comparison tab.  The tab is
+                 * where the reference still, the threshold, and the diff stats
+                 * live — the same routing the rail's other items do for their
+                 * own tab or dialog. */
+                if (panel_ && panel_->tabs())
+                    panel_->tabs()->setCurrentIndex(1);
+                break;
             case IconRail::ContactUs: {
                 ContactDialog d(this);
                 d.exec();
@@ -4735,6 +4868,15 @@ struct pump {
      * window borrows it (MainWindow::play_) to pause and stop it. */
     PlaybackCtl playback;
 
+    /* The reference still for the Comparison tab.  Loaded by the "Load
+     * reference" button (or --reference PATH) and held here because the pump
+     * owns the session and the per-frame temps: it is what can run
+     * dyt_compare_stats() against the live grid.  The path is kept so the
+     * panel can show what is loaded.  An empty path means nothing is. */
+    std::string  ref_path;
+    std::vector<float> ref_temps;
+    int          ref_w = 0, ref_h = 0;
+
     /* Post a transient notice.  A method so the callers cannot set one without
      * the other and leave a message that never expires. */
     void notice(const std::string &s, int ttl = 150)
@@ -4890,9 +5032,56 @@ struct pump {
                                scr.temps);
         win->set_frame_status(snap, ds, fps.fps(), mode,
                               msg.empty() ? nullptr : msg.c_str());
+        sync_compare_panel(snap, scr.temps, scr.cap);
 
         frames++;                        /* painted frames, for --frames/--png */
         return true;
+    }
+
+    /* Push the Comparison tab's path + difference stats.  The reference grid
+     * lives here (the pump owns the session); the stats are computed against
+     * the live grid the snapshot just produced, so the page is correct on
+     * every painted frame.  The threshold comes from the panel's spin box,
+     * which is the only input the user has for it.  No reference, or a
+     * reference whose size does not match the live frame, leaves the stats
+     * box empty rather than handing the engine a size-mismatched pair. */
+    void sync_compare_panel(const dyt_snapshot_t &snap,
+                            const float *live, int live_cap)
+    {
+        if (!win || !win->panel())
+            return;
+
+        const bool have_ref = !ref_path.empty() &&
+                              ref_w == snap.width && ref_h == snap.height &&
+                              live && live_cap >= snap.width * snap.height &&
+                              (int)ref_temps.size() >= snap.width * snap.height;
+        QString stats;
+        if (have_ref) {
+            dyt_compare_stats_t s;
+            const double thresh = win->panel()->compare_threshold();
+            if (dyt_compare_stats(live, ref_temps.data(),
+                                  snap.width, snap.height,
+                                  (float)thresh, &s) == 0 && s.n > 0) {
+                stats = QStringLiteral(
+                    "Pixels compared: %1\n"
+                    "Difference: min %2 C, max %3 C, mean %4 C\n"
+                    "Largest |Δ|: %5 C at (%6, %7)\n"
+                    "Beyond threshold (%8 C): %9")
+                    .arg(s.n)
+                    .arg(s.min, 0, 'f', 1)
+                    .arg(s.max, 0, 'f', 1)
+                    .arg(s.mean, 0, 'f', 2)
+                    .arg(s.max_abs, 0, 'f', 1)
+                    .arg(s.max_abs_x)
+                    .arg(s.max_abs_y)
+                    .arg(thresh, 0, 'f', 1)
+                    .arg(s.beyond);
+            } else if (s.n == 0) {
+                stats = QStringLiteral("No finite overlap.");
+            }
+        }
+        win->panel()->sync_compare(
+            QString::fromStdString(ref_path), have_ref, stats);
     }
 
 private:
@@ -7635,6 +7824,7 @@ static int selftest(const opts &o)
      * where a live button that does nothing reads as broken. */
     {
         IconRail *rail = win.rail();
+        ControlPanel *panel = win.panel();
         pm.step();              /* so snap_ (which the picker marks from) is fresh */
 
         /* --- Palette.  One entry per loaded palette, the mark on the current
@@ -7824,23 +8014,37 @@ static int selftest(const opts &o)
         dyt_session_set_range_mode(sess, v0.range_mode);
         pm.step();
 
-        /* --- The one whose engine has not landed is unavailable, not inert. */
-        const bool pending_ok = cmp && !cmp->isEnabled();
+        /* --- Compare is live now: enabled, and clicking it switches the panel
+         * to the Comparison tab.  This replaces the old "pending" check that
+         * held while Compare had no engine behind it — the engine has landed
+         * (src/compare.c), so the button's claim is now "it switches to the
+         * Comparison tab", not "it is greyed out". */
+        const int before_tab = panel ? panel->tabs()->currentIndex() : -1;
+        if (cmp)
+            cmp->click();
+        const int after_tab  = panel ? panel->tabs()->currentIndex() : -1;
+        const bool compare_ok = cmp && cmp->isEnabled() &&
+                                before_tab != 1 && after_tab == 1;
+        /* Leave the panel where the user would expect it (not on Comparison
+         * unless they were already there) so later assertions are not shifted
+         * onto the Comparison page. */
+        if (panel && panel->tabs() && before_tab != 1)
+            panel->tabs()->setCurrentIndex(before_tab);
 
         const bool ok = count_ok && mark_ok && low_ok && high_ok &&
                         popup_ok && mark_tool_ok && reset_ok && help_ok &&
-                        rot_ok && rot_fit_ok && rot_reset_ok && pending_ok;
+                        rot_ok && rot_fit_ok && rot_reset_ok && compare_ok;
         std::printf("  %-4s the rail's items reach what they claim "
                     "(%d palette entries %s, mark %s, pick %s/%s, popup %s, "
                     "re-arm %s, reset %s, rotate %s, refit %s, rotate-reset %s, "
-                    "tutorials %s, pending %s)\n",
+                    "tutorials %s, compare %s)\n",
                     ok ? "ok" : "FAIL", (int)pals.size(),
                     count_ok ? "yes" : "NO", mark_ok ? "yes" : "NO",
                     low_ok ? "yes" : "NO", high_ok ? "yes" : "NO",
                     popup_ok ? "yes" : "NO", mark_tool_ok ? "yes" : "NO",
                     reset_ok ? "yes" : "NO", rot_ok ? "yes" : "NO",
                     rot_fit_ok ? "yes" : "NO", rot_reset_ok ? "yes" : "NO",
-                    help_ok ? "yes" : "NO", pending_ok ? "yes" : "NO");
+                    help_ok ? "yes" : "NO", compare_ok ? "yes" : "NO");
         if (!ok)
             fails++;
     }
@@ -8459,6 +8663,79 @@ static int run_gui(const opts &o_in, QApplication &app)
     pm.win  = &win;
     pm.live = o.live;
     win.set_playback(&pm.playback);    /* the window steers the pump's reader */
+
+    /* The Comparison tab's "Load reference" button.  Opens a still container
+     * through the same pipeline a gallery still uses, but pulls the Celsius
+     * grid (dyt_frame_source_temps) rather than the RGB — the live frame's
+     * grid is what the stats run against.  Held in the pump because the
+     * pump's step() is what recomputes the stats each frame. */
+    win.panel()->on_load_reference_ = [&]() {
+        const QString qpath = QFileDialog::getOpenFileName(
+            &win, QStringLiteral("Load reference still"),
+            QString::fromStdString(o.capture_dir),
+            QStringLiteral("DYT stills (*.dyt.jpg);;All files (*)"));
+        if (qpath.isEmpty())
+            return;
+        const std::string path = qpath.toStdString();
+
+        dyt_session_t      *gs = setup_session(o);
+        dyt_frame_source_t *sf = gs ? dyt_frame_source_open_still(
+            gs, path.c_str(), o.width, DYT_MODE_1000, DYT_PLANE_BOTTOM_HALF,
+            o.cap.t_amb, o.cap.sensor_mode, o.cap.fix_mode) : nullptr;
+        const uint8_t      *px = nullptr;
+        int                 w = 0, h = 0;
+        if (sf && dyt_frame_source_next(sf, &px, &w, &h) == DYT_FS_FRAME && px) {
+            std::vector<float> temps((size_t)w * (size_t)h);
+            if (dyt_frame_source_temps(sf, temps.data(), w * h) == 0) {
+                pm.ref_path  = path;
+                pm.ref_temps = std::move(temps);
+                pm.ref_w      = w;
+                pm.ref_h      = h;
+                pm.notice("reference loaded", 120);
+            } else {
+                pm.notice("reference has no thermal plane", 200);
+            }
+        } else {
+            pm.notice("cannot open reference", 200);
+        }
+        dyt_frame_source_close(sf);
+        dyt_session_free(gs);
+    };
+    win.panel()->on_clear_reference_ = [&]() {
+        pm.ref_path.clear();
+        pm.ref_temps.clear();
+        pm.ref_w = pm.ref_h = 0;
+        pm.notice("reference cleared", 120);
+    };
+    win.panel()->on_threshold_changed_ = [&]() {
+        /* The threshold is read live from the spin box in sync_compare_panel,
+         * so a change takes effect on the next frame — nothing to do here but
+         * let that happen.  The hook exists so the panel can grow a side
+         * effect later without a second wiring. */
+    };
+
+    /* An explicit --reference loads the still at start-up, the same way the
+     * button does, so a scripted run can pin the comparison without a click. */
+    if (!o.reference.empty()) {
+        dyt_session_t      *gs = setup_session(o);
+        dyt_frame_source_t *sf = gs ? dyt_frame_source_open_still(
+            gs, o.reference.c_str(), o.width, DYT_MODE_1000,
+            DYT_PLANE_BOTTOM_HALF, o.cap.t_amb, o.cap.sensor_mode,
+            o.cap.fix_mode) : nullptr;
+        const uint8_t      *px = nullptr;
+        int                 w = 0, h = 0;
+        if (sf && dyt_frame_source_next(sf, &px, &w, &h) == DYT_FS_FRAME && px) {
+            std::vector<float> temps((size_t)w * (size_t)h);
+            if (dyt_frame_source_temps(sf, temps.data(), w * h) == 0) {
+                pm.ref_path  = o.reference;
+                pm.ref_temps = std::move(temps);
+                pm.ref_w      = w;
+                pm.ref_h      = h;
+            }
+        }
+        dyt_frame_source_close(sf);
+        dyt_session_free(gs);
+    }
     if (dyt_session_get_palette(sess, o.palette - 1, &pm.pal) != 0) {
         dyt_session_free(sess);
         return 1;
