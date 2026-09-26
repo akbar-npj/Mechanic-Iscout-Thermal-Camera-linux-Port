@@ -133,16 +133,37 @@ the Mark, mirroring the vendor's single `cursor_code`. That is why the Mark rows
 are a separate group *box* but not a separate button group — two groups would
 have needed the `None` row unchecked while the Mark row was checked, and Qt
 refuses to uncheck the checked button of an exclusive group. The rail's Mark
-button has its own right-click menu (`mark_menu()`, two items: Text and Arrow),
-the reference's `contextMenuStrip_comment` route — a left-click on the rail
-button re-arms the last active tool, a right-click offers the two kinds.
-Assertion 68 pins the Text path: the row, the key, the placement pixel, the
-painted chip (by difference against the same canvas with no mark), the disarm,
-the off-image refusal, the cancelled prompt and the one-tool rule in both
-directions. Assertion 69 pins the Arrow path: the row and the key, the drag's
-stored endpoints, the live rubber band, the head painted (before/mid/after, by
-pixel difference), the no-drag refusal, and the rail menu's policy, popup, two
-items and key routing.
+button has its own right-click menu (`mark_menu()`), the reference's
+`contextMenuStrip_comment` route — a left-click on the rail button re-arms the
+last active tool, a right-click offers the two kinds and, below a separator, the
+history's three actions. Assertion 68 pins the Text path: the row, the key, the
+placement pixel, the painted chip (by difference against the same canvas with no
+mark), the disarm, the off-image refusal, the cancelled prompt and the one-tool
+rule in both directions. Assertion 69 pins the Arrow path: the row and the key,
+the drag's stored endpoints, the live rubber band, the head painted
+(before/mid/after, by pixel difference), the no-drag refusal, and the rail menu's
+policy, popup, leading two items and key routing.
+
+**Undo / Redo / Reset** take a mark back and put it again. They are the port's
+own addition — the vendor's `contextMenuStrip_comment` offers no way to remove a
+comment — and they live on the canvas with the marks. `mark_order_` holds the
+*kind* of every live mark in placement order, so an undo knows which of the two
+lists the last mark is the last of without the two lists needing a shared
+container (which would have broken every accessor assertions 68 and 69 read);
+`mark_redo_` holds the undone marks themselves, most recently undone first,
+because undoing popped one off its list. A new placement discards the redo
+branch, the ordinary undo rule, and Reset clears both lists *and* the history —
+reset is not "undo everything", because there is nothing to redo back to
+afterwards. All three run the same three `MainWindow` methods, reached three
+ways: the Mark group's Undo / Redo / Reset rows (through the panel's `act`
+callbacks, since a Ctrl chord is not one `handle_key` character — the same
+exception the Super Resolution Off row makes), the rail's Mark menu, and the
+chords `Ctrl+Z` / `Ctrl+Y` (and `Ctrl+Shift+Z`) / `Ctrl+R`, handled in
+`keyPressEvent` before the character read or a chord's control character would be
+taken for a binding of its own. The rows grey out with the history — an Undo with
+nothing to undo would be a row that does nothing. Assertion 70 pins the model,
+the redo, the discarded branch, the rows' enable state and their clicks, the
+menu's six entries and their routing, and the four chords.
 
 Each row runs the same `handle_key` its key does (through `ControlPanel::on_key`,
 the same one-dispatch rule the menus followed), so a panel button and a key
@@ -826,6 +847,7 @@ keyboard, both driving `src/view_model.c` rather than re-deciding anything:
 | `p` / `l` / `b` / `o` | point / line / box / polygon |
 | `n` | no tool, and forget the placed points and the polygon outline |
 | `T` / `w` | Mark: arm the text tool / the arrow tool (a second press puts it away) |
+| Ctrl+Z / Ctrl+Y / Ctrl+R | Mark: undo / redo / reset |
 | Enter / right button | finish the polygon outline |
 | Backspace | take back the last polygon vertex |
 | `c` | chart analysis: annotate the line's profile (picks up the line tool) |
@@ -1389,7 +1411,8 @@ $ ./build/dytqt --selftest
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
   ok   the Mark Text tool places a label at the clicked pixel and paints it there (row yes, key yes, place yes, painted yes, disarms yes, off-image yes, cancel yes, one tool yes)
   ok   the Mark Arrow tool drags an arrow between the pixels and the rail's Mark menu offers both kinds (row yes, key yes, drag yes, live yes, head yes, no-drag yes, menu yes, menu keys yes)
-  ok   the control panel cannot take the keyboard (32 control(s), 0 that would)
+  ok   the Mark history undoes, redoes and resets, by the rows, the menu and Ctrl+Z / Ctrl+Y / Ctrl+R (model yes, redo yes, branch yes, rows yes, menu yes, keys yes)
+  ok   the control panel cannot take the keyboard (35 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
@@ -1577,7 +1600,7 @@ worth naming one by one:
   somewhere else while looking entirely plausible.
 
 The last stretch of the parity work — the Windows panel's remaining controls —
-added six more. **64** is the colour bar's two range handles: it reads their
+added seven more. **64** is the colour bar's two range handles: it reads their
 geometry off the widget, finds the hot handle's pixel in a render, drags one and
 requires the session to hold the window the drag produced, then double-clicks
 back to auto. **65** is Rapid Diagnostics, and its second half is the one that
@@ -1606,8 +1629,18 @@ head's own projection — asserted by pixel difference before, during and after
 the drag, so a head that was never drawn cannot satisfy it — that a press with
 no drag places nothing and leaves the tool armed (the vendor's own
 `end_point != (0,0)` guard), and that the rail's right-click menu has the
-right policy, opens on a sent context event, offers exactly the two items
-(Text / Arrow) and routes each through the same key its row does. The alarm's threshold
+right policy, opens on a sent context event, offers the two kinds first and
+routes each through the same key its row does. **70** is the Mark history: that
+an undo takes the *last-placed* mark whichever list it is in, that a redo puts it
+back with the same coordinates (an arrow whose endpoint was lost would be a
+different arrow), that a new placement discards the redo branch, that Reset
+clears the marks and the history with them, that the three rows grey out with
+what there is to do and each does what it says, that the menu carries the two
+kinds, a separator and the three actions in that order, and that `Ctrl+Z`,
+`Ctrl+Y`, `Ctrl+Shift+Z` and `Ctrl+R` all route. Mutation-checked six ways — a
+redo stack that never fills, a redo that loses an endpoint, a Reset that leaves
+the order behind, a placement that keeps the old branch, a row that is always
+enabled, and `Ctrl+Z` wired to redo — all caught. The alarm's threshold
 field is pinned where it is defined rather than through the window: `a` must arm
 at the field's value (assertion 25), the field's clamp and the vendor's rounding
 are `view_model_test`'s, the height ranges are `surface_test`'s, and the fixed

@@ -1562,7 +1562,8 @@ public:
 
     /* Place a label at a source pixel.  Empty text is refused rather than
      * stored: a chip with nothing in it is a mark the user cannot read or
-     * find again. */
+     * find again.  A placement is a new action, so it discards the redo
+     * branch — the ordinary undo rule. */
     bool add_mark(const QPointF &src, const QString &text)
     {
         if (text.isEmpty() || snap_.width <= 0 || snap_.height <= 0)
@@ -1572,6 +1573,8 @@ public:
         m.y = clamp_src(src.y(), snap_.height);
         m.text = text;
         marks_.push_back(m);
+        mark_order_.push_back(MarkKindText);
+        mark_redo_.clear();
         update();
         return true;
     }
@@ -1591,20 +1594,79 @@ public:
         if (m.x0 == m.x1 && m.y0 == m.y1)
             return false;
         arrows_.push_back(m);
+        mark_order_.push_back(MarkKindArrow);
+        mark_redo_.clear();
         update();
         return true;
     }
 
+    /* Take the last-placed mark back.  The kind at the back of `mark_order_`
+     * says which list it is the last of, so the two lists need no shared
+     * container and every accessor above keeps its meaning.  The whole mark
+     * goes on the redo stack, because it is about to leave its list. */
+    bool undo_mark()
+    {
+        if (mark_order_.empty())
+            return false;
+        const int kind = mark_order_.back();
+        mark_order_.pop_back();
+
+        MarkUndone u;
+        u.kind = kind;
+        if (kind == MarkKindText) {
+            if (marks_.empty())
+                return false;
+            u.label = marks_.back();
+            marks_.pop_back();
+        } else {
+            if (arrows_.empty())
+                return false;
+            u.arrow = arrows_.back();
+            arrows_.pop_back();
+        }
+        mark_redo_.push_back(u);
+        update();
+        return true;
+    }
+
+    /* Put the most recently undone mark back, at the end of its list and of
+     * the placement order — which is exactly where it was. */
+    bool redo_mark()
+    {
+        if (mark_redo_.empty())
+            return false;
+        const MarkUndone u = mark_redo_.back();
+        mark_redo_.pop_back();
+        if (u.kind == MarkKindText) {
+            marks_.push_back(u.label);
+            mark_order_.push_back(MarkKindText);
+        } else {
+            arrows_.push_back(u.arrow);
+            mark_order_.push_back(MarkKindArrow);
+        }
+        update();
+        return true;
+    }
+
+    /* Start over: every mark, and the history with it.  Reset is not "undo
+     * everything" — there is nothing to redo back to afterwards. */
     void clear_marks()
     {
         marks_.clear();
         arrows_.clear();
+        mark_order_.clear();
+        mark_redo_.clear();
         update();
     }
     size_t mark_count() const { return marks_.size(); }
     const MarkLabel &mark_at(size_t i) const { return marks_[i]; }
     size_t arrow_count() const { return arrows_.size(); }
     const MarkArrow &arrow_at(size_t i) const { return arrows_[i]; }
+    /* Whether there is a mark to take back / a taken-back mark to put again —
+     * what the Undo and Redo rows are enabled by. */
+    bool can_undo_marks() const { return !mark_order_.empty(); }
+    bool can_redo_marks() const { return !mark_redo_.empty(); }
+    size_t mark_count_all() const { return mark_order_.size(); }
     /* Whether an arrow drag is in progress — the rubber band the canvas draws
      * before the release commits it. */
     bool arrow_dragging() const { return arrow_drag_; }
@@ -2847,9 +2909,23 @@ private:
     /* The Mark annotations and the tool that places them (see set_mark_mode).
      * `mark_mode_` is a MarkKind; both lists are in source pixels.  The arrow
      * drag's two ends are the in-progress one — the committed arrows live in
-     * `arrows_`. */
+     * `arrows_`.
+     *
+     * `mark_order_` is the *placement* order of the two lists (the kind of each
+     * mark, oldest first), which is what an undo walks back: the last entry is
+     * always the last-placed mark, and because a mark is only ever appended or
+     * popped, that kind's own list has it at its back.  `mark_redo_` is the
+     * undone marks, most recently undone first — the whole mark, not just its
+     * kind, because undoing popped it off its list. */
     std::vector<MarkLabel>    marks_;
     std::vector<MarkArrow>    arrows_;
+    std::vector<int>          mark_order_;
+    struct MarkUndone {
+        int       kind = MarkKindNone;
+        MarkLabel label;
+        MarkArrow arrow;
+    };
+    std::vector<MarkUndone>   mark_redo_;
     int                       mark_mode_ = MarkKindNone;
     bool                      arrow_drag_ = false;
     QPointF                   arrow_a_, arrow_b_;
@@ -4273,7 +4349,7 @@ public:
         RapidDiag,
         LeakShort, LeakLarge, LeakSmall,
         SurfShape, SurfColor,
-        MarkTextRow, MarkArrowRow,
+        MarkTextRow, MarkArrowRow, MarkUndoRow, MarkRedoRow, MarkResetRow,
         Still, Record, Gallery,
         SrOff, SrVisible, SrThermal,
         N_Ids
@@ -4372,6 +4448,14 @@ public:
     std::function<void()> on_load_layout_;
     std::function<void()> on_clear_layout_;
     std::function<void()> on_layout_changed_;
+
+    /* The Mark history's three hooks.  A Ctrl chord is not a single character,
+     * so these rows cannot run a key through on_key the way every other row
+     * does — the window owns the canvas and the history, so it does the work
+     * and the panel is the view (the same split the layout hooks take). */
+    std::function<void()> on_mark_undo_;
+    std::function<void()> on_mark_redo_;
+    std::function<void()> on_mark_reset_;
 
     /* What the layout controls are set to, as the push reads them.  Public so
      * the window (and the selftest) can drive the panel→canvas contract
@@ -4501,6 +4585,16 @@ public:
         mark_mode_ = mode;
         set_checked(btn_[MarkTextRow],  mode == MarkKindText);
         set_checked(btn_[MarkArrowRow], mode == MarkKindArrow);
+    }
+
+    /* The Mark history's three rows, enabled by what there is to do: an Undo
+     * with an empty history and a Redo with an empty redo stack would be rows
+     * that do nothing, which is the one thing no control here may be. */
+    void sync_mark_history(bool can_undo, bool can_redo, bool any)
+    {
+        if (btn_[MarkUndoRow])  btn_[MarkUndoRow]->setEnabled(can_undo);
+        if (btn_[MarkRedoRow])  btn_[MarkRedoRow]->setEnabled(can_redo);
+        if (btn_[MarkResetRow]) btn_[MarkResetRow]->setEnabled(any);
     }
 
     /* The 3D page's height mode.  Held by the SurfaceView (it is an input to
@@ -4670,8 +4764,11 @@ private:
             p.setRenderHint(QPainter::Antialiasing, true);
             paint_icon(p, id, QRect(0, 0, 18, 18)); }
         b->setIcon(QIcon(pm));
-        b->setToolTip(QStringLiteral("key: %1")
-                          .arg(QChar((char)key).toUpper()));
+        /* A row whose key is a chord (Ctrl+Z) or which has no key at all passes
+         * 0 here and names its own shortcut in the tooltip instead. */
+        if (key)
+            b->setToolTip(QStringLiteral("key: %1")
+                              .arg(QChar((char)key).toUpper()));
         connect(b, &QPushButton::clicked, [this, key, act]() {
             if (act) {
                 act();
@@ -4741,6 +4838,21 @@ private:
                             'T', true));
         mgrp->addButton(row(mark, MarkArrowRow, QStringLiteral("Arrow"),
                             'w', true));
+        /* The history of the two rows above.  Not tools, so they sit outside
+         * the exclusive group (a row that undoes is not a cursor), and they
+         * take the `act` route rather than a key because a Ctrl chord is not
+         * one character — the same exception the Super Resolution Off row
+         * makes.  Each names its own chord in the tooltip, since row() only
+         * prints a "key:" hint for a single-character key. */
+        row(mark, MarkUndoRow, QStringLiteral("Undo"), 0, false,
+            [this]() { if (on_mark_undo_) on_mark_undo_(); })
+            ->setToolTip(QStringLiteral("Ctrl+Z"));
+        row(mark, MarkRedoRow, QStringLiteral("Redo"), 0, false,
+            [this]() { if (on_mark_redo_) on_mark_redo_(); })
+            ->setToolTip(QStringLiteral("Ctrl+Y"));
+        row(mark, MarkResetRow, QStringLiteral("Reset"), 0, false,
+            [this]() { if (on_mark_reset_) on_mark_reset_(); })
+            ->setToolTip(QStringLiteral("Ctrl+R"));
         lay->addWidget(mark);
 
         /* Analysis — one chart, two presentations of it, in the reference's
@@ -5388,6 +5500,33 @@ private:
             p.drawPolygon(QPolygonF()
                           << QPointF(cx + 7, cy - 7) << QPointF(cx - 1, cy - 5)
                           << QPointF(cx + 5, cy + 1));
+            break;
+        case MarkUndoRow:
+            /* an arrow doubling back to the left. */
+            p.setBrush(Qt::NoBrush);
+            p.drawLine(cx + 6, cy + 3, cx - 3, cy + 3);
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx - 8, cy + 3) << QPointF(cx - 2, cy - 2)
+                          << QPointF(cx - 2, cy + 8));
+            break;
+        case MarkRedoRow:
+            /* the same, doubled back to the right. */
+            p.setBrush(Qt::NoBrush);
+            p.drawLine(cx - 6, cy + 3, cx + 3, cy + 3);
+            p.setBrush(cyan);
+            p.setPen(Qt::NoPen);
+            p.drawPolygon(QPolygonF()
+                          << QPointF(cx + 8, cy + 3) << QPointF(cx + 2, cy - 2)
+                          << QPointF(cx + 2, cy + 8));
+            break;
+        case MarkResetRow:
+            /* a waste bin: lid, handle and body. */
+            p.setBrush(Qt::NoBrush);
+            p.drawLine(cx - 7, cy - 4, cx + 7, cy - 4);
+            p.drawLine(cx - 2, cy - 7, cx + 2, cy - 7);
+            p.drawRect(cx - 5, cy - 2, 10, 9);
             break;
         case Still:
             /* a camera */
@@ -6195,14 +6334,53 @@ public:
      * (:25667), wired to `label_but_remark_Click` (:20701) and
      * `panel_arrow_Click` (:22399).  Each item runs the same key the panel row
      * does, so the menu is a third route to the same two actions and not a
-     * second set.  Public, like palette_menu(), so --selftest can inspect it
-     * without a nested loop. */
+     * second set.
+     *
+     * The history's three actions are the port's own addition — the vendor
+     * offers no way to take a comment back.  They are built with plain_action
+     * because a Ctrl chord is not a `handle_key` character, and they run the
+     * same three methods the panel rows and the keys do.
+     *
+     * Public, like palette_menu(), so --selftest can inspect it without a
+     * nested loop. */
     QMenu *mark_menu()
     {
         auto *menu = new QMenu(this);
         menu->addAction(key_action(QStringLiteral("Text"),  'T', "T"));
         menu->addAction(key_action(QStringLiteral("Arrow"), 'w', "w"));
+        menu->addSeparator();
+        auto add = [&](const QString &text, const char *hint,
+                       std::function<void()> fn) {
+            QAction *a = plain_action(text, std::move(fn));
+            a->setToolTip(QString::fromUtf8(hint));
+            menu->addAction(a);
+        };
+        add(QStringLiteral("Undo"),  "Undo    Ctrl+Z",  [this]() { mark_undo(); });
+        add(QStringLiteral("Redo"),  "Redo    Ctrl+Y",  [this]() { mark_redo(); });
+        add(QStringLiteral("Reset"), "Reset    Ctrl+R", [this]() { mark_reset(); });
         return menu;
+    }
+
+    /* The Mark history, on the canvas.  Public because the panel's three rows
+     * and the rail's menu both reach them (the rows through the panel's
+     * callbacks, the menu directly), and --selftest drives all three routes. */
+    void mark_undo()
+    {
+        if (view_)
+            view_->undo_mark();
+        sync_actions();
+    }
+    void mark_redo()
+    {
+        if (view_)
+            view_->redo_mark();
+        sync_actions();
+    }
+    void mark_reset()
+    {
+        if (view_)
+            view_->clear_marks();
+        sync_actions();
     }
 
     FrameView   *view()  const { return view_; }
@@ -6752,6 +6930,34 @@ protected:
 
     void keyPressEvent(QKeyEvent *e) override
     {
+        /* The Mark history's chords come first: a Ctrl chord is not one
+         * character, so it cannot go through handle_key's single dispatch the
+         * way every other binding does.  It is the same exception the panel's
+         * Undo/Redo/Reset rows make, and they all reach the same three
+         * methods.  Placed before the text read, or Ctrl+Z's control character
+         * would be taken for a binding of its own. */
+        if (e->modifiers() & Qt::ControlModifier) {
+            switch (e->key()) {
+            case Qt::Key_Z:
+                if (e->modifiers() & Qt::ShiftModifier)
+                    mark_redo();
+                else
+                    mark_undo();
+                e->accept();
+                return;
+            case Qt::Key_Y:
+                mark_redo();
+                e->accept();
+                return;
+            case Qt::Key_R:
+                mark_reset();
+                e->accept();
+                return;
+            default:
+                break;
+            }
+        }
+
         /* One unfolded character, because the bindings are not all the same
          * case.  The runtime-parameter keys are case-sensitive — 'e' arms
          * emissivity but 'A'/'R'/'D' arm ambient/reflected/distance, and 'y'
@@ -6887,6 +7093,15 @@ private:
             int   n = sess_ ? dyt_session_profile(sess_, prof, DYT_PROFILE_MAX) : 0;
             panel_->sync_analysis(snap_, n > 0 ? prof : nullptr, n > 0 ? n : 0);
         }
+
+        /* The Mark history's three rows.  The history lives on the canvas, so
+         * this is where the panel learns what there is to undo, redo or
+         * reset — a row that can do nothing is disabled rather than left
+         * looking live. */
+        if (panel_ && view_)
+            panel_->sync_mark_history(view_->can_undo_marks(),
+                                      view_->can_redo_marks(),
+                                      view_->mark_count_all() > 0);
 
         /* The rail's Mark, by the same rule: a rail button is checkable, so a
          * click that unchecked it would leave the mark disagreeing with the
@@ -7290,6 +7505,7 @@ struct key_line_t {
 static const key_line_t kKeyLines[] = {
     { "measurement", "  p l b o n     point / line / box / polygon / clear\n" },
     { "measurement", "  T w           Mark: place a text label / drag an arrow\n" },
+    { "measurement", "  ^Z ^Y ^R      Mark: undo / redo / reset\n" },
     { "measurement", "  enter bksp    polygon: finish the outline / undo a vertex\n" },
     { "measurement", "  c             Analysis: annotate the line's chart\n" },
     { "measurement", "  a i           alarm / isotherm\n" },
@@ -7875,6 +8091,16 @@ static int selftest(const opts &o)
         QApplication::sendEvent(&win, &e);
     };
 
+    /* A Ctrl chord, which send_key cannot express.  The modifiers are what
+     * keyPressEvent's Mark-history branch reads, so this is the only way to
+     * drive it. */
+    auto send_ctrl = [&](Qt::Key k, bool shift = false) {
+        QKeyEvent e(QEvent::KeyPress, k,
+                    Qt::ControlModifier |
+                        (shift ? Qt::ShiftModifier : Qt::NoModifier));
+        QApplication::sendEvent(&win, &e);
+    };
+
     /* 23. The tool keys reach the session.  This is also what arms the mouse
      * test below: the pointer handler reads the tool from the view's own
      * snapshot, so a tool must be selected through the key path before a drag
@@ -8239,6 +8465,12 @@ static int selftest(const opts &o)
     bool retry_seen = false;
     win.on_quit_  = [&]() { quit_seen  = true; };
     win.on_retry_ = [&]() { retry_seen = true; };
+
+    /* The Mark history's three rows reach the canvas through these, the same
+     * wiring run_gui installs — the contract under test is the app's own. */
+    win.panel()->on_mark_undo_  = [&]() { win.mark_undo(); };
+    win.panel()->on_mark_redo_  = [&]() { win.mark_redo(); };
+    win.panel()->on_mark_reset_ = [&]() { win.mark_reset(); };
 
     /* 28. A parameter key arms its ladder, re-pressing it advances the rung,
      * and a different parameter's key starts its own ladder at the first. */
@@ -11368,13 +11600,16 @@ static int selftest(const opts &o)
                 QMenu *mm = win.mark_menu();
                 const QList<QAction *> items = mm ? mm->actions()
                                                   : QList<QAction *>();
-                menu_ok = policy_ok && opened_ok && items.size() == 2 &&
+                /* The two *kinds* lead the menu, as the vendor's own does; the
+                 * history's three actions follow the separator and are pinned
+                 * by assertion 70. */
+                menu_ok = policy_ok && opened_ok && items.size() >= 2 &&
                           items[0]->text() == QStringLiteral("Text") &&
                           items[1]->text() == QStringLiteral("Arrow");
 
                 /* Each item runs the same key its row does, so the menu is a
                  * third route and not a second set. */
-                if (items.size() == 2) {
+                if (items.size() >= 2) {
                     items[1]->trigger();
                     const bool armed_arrow = view->mark_mode() == MarkKindArrow;
                     items[0]->trigger();
@@ -11400,6 +11635,144 @@ static int selftest(const opts &o)
                         rubber_ok ? "yes" : "NO", head_ok ? "yes" : "NO",
                         nodrag_ok ? "yes" : "NO", menu_ok ? "yes" : "NO",
                         menu_key_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
+        /* 70. The Mark history: undo, redo and reset, on all three routes.
+         * The model is driven directly (add_mark/add_arrow are what the click
+         * path calls), the rows by a click, the menu by trigger(), and the
+         * chords by a real QKeyEvent with the modifier set — so each route is
+         * pinned to the same three methods. */
+        {
+            bool model_ok = false, redo_ok = false, drop_ok = false,
+                 rows_ok = false, menu_ok = false, keys_ok = false;
+
+            if (view && fv && sess && panel) {
+                panel->tabs()->setCurrentIndex(ControlPanel::TabTroubleshoot);
+                send_char('n');
+                dyt_session_reset_view(sess);
+                view->set_mark_mode(MarkKindNone);
+                view->clear_marks();
+                pm.step();
+
+                /* A label and then an arrow — different lists, so an undo has
+                 * to know which one the last mark is the last of. */
+                const bool placed =
+                    view->add_mark(QPointF(80, 90), QStringLiteral("A")) &&
+                    view->add_arrow(QPointF(40, 150), QPointF(120, 110));
+                model_ok = placed && view->can_undo_marks() &&
+                           !view->can_redo_marks() && view->mark_count() == 1 &&
+                           view->arrow_count() == 1 &&
+                           view->mark_count_all() == 2;
+
+                /* Undo takes the arrow first (it was placed last), then the
+                 * label; redo puts them back in the same order, with the same
+                 * coordinates — a redo that lost the endpoints would be a
+                 * different arrow. */
+                const bool u1 = view->undo_mark() && view->arrow_count() == 0 &&
+                                view->mark_count() == 1 &&
+                                view->can_redo_marks();
+                const bool u2 = view->undo_mark() && view->mark_count() == 0 &&
+                                view->mark_count_all() == 0 &&
+                                !view->can_undo_marks();
+                const bool r1 = view->redo_mark() && view->mark_count() == 1 &&
+                                (int)std::lround(view->mark_at(0).x) == 80 &&
+                                (int)std::lround(view->mark_at(0).y) == 90;
+                const bool r2 = view->redo_mark() && view->arrow_count() == 1 &&
+                                (int)std::lround(view->arrow_at(0).x0) == 40 &&
+                                (int)std::lround(view->arrow_at(0).x1) == 120 &&
+                                (int)std::lround(view->arrow_at(0).y1) == 110 &&
+                                !view->can_redo_marks();
+                model_ok = model_ok && u1 && u2;
+                redo_ok  = r1 && r2;
+
+                /* A new placement after an undo is a new branch: the redo
+                 * stack goes with the old one. */
+                view->undo_mark();
+                const bool had_redo = view->can_redo_marks();
+                view->add_mark(QPointF(10, 10), QStringLiteral("B"));
+                drop_ok = had_redo && !view->can_redo_marks();
+
+                /* The rows follow the history's enable state, and each does
+                 * what it says.  Two marks live here (one from the redo, one
+                 * just placed), so Undo is live and Redo is not. */
+                pm.step();
+                QPushButton *ru = panel->button(ControlPanel::MarkUndoRow);
+                QPushButton *rr = panel->button(ControlPanel::MarkRedoRow);
+                QPushButton *rs = panel->button(ControlPanel::MarkResetRow);
+                const bool en1 = ru && rr && rs && ru->isEnabled() &&
+                                 !rr->isEnabled() && rs->isEnabled();
+                if (ru) ru->click();
+                const bool after_undo = view->mark_count_all() == 1;
+                pm.step();
+                const bool en2 = ru && rr && rr->isEnabled();
+                if (rr) rr->click();
+                const bool after_redo = view->mark_count_all() == 2;
+                if (rs) rs->click();
+                const bool after_reset = view->mark_count_all() == 0 &&
+                                         view->mark_count() == 0 &&
+                                         view->arrow_count() == 0 &&
+                                         !view->can_undo_marks() &&
+                                         !view->can_redo_marks();
+                pm.step();
+                const bool en3 = ru && rr && rs && !ru->isEnabled() &&
+                                 !rr->isEnabled() && !rs->isEnabled();
+                rows_ok = en1 && after_undo && en2 && after_redo &&
+                          after_reset && en3;
+
+                /* The menu: the two kinds, a separator, then the history's
+                 * three, and each routes to the same method. */
+                view->add_mark(QPointF(30, 30), QStringLiteral("C"));
+                QMenu *mm = win.mark_menu();
+                const QList<QAction *> mi = mm ? mm->actions()
+                                               : QList<QAction *>();
+                menu_ok = mi.size() == 6 &&
+                          mi[2]->isSeparator() &&
+                          mi[3]->text() == QStringLiteral("Undo") &&
+                          mi[4]->text() == QStringLiteral("Redo") &&
+                          mi[5]->text() == QStringLiteral("Reset");
+                if (menu_ok) {
+                    mi[3]->trigger();
+                    const bool m_undo = view->mark_count_all() == 0;
+                    mi[4]->trigger();
+                    const bool m_redo = view->mark_count_all() == 1;
+                    mi[5]->trigger();
+                    const bool m_reset = view->mark_count_all() == 0;
+                    menu_ok = m_undo && m_redo && m_reset;
+                }
+
+                /* The chords.  Ctrl+Z and Ctrl+Shift+Z both undo/redo the same
+                 * history Ctrl+Y does. */
+                view->add_mark(QPointF(50, 50), QStringLiteral("D"));
+                send_ctrl(Qt::Key_Z);
+                const bool k_undo = view->mark_count_all() == 0;
+                send_ctrl(Qt::Key_Y);
+                const bool k_redo = view->mark_count_all() == 1;
+                send_ctrl(Qt::Key_Z);
+                send_ctrl(Qt::Key_Z, /*shift=*/true);
+                const bool k_shift = view->mark_count_all() == 1;
+                send_ctrl(Qt::Key_R);
+                const bool k_reset = view->mark_count_all() == 0;
+                keys_ok = k_undo && k_redo && k_shift && k_reset;
+
+                view->set_mark_mode(MarkKindNone);
+                view->clear_marks();
+                send_char('n');
+                dyt_session_reset_view(sess);
+                pm.step();
+            }
+
+            const bool ok = model_ok && redo_ok && drop_ok && rows_ok &&
+                            menu_ok && keys_ok;
+            std::printf("  %-4s the Mark history undoes, redoes and resets, by "
+                        "the rows, the menu and Ctrl+Z / Ctrl+Y / Ctrl+R "
+                        "(model %s, redo %s, branch %s, rows %s, menu %s, "
+                        "keys %s)\n",
+                        ok ? "ok" : "FAIL", model_ok ? "yes" : "NO",
+                        redo_ok ? "yes" : "NO", drop_ok ? "yes" : "NO",
+                        rows_ok ? "yes" : "NO", menu_ok ? "yes" : "NO",
+                        keys_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }
@@ -12426,6 +12799,13 @@ static int run_gui(const opts &o_in, QApplication &app)
             QLineEdit::Normal, QString(), &ok);
         return ok ? t.trimmed() : QString();
     };
+
+    /* The Mark history's three rows.  The panel's rows call these; the menu
+     * and the Ctrl chords reach the same MainWindow methods directly, so all
+     * three routes are one implementation. */
+    win.panel()->on_mark_undo_  = [&]() { win.mark_undo(); };
+    win.panel()->on_mark_redo_  = [&]() { win.mark_redo(); };
+    win.panel()->on_mark_reset_ = [&]() { win.mark_reset(); };
 
     win.on_record_ = [&]() {
         std::string why;
