@@ -127,6 +127,10 @@ static const int kBarW   = 22;   /* colour-bar width, px */
 static const int kBarGap = 14;   /* image -> bar gap */
 static const int kLabelW  = 96;  /* room for the bar's labels */
 static const int kPad     = 8;
+/* How deep the strip at each end of the bar is that grabs its fixed handle.
+ * The handles sit at opposite corners, so a top-strip grab is always the up
+ * handle and a bottom-strip grab always the down one. */
+static const int kHandleHit = 14;
 
 static const int kLineH   = 16;  /* one status line */
 static const int kStripPad = 4;  /* the strip's own margin */
@@ -1989,13 +1993,6 @@ public:
         return kPad + (int)std::lround((1.0 - u) * (h - 1));
     }
 
-    int bar_row_widget(float c) const
-    {
-        const double  s   = display_scale();
-        const QPointF org = display_origin();
-        return (int)std::lround(org.y() + s * bar_row_canvas(c));
-    }
-
     /* The temperature a widget-space y on the bar means — the inverse of the
      * above, and what a dragged handle's new position reads back as. */
     float bar_temp_at_widget(int wy) const
@@ -2009,10 +2006,33 @@ public:
         return dyt_vm_bar_temp((float)(1.0 - cy / h), bl, bhi);
     }
 
-    /* The bar's column, in widget space, with room for the two triangles that
-     * stick out past its ends.  Deliberately not widened sideways: the strip
-     * to its left is the picture, and a measurement placed there must not be
-     * stolen by a handle. */
+    /* The degrees one canvas row of the bar is worth — the scale's span over
+     * its height.  The handles are fixed, so a drag is *relative*: this is
+     * what turns the pointer's travel into a change of value. */
+    float bar_deg_per_row() const
+    {
+        float bl = 0.f, bhi = 0.f;
+        bar_scale(&bl, &bhi);
+        const int h = img_.height() > 1 ? img_.height() - 1 : 1;
+        return (bhi - bl) / (float)h;
+    }
+
+    /* The canvas position of a handle's centre: the up handle in the bar's
+     * top-right, the down handle in its bottom-left.  The hit test, the
+     * drawing and --selftest all name this one point, so they cannot disagree
+     * about where a handle is. */
+    QPoint bar_handle_pos(int which) const
+    {
+        const int bx = kPad + img_.width() + kBarGap;
+        const int by = kPad;
+        const int bh = img_.height();
+        return which == 0 ? QPoint(bx + kBarW - 6, by + 6)
+                          : QPoint(bx + 6, by + bh - 6);
+    }
+
+    /* The bar's column, in widget space.  Deliberately not widened sideways:
+     * the strip to its left is the picture, and a measurement placed there
+     * must not be stolen by a handle. */
     QRect bar_hit_rect_widget() const
     {
         const double  s   = display_scale();
@@ -2022,77 +2042,93 @@ public:
         const int by = (int)std::floor(org.y() + s * kPad);
         const int bw = (int)std::ceil(s * kBarW);
         const int bh = (int)std::ceil(s * img_.height());
-        return QRect(bx, by - 10, bw, bh + 20);
+        return QRect(bx, by, bw, bh);
     }
 
-    /* Which handle a widget-space point grabs — the window end whose row is
-     * nearer — or -1 when the point is not on the bar at all. */
+    /* Which handle a widget-space point grabs.  The two are fixed at the bar's
+     * opposite corners — up at the top-right, down at the bottom-left — so the
+     * top strip is always the up handle and the bottom strip always the down
+     * one, however narrow the window has been dragged.  That is what makes
+     * them operable individually: the old nearest-row rule could not tell them
+     * apart once the window had been narrowed towards them.  -1 is "not on a
+     * handle" (including the middle of the bar, which grabs nothing). */
     int bar_handle_at(const QPoint &wp) const
     {
         if (img_.isNull() || snap_.width <= 0)
             return -1;
-        if (!bar_hit_rect_widget().contains(wp))
+        const QRect r = bar_hit_rect_widget();
+        if (!r.contains(wp))
             return -1;
-        const int dy = std::abs(wp.y() - bar_row_widget(snap_.hi));
-        const int dl = std::abs(wp.y() - bar_row_widget(snap_.lo));
-        return dy <= dl ? 0 : 1;
+        const int strip = std::min(kHandleHit, r.height() / 3);
+        if (wp.y() - r.top() < strip)
+            return 0;
+        if (r.bottom() - wp.y() < strip)
+            return 1;
+        return -1;
     }
 
-    /* Move the dragged handle to the pointer and report the new window.  The
-     * two ends may not cross: a quarter of a degree of daylight is kept
-     * between them, so the handles cannot be dragged onto one row and become
-     * impossible to tell apart again. */
+    /* Move the window end the dragged handle owns, from the pointer's travel
+     * since the press — the vendor's own model (`panel_lut_max_but_MouseMove`
+     * keeps `lut_num = e.Y` and uses `e.Y - lut_num`).  A fixed handle cannot
+     * follow the pointer's absolute row, so the *delta* is what moves the
+     * value: pointer up is warmer, which lowers the max and raises the min.
+     * The other end is not touched, so the two operate individually. */
     void bar_drag_apply(const QPoint &wp)
     {
-        const float v   = bar_temp_at_widget(wp.y());
         const float gap = 0.25f;
+        const float d   = (float)(bar_drag_y0_ - wp.y()) * bar_drag_deg_;
+        float bl = 0.f, bhi = 0.f;
+        bar_scale(&bl, &bhi);
         float lo = snap_.lo, hi = snap_.hi;
 
         if (bar_drag_ == 0)
-            hi = std::max(v, lo + gap);
+            hi = std::min(std::max(bar_drag_val0_ + d, lo + gap), bhi);
         else
-            lo = std::min(v, hi - gap);
+            lo = std::max(std::min(bar_drag_val0_ + d, hi - gap), bl);
 
         if (on_bar_range_)
             on_bar_range_(lo, hi);
         update();
     }
 
-    /* The two handles, at the display window's ends inside the bar's scale.
-     * A triangle just outside the bar points at the row it marks, in the
-     * hot/cold colours the extremes already use, with the window's value
-     * beside it — so a drag reads its own number without a second widget. */
+    /* The two fixed handles, and the window they set.
+     *
+     * The handles are drawn *inside* the bar at its corners — up at the
+     * top-right, down at the bottom-left — because the margin above the picture
+     * is only kPad and a triangle outside the bar would be clipped.  A dark
+     * outline keeps each readable over any palette entry.  The handles no
+     * longer travel with the value, so the window's position is shown by the
+     * two boundary lines instead, and its values by the labels beside the
+     * handles (draw_content). */
     void draw_bar_handles(QPainter &p)
     {
         if (img_.isNull() || snap_.width <= 0 || snap_.height <= 0)
             return;
 
         const int bx = kPad + img_.width() + kBarGap;
-        const int cx = bx + kBarW / 2;
-        const int lx = bx + kBarW + 4;
 
+        /* The window's two boundaries, under the handles. */
         for (int which = 0; which < 2; which++) {
-            const bool  hot = (which == 0);
-            const float c   = hot ? snap_.hi : snap_.lo;
-            const int   y   = bar_row_canvas(c);
+            const bool hot = (which == 0);
+            const int  y   = bar_row_canvas(hot ? snap_.hi : snap_.lo);
+            p.setPen(QPen(hot ? QColor(255, 90, 60) : QColor(90, 180, 255), 2));
+            p.drawLine(bx, y, bx + kBarW - 1, y);
+        }
 
-            p.setPen(Qt::NoPen);
-            p.setBrush(hot ? QColor(255, 90, 60) : QColor(90, 180, 255));
-
+        /* The two handles, over the boundaries. */
+        for (int which = 0; which < 2; which++) {
+            const bool   hot = (which == 0);
+            const QPoint c   = bar_handle_pos(which);
             QPolygon tri;
-            if (hot)
-                tri << QPoint(cx - 5, y - 8) << QPoint(cx + 5, y - 8)
-                    << QPoint(cx, y - 1);
-            else
-                tri << QPoint(cx - 5, y + 8) << QPoint(cx + 5, y + 8)
-                    << QPoint(cx, y + 1);
+            if (hot)   /* apex up, in the top-right */
+                tri << QPoint(c.x(), c.y() - 5) << QPoint(c.x() - 5, c.y() + 5)
+                    << QPoint(c.x() + 5, c.y() + 5);
+            else       /* apex down, in the bottom-left */
+                tri << QPoint(c.x(), c.y() + 5) << QPoint(c.x() - 5, c.y() - 5)
+                    << QPoint(c.x() + 5, c.y() - 5);
+            p.setPen(QPen(QColor(20, 20, 20), 1));
+            p.setBrush(hot ? QColor(255, 90, 60) : QColor(90, 180, 255));
             p.drawPolygon(tri);
-
-            char lbl[32];
-            if (dyt_vm_temp(&snap_, c, lbl, sizeof lbl) != 0)
-                continue;
-            p.setPen(hot ? QColor(255, 150, 120) : QColor(150, 205, 255));
-            p.drawText(lx, y + 4, QString::fromUtf8(lbl));
         }
     }
 
@@ -2145,11 +2181,16 @@ protected:
             return;
         }
         /* The colour bar's range handles come first: the bar is not part of
-         * the picture, so a press on it is never a measurement. */
+         * the picture, so a press on it is never a measurement.  The press
+         * records what the *relative* drag is measured from — the pointer's y,
+         * the end's value and the scale's degrees per row — because the handle
+         * itself does not move (see bar_drag_apply). */
         const int h = bar_handle_at(e->pos());
         if (h >= 0) {
-            bar_drag_ = h;
-            bar_drag_apply(e->pos());
+            bar_drag_     = h;
+            bar_drag_y0_  = e->pos().y();
+            bar_drag_val0_ = (h == 0) ? snap_.hi : snap_.lo;
+            bar_drag_deg_ = bar_deg_per_row();
             e->accept();
             return;
         }
@@ -2346,36 +2387,34 @@ protected:
         p.setPen(QColor(200, 200, 200));
         p.drawRect(bx, y0, kBarW - 1, bh - 1);
 
-        /* The bar's end labels are the frame's own extremes, because that is
-         * the range the bar is a *scale* over.  The Windows panel labels it the
-         * same way — the outer pair beside the bar — and puts the display
-         * window's values on the two arrows, so narrowing the window moves the
-         * arrows without moving the ends. */
+        /* The bar's labels, in one column beside it.  The *window*'s two
+         * values sit at the outer positions, beside the fixed handles that set
+         * them, in the same hot/cold colours as the window's boundary lines.
+         * The scale's own ends — the frame's extremes, which is the range the
+         * bar is a *scale* over — move just inside them and are drawn only
+         * once the window has left that end, so at AUTO the two never print
+         * the same number one line apart.  The mid label has nothing to
+         * collide with and is always drawn. */
         float bl = 0.f, bhi = 0.f;
         bar_scale(&bl, &bhi);
         const int lx = bx + kBarW + 4;
-        for (int i = 0; i < 3; i++) {
-            /* An end label earns its place only once its handle has left the
-             * end: at AUTO the window *is* the frame, so drawing both would
-             * print the same number twice, one line apart.  The mid label has
-             * no handle to collide with and is always drawn. */
-            if (i == 0 && bar_row_canvas(snap_.hi) <= y0 + 2)
-                continue;
-            if (i == 2 && bar_row_canvas(snap_.lo) >= y0 + bh - 2)
-                continue;
 
-            const float c = (i == 0) ? bhi
-                                     : (i == 1 ? (bl + bhi) * 0.5f : bl);
+        auto label = [&](float c, int yy, const QColor &col) {
             char lbl[32];
-            if (dyt_vm_temp(&snap_, c, lbl, sizeof lbl) != 0)
-                continue;
-            const int yy = (i == 1) ? y0 + bh / 2 : (i == 0 ? y0 + 12
-                                                            : y0 + bh - 3);
-            p.setPen(i == 1 ? QColor(170, 170, 170) : QColor(210, 210, 210));
-            p.drawText(lx, yy, QString::fromUtf8(lbl));
-        }
+            if (dyt_vm_temp(&snap_, c, lbl, sizeof lbl) == 0) {
+                p.setPen(col);
+                p.drawText(lx, yy, QString::fromUtf8(lbl));
+            }
+        };
+        label(snap_.hi, y0 + 12, QColor(255, 150, 120));       /* window high */
+        if (snap_.hi < bhi - 1e-3f)
+            label(bhi, y0 + 30, QColor(210, 210, 210));        /* scale high */
+        label((bl + bhi) * 0.5f, y0 + bh / 2, QColor(170, 170, 170));
+        if (snap_.lo > bl + 1e-3f)
+            label(bl, y0 + bh - 21, QColor(210, 210, 210));    /* scale low */
+        label(snap_.lo, y0 + bh - 3, QColor(150, 205, 255));   /* window low */
 
-        /* The two range handles, over the scale and the labels. */
+        /* The two fixed handles and the window they set, over the scale. */
         draw_bar_handles(p);
 
         /* ---- the measurement overlays --------------------------------
@@ -2889,8 +2928,13 @@ private:
      * here (set_alarm_setpoint); this is only the value 'a' arms at. */
     float               alarm_setpoint_ = DYT_ALARM_SETPOINT_DEFAULT;
     /* Which colour-bar handle a drag is moving: 0 the top (the window's high
-     * end), 1 the bottom, -1 nothing. */
+     * end), 1 the bottom, -1 nothing.  The handles are fixed, so the drag is
+     * relative and these are what it is measured from: the pointer's y at the
+     * press, the end's value then, and the scale's degrees per canvas row. */
     int                 bar_drag_ = -1;
+    int                 bar_drag_y0_   = 0;
+    float               bar_drag_val0_ = 0.f;
+    float               bar_drag_deg_  = 0.f;
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 
@@ -10908,12 +10952,14 @@ static int selftest(const opts &o)
                 fails++;
         }
 
-        /* 64. The colour bar's range handles.  The bar is a scale over the
-         * frame's own extremes and the two handles mark the display window
-         * inside it — the Windows panel's panel_lut_max_but / panel_lut_min_but,
-         * which drag the window's ends.  A drag on the top one narrows the
-         * window from above and turns the range fixed; a double-click hands it
-         * back to the frame, which is the way out of a window dragged to
+        /* 64. The colour bar's two fixed handles.  The bar is a scale over the
+         * frame's own extremes and the two handles — the Windows panel's
+         * panel_lut_max_but / panel_lut_min_but — drag the display window
+         * inside it.  The up handle is fixed at the bar's top-right and the
+         * down handle at its bottom-left, and each drags *only its own end*,
+         * by the pointer's travel since the press (the vendor's own relative
+         * model, `panel_lut_max_but_MouseMove`).  A double-click hands the
+         * range back to the frame, which is the way out of a window dragged to
          * nothing.
          *
          * The handle colours (255,90,60) and (90,180,255) are checked against
@@ -10921,7 +10967,7 @@ static int selftest(const opts &o)
          * for one is about the handle and not about the picture. */
         {
             bool geom_ok = false, paint_ok = false, drag_ok = false,
-                 moved_ok = false, auto_ok = false;
+                 indiv_ok = false, auto_ok = false;
             float seen_lo = 0.f, seen_hi = 0.f;
 
             if (view && fv) {
@@ -10932,32 +10978,42 @@ static int selftest(const opts &o)
                 dyt_session_snapshot(sess, &s0, nullptr, 0);
                 const QRect bar = fv->bar_rect();
 
-                /* The scale is the frame's own extremes, so at AUTO — where
-                 * the window *is* the frame — both handles sit on the bar's
-                 * ends. */
+                /* The handles are fixed at the bar's opposite corners — up at
+                 * the top-right, down at the bottom-left — and at AUTO, where
+                 * the window *is* the frame, its boundary lines sit on the
+                 * bar's ends. */
+                const QPoint hu = fv->bar_handle_pos(0);
+                const QPoint hd = fv->bar_handle_pos(1);
                 geom_ok = s0.stats.hi > s0.stats.lo && bar.height() > 8 &&
                           bar.width() > 4 &&
                           s0.range_mode == DYT_RANGE_AUTO &&
+                          hu.x() > bar.center().x() &&
+                          hu.y() < bar.center().y() &&
+                          hd.x() < bar.center().x() &&
+                          hd.y() > bar.center().y() &&
                           fv->bar_handle_row(s0.hi) == bar.top() &&
                           fv->bar_handle_row(s0.lo) == bar.bottom();
 
+                /* Both handles painted, each at its own corner.  The probe box
+                 * is the *triangle* only — it stops short of the row the
+                 * window's boundary line is drawn on, because at AUTO that line
+                 * is the same colour and would satisfy the probe on its own. */
                 const QImage before = fv->render_canvas();
-                int hot_px = 0;
-                for (int y = 0; y < before.height(); y++)
-                    for (int x = bar.left(); x <= bar.right(); x++)
-                        if (before.pixelColor(x, y) == QColor(255, 90, 60))
-                            hot_px++;
-                paint_ok = hot_px >= 3;
-
-                /* Aim a drag at a row a third of the way down the bar.  That
-                 * is inside the window, so the nearer handle is the top one
-                 * and it must follow the pointer down. */
-                const int    ty = bar.top() + bar.height() / 3;
-                const QPoint grab =
-                    fv->canvas_to_widget(QPointF(bar.center().x(),
-                                                 bar.center().y()));
-                const QPoint to =
-                    fv->canvas_to_widget(QPointF(bar.center().x(), ty));
+                auto px_in = [](const QImage &im, const QRect &r,
+                                const QColor &want) {
+                    int n = 0;
+                    for (int y = r.top(); y <= r.bottom(); y++)
+                        for (int x = r.left(); x <= r.right(); x++)
+                            if (x >= 0 && y >= 0 && x < im.width() &&
+                                y < im.height() &&
+                                im.pixelColor(x, y) == want)
+                                n++;
+                    return n;
+                };
+                const QRect hu_box(hu.x() - 5, hu.y() + 2, 11, 7);
+                const QRect hd_box(hd.x() - 5, hd.y() - 8, 11, 7);
+                paint_ok = px_in(before, hu_box, QColor(255, 90, 60)) >= 3 &&
+                           px_in(before, hd_box, QColor(90, 180, 255)) >= 3;
 
                 fv->on_bar_range_ = [&](float lo, float hi) {
                     seen_lo = lo;
@@ -10968,38 +11024,69 @@ static int selftest(const opts &o)
                     dyt_session_set_range_mode(sess, DYT_RANGE_AUTO);
                 };
 
-                QMouseEvent press(QEvent::MouseButtonPress, QPointF(grab),
-                                  QPointF(grab), Qt::LeftButton,
-                                  Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(fv, &press);
-                QMouseEvent move(QEvent::MouseMove, QPointF(to), QPointF(to),
-                                 Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
-                QApplication::sendEvent(fv, &move);
-                QMouseEvent rel(QEvent::MouseButtonRelease, QPointF(to),
-                                QPointF(to), Qt::LeftButton, Qt::NoButton,
-                                Qt::NoModifier);
-                QApplication::sendEvent(fv, &rel);
+                /* A press on a handle and a move `dy` px down from it. */
+                auto drag = [&](const QPoint &canvas_pt, int dy) {
+                    const QPoint a = fv->canvas_to_widget(QPointF(canvas_pt));
+                    const QPoint b(a.x(), a.y() + dy);
+                    QMouseEvent p(QEvent::MouseButtonPress, QPointF(a),
+                                  QPointF(a), Qt::LeftButton, Qt::LeftButton,
+                                  Qt::NoModifier);
+                    QApplication::sendEvent(fv, &p);
+                    QMouseEvent m(QEvent::MouseMove, QPointF(b), QPointF(b),
+                                  Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+                    QApplication::sendEvent(fv, &m);
+                    QMouseEvent r(QEvent::MouseButtonRelease, QPointF(b),
+                                  QPointF(b), Qt::LeftButton, Qt::NoButton,
+                                  Qt::NoModifier);
+                    QApplication::sendEvent(fv, &r);
+                };
 
+                /* The up handle, dragged *down*: the high end falls by the
+                 * pointer's travel and the low end does not move at all.  The
+                 * tolerance is tight (0.1 C) and the direction is asserted
+                 * outright, because the fixture's whole span is only about a
+                 * degree — a reversed delta would otherwise stay inside a
+                 * loose bound. */
+                const int   dy  = bar.height() / 4;
+                const float deg = fv->bar_deg_per_row();
+                drag(hu, dy);
                 dyt_snapshot_t s1{};
                 dyt_session_snapshot(sess, &s1, nullptr, 0);
+                const float want_hi = s0.hi - (float)dy * deg;
                 drag_ok = s1.range_mode == DYT_RANGE_FIXED &&
-                          seen_hi < s0.hi - 1e-3f &&
+                          s1.hi < s0.hi - 0.1f &&
+                          std::fabs(seen_hi - want_hi) < 0.1f &&
+                          std::fabs(s1.hi - want_hi) < 0.1f &&
                           std::fabs(seen_lo - s0.lo) < 1e-3f &&
-                          std::fabs(s1.hi - seen_hi) < 1e-2f;
+                          std::fabs(s1.lo - s0.lo) < 1e-3f;
 
-                /* The handle moved down the bar — the geometry the painting
-                 * follows, so this is what makes the drag visible at all. */
-                moved_ok = fv->bar_handle_row(s1.hi) > bar.top() &&
-                           fv->bar_handle_row(s1.hi) < bar.bottom() &&
-                           fv->bar_handle_row(s1.lo) == bar.bottom();
+                /* Let the canvas see the window the first drag set, so the
+                 * second drag starts from it rather than from the stale one. */
+                pm.step();
 
-                QMouseEvent dbl(QEvent::MouseButtonDblClick, QPointF(grab),
-                                QPointF(grab), Qt::LeftButton, Qt::LeftButton,
-                                Qt::NoModifier);
-                QApplication::sendEvent(fv, &dbl);
+                /* The down handle, dragged *up*: the low end rises and the
+                 * high end stays exactly where the first drag left it — the
+                 * two operate individually. */
+                const float lo_before = s1.lo;
+                seen_lo = seen_hi = 0.f;
+                drag(hd, -dy);
                 dyt_snapshot_t s2{};
                 dyt_session_snapshot(sess, &s2, nullptr, 0);
-                auto_ok = s2.range_mode == DYT_RANGE_AUTO;
+                const float want_lo = lo_before + (float)dy * deg;
+                indiv_ok = s2.lo > lo_before + 0.1f &&
+                           std::fabs(seen_lo - want_lo) < 0.1f &&
+                           std::fabs(s2.lo - want_lo) < 0.1f &&
+                           std::fabs(s2.hi - s1.hi) < 1e-3f;
+
+                const QPoint mid =
+                    fv->canvas_to_widget(QPointF(bar.center()));
+                QMouseEvent dbl(QEvent::MouseButtonDblClick, QPointF(mid),
+                                QPointF(mid), Qt::LeftButton, Qt::LeftButton,
+                                Qt::NoModifier);
+                QApplication::sendEvent(fv, &dbl);
+                dyt_snapshot_t s3{};
+                dyt_session_snapshot(sess, &s3, nullptr, 0);
+                auto_ok = s3.range_mode == DYT_RANGE_AUTO;
 
                 fv->on_bar_range_ = nullptr;
                 fv->on_bar_auto_  = nullptr;
@@ -11007,15 +11094,15 @@ static int selftest(const opts &o)
                 pm.step();
             }
 
-            const bool ok = geom_ok && paint_ok && drag_ok && moved_ok &&
+            const bool ok = geom_ok && paint_ok && drag_ok && indiv_ok &&
                             auto_ok;
-            std::printf("  %-4s the colour bar's range handles sit on the "
-                        "frame's scale, drag the window and reset to auto "
-                        "(geometry %s, painted %s, drag %s, moved %s, "
-                        "auto %s)\n", ok ? "ok" : "FAIL",
-                        geom_ok ? "yes" : "NO", paint_ok ? "yes" : "NO",
-                        drag_ok ? "yes" : "NO", moved_ok ? "yes" : "NO",
-                        auto_ok ? "yes" : "NO");
+            std::printf("  %-4s the colour bar's two fixed handles sit at the "
+                        "top-right and bottom-left and each drags only its own "
+                        "end, with a double-click back to auto (geometry %s, "
+                        "painted %s, drag %s, individual %s, auto %s)\n",
+                        ok ? "ok" : "FAIL", geom_ok ? "yes" : "NO",
+                        paint_ok ? "yes" : "NO", drag_ok ? "yes" : "NO",
+                        indiv_ok ? "yes" : "NO", auto_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }

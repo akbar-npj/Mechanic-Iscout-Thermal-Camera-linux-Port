@@ -898,6 +898,37 @@ pressed, so a camera whose auto-range later settles elsewhere will show an alarm
 that no longer matches the scene — the honest consequence of a derived band, and
 the reason explicit thresholds are a later task.
 
+### The colour bar and its window handles
+
+The bar beside the picture is a *scale* over the frame's own extremes
+(`stats.lo..stats.hi`), and the two handles inside it drag the **display window**
+narrower or wider — the Windows panel's `panel_lut_max_but` /
+`panel_lut_min_but` (`CAAnalyzer.decompiled.cs:18577`/`:18517`). The up handle is
+fixed at the bar's **top-right** and the down handle at its **bottom-left**, so
+the top strip of the bar is always the up handle and the bottom strip always the
+down one, however narrow the window has been dragged — that is what makes them
+operable *individually*, which the old nearest-row rule could not do once the two
+ends came close. They are drawn *inside* the bar because the margin above the
+picture is only `kPad` and a triangle outside it would be clipped; a dark
+outline keeps each readable over any palette entry.
+
+A fixed handle cannot follow the pointer's row, so the drag is **relative** —
+the vendor's own model, where `panel_lut_max_but_MouseMove` keeps `lut_num = e.Y`
+and works from `e.Y - lut_num`. The press records the pointer's y, that end's
+value and the scale's degrees per row; the move adds `(y0 - y) * deg` to the
+recorded value. Pointer *up* is warmer, so dragging the up handle down lowers the
+max and dragging the down handle up raises the min — each end moves alone, and
+the other is passed through untouched. The two may not cross: a quarter of a
+degree of daylight is kept between them.
+
+Because the handles no longer travel with the value, the window's position is
+shown by two 1 px **boundary lines** across the bar in the hot/cold colours, and
+its values by the labels at the outer positions beside the handles. The scale's
+own ends sit just inside them and are drawn only once the window has left that
+end, so at AUTO — where the window *is* the frame — the same number is not
+printed twice, one line apart. A double-click anywhere on the bar hands the range
+back to the frame, which is the way out of a window dragged to nothing.
+
 ### Runtime parameters and the device panel
 
 The four radiometric parameters the device stores — emissivity, ambient,
@@ -1405,7 +1436,7 @@ $ ./build/dytqt --selftest
   ok   a panel button reaches the session like its key (line yes, polygon yes, clear yes)
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
-  ok   the colour bar's range handles sit on the frame's scale, drag the window and reset to auto (geometry yes, painted yes, drag yes, moved yes, auto yes)
+  ok   the colour bar's two fixed handles sit at the top-right and bottom-left and each drags only its own end, with a double-click back to auto (geometry yes, painted yes, drag yes, individual yes, auto yes)
   ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
   ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
@@ -1600,10 +1631,18 @@ worth naming one by one:
   somewhere else while looking entirely plausible.
 
 The last stretch of the parity work — the Windows panel's remaining controls —
-added seven more. **64** is the colour bar's two range handles: it reads their
-geometry off the widget, finds the hot handle's pixel in a render, drags one and
-requires the session to hold the window the drag produced, then double-clicks
-back to auto. **65** is Rapid Diagnostics, and its second half is the one that
+added seven more. **64** is the colour bar's two fixed handles: it reads their
+corners off the widget (the up handle's canvas point is right of and above the
+bar's centre, the down handle's left of and below it), finds each handle's own
+pixel in a render — the probe box is the triangle alone, stopping short of the
+row the window's boundary line is drawn on, because at AUTO that line is the same
+colour and would satisfy the probe by itself — drags each one and requires the
+session to hold the window the drag produced *with the other end untouched* (the
+individual operation the fixed corners exist for), then double-clicks back to
+auto. The tolerance is tight and the direction is asserted outright, because the
+fixture's whole span is only about a degree: a reversed delta would otherwise
+stay inside a loose bound. **65** is Rapid Diagnostics, and its second half is
+the one that
 bites: pressing it twice must change nothing, because the second press reads the
 *frame's* extremes and not the window the first one latched — at AUTO those are
 the same numbers, so nothing weaker separates them. **66** drives all three
