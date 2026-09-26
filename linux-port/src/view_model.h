@@ -250,6 +250,26 @@ int dyt_vm_tool_mouse(dyt_session_t *s, dyt_vm_pointer_t *p,
 int dyt_vm_alarm_band(const dyt_snapshot_t *snap,
                       float *lo, float *hi, float *hyst);
 
+/* The high-temperature alarm's setpoint: the number the Windows panel's
+ * numeric field beside "High TEMP. Alarm" holds (`num_alarm_val`, backed by
+ * `gfHighWarnTemp = 70f` — CAAnalyzer.decompiled.cs:33191).
+ *
+ * Unlike the band above, this is a *threshold the user sets*, and the vendor
+ * clamps it to the sensor's own span on the way out of the edit box
+ * (`num_alarm_val_LostFocus`, :19610): -20.0 .. 450.0 Celsius.  A value the
+ * device could never report is refused rather than stored.
+ *
+ * A policy, like the band: one spelling of "what the field may hold", so the
+ * Qt panel and --selftest cannot disagree about it. */
+#define DYT_ALARM_SETPOINT_DEFAULT  70.0f
+#define DYT_ALARM_SETPOINT_MIN     (-20.0f)
+#define DYT_ALARM_SETPOINT_MAX      450.0f
+
+/* Clamp `v` into the field's range.  A NaN or an infinity falls back to the
+ * default, so a field nothing has filled in yet still arms a sane threshold
+ * rather than poisoning every comparison against it. */
+float dyt_vm_alarm_clamp_setpoint(float v);
+
 /* --------------------------------------------------------------- overlays */
 
 /* Halve the brightness of every pixel whose temperature falls outside

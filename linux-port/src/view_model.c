@@ -3,6 +3,7 @@
  */
 #include "view_model.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -569,6 +570,21 @@ int dyt_vm_alarm_band(const dyt_snapshot_t *snap,
     *hi   = snap->hi - 0.30f * span;
     *hyst = 0.10f * span;
     return 0;
+}
+
+float dyt_vm_alarm_clamp_setpoint(float v)
+{
+    /* isfinite() covers NaN and both infinities in one test: none of the
+     * three is a temperature a user could have meant to type, and every
+     * comparison against a NaN is false, which would leave an armed alarm
+     * that can never fire. */
+    if (!isfinite(v))
+        return DYT_ALARM_SETPOINT_DEFAULT;
+    if (v < DYT_ALARM_SETPOINT_MIN)
+        return DYT_ALARM_SETPOINT_MIN;
+    if (v > DYT_ALARM_SETPOINT_MAX)
+        return DYT_ALARM_SETPOINT_MAX;
+    return v;
 }
 
 /* --------------------------------------------------------------- overlays */

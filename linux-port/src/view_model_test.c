@@ -913,6 +913,98 @@ static void test_alarm_band(void)
              dyt_vm_alarm_band(&s, NULL, &hi, &h), -1);
 }
 
+/* The alarm setpoint's field.  The vendor's own limits (CAAnalyzer
+ * num_alarm_val_LostFocus, :19610) are -20 .. 450 Celsius, and its backing
+ * field starts at 70 (gfHighWarnTemp, :33191) — both pinned here so the Qt
+ * spin box and the engine cannot drift apart about what may be typed. */
+static void test_alarm_setpoint(void)
+{
+    float v;
+
+    v = dyt_vm_alarm_clamp_setpoint(35.5f);
+    if (fabsf(v - 35.5f) < 1e-6f)
+        ok("alarm setpoint: a value in range is kept");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.3f", (double)v);
+        fail("alarm setpoint: a value in range is kept", d);
+    }
+
+    v = dyt_vm_alarm_clamp_setpoint(-100.0f);
+    if (fabsf(v - DYT_ALARM_SETPOINT_MIN) < 1e-6f)
+        ok("alarm setpoint: below the floor clamps to -20");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.3f", (double)v);
+        fail("alarm setpoint: below the floor clamps to -20", d);
+    }
+
+    v = dyt_vm_alarm_clamp_setpoint(1000.0f);
+    if (fabsf(v - DYT_ALARM_SETPOINT_MAX) < 1e-6f)
+        ok("alarm setpoint: above the ceiling clamps to 450");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.3f", (double)v);
+        fail("alarm setpoint: above the ceiling clamps to 450", d);
+    }
+
+    /* A field nothing has filled in yet must still arm something sane: every
+     * comparison against a NaN is false, so an un-clamped NaN would be an
+     * armed alarm that can never fire. */
+    v = dyt_vm_alarm_clamp_setpoint(NAN);
+    if (fabsf(v - DYT_ALARM_SETPOINT_DEFAULT) < 1e-6f)
+        ok("alarm setpoint: NaN falls back to the 70 degree default");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.3f", (double)v);
+        fail("alarm setpoint: NaN falls back to the 70 degree default", d);
+    }
+
+    v = dyt_vm_alarm_clamp_setpoint(INFINITY);
+    if (fabsf(v - DYT_ALARM_SETPOINT_DEFAULT) < 1e-6f)
+        ok("alarm setpoint: an infinity falls back to the default");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.3f", (double)v);
+        fail("alarm setpoint: an infinity falls back to the default", d);
+    }
+
+    /* The field is the *high* side: armed at the setpoint with the low side on
+     * the clamp's floor, only a reading above the setpoint may trip it. */
+    {
+        dyt_alarm_t a;
+        dyt_alarm_state_t st;
+        dyt_alarm_init(&a);
+        dyt_alarm_set(&a, DYT_ALARM_SETPOINT_MIN,
+                      dyt_vm_alarm_clamp_setpoint(50.0f),
+                      DYT_ALARM_HYST_DEFAULT);
+
+        st = dyt_alarm_update(&a, 49.9f, 20.0f);
+        const int quiet_below = (st == DYT_ALARM_NONE);
+
+        st = dyt_alarm_update(&a, 50.1f, 20.0f);
+        const int trips_above = (st == DYT_ALARM_HIGH);
+
+        /* Still latched just under the threshold — that is the hysteresis the
+         * port adds and the vendor's bare `>` lacks. */
+        st = dyt_alarm_update(&a, 49.9f, 20.0f);
+        const int holds = (st == DYT_ALARM_HIGH);
+
+        st = dyt_alarm_update(&a, 48.9f, 20.0f);
+        const int clears = (st == DYT_ALARM_NONE);
+
+        if (quiet_below && trips_above && holds && clears)
+            ok("alarm setpoint: arms high-only at the field's value");
+        else {
+            char d[96];
+            snprintf(d, sizeof d, "below %s above %s holds %s clears %s",
+                     quiet_below ? "y" : "N", trips_above ? "y" : "N",
+                     holds ? "y" : "N", clears ? "y" : "N");
+            fail("alarm setpoint: arms high-only at the field's value", d);
+        }
+    }
+}
+
 static void test_data_dir(void);
 
 static void test_utilities(void)
@@ -1664,6 +1756,7 @@ int main(void)
     test_grab();
     test_tool_mouse();
     test_alarm_band();
+    test_alarm_setpoint();
     test_utilities();
     test_capture();
     test_gallery();

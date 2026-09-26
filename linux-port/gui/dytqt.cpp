@@ -837,15 +837,17 @@ static QImage transformed(const QImage &src, const dyt_view_transform_t &t)
  * a sibling (FrameView::param_key), because its keys are case-sensitive and
  * this function's are not.  The letters are free of the device keys: retry is
  * lowercase "r" and the panel toggle is "d". */
-static int apply_measure_key(dyt_session_t *sess, int key)
+static int apply_measure_key(dyt_session_t *sess, int key, float alarm_setpoint)
 {
     dyt_snapshot_t s;
 
     if (!sess)
         return 0;
 
-    /* Only the alarm and isotherm keys need the current state — the range for
-     * the band, and whether it is already armed. */
+    /* The alarm and isotherm keys both need the current state: whether the
+     * alarm is already armed (this key is a toggle) and whether the isotherm is
+     * on.  The alarm's *threshold* is not among them — it comes from the
+     * panel's field, handed in by the caller. */
     if (key == 'a' || key == 'i') {
         if (dyt_session_snapshot(sess, &s, nullptr, 0) != 0)
             return 1;                 /* consumed; there is no frame yet */
@@ -863,13 +865,20 @@ static int apply_measure_key(dyt_session_t *sess, int key)
         dyt_session_clear_points(sess);
         return 1;
     case 'a':
-        if (!s.alarm_on) {
-            float lo, hi, hyst;
-            if (dyt_vm_alarm_band(&s, &lo, &hi, &hyst) == 0)
-                dyt_session_set_alarm(sess, lo, hi, hyst);
-        } else {
+        /* The Windows panel's High TEMP. Alarm is a *threshold*, not a band:
+         * the user types the temperature in the field beside the row and the
+         * alarm fires above it.  So arm the high side at the field's value and
+         * put the low side on the clamp's floor, where nothing a sensor can
+         * report will ever reach it — that is what makes this a high alarm and
+         * not a window alarm.  The hysteresis is the port's own addition (the
+         * vendor tests a bare `>`), so a scene sitting on the threshold does
+         * not chatter. */
+        if (!s.alarm_on)
+            dyt_session_set_alarm(sess, DYT_ALARM_SETPOINT_MIN,
+                                  dyt_vm_alarm_clamp_setpoint(alarm_setpoint),
+                                  DYT_ALARM_HYST_DEFAULT);
+        else
             dyt_session_alarm_disable(sess);
-        }
         return 1;
     case 'i':
         dyt_session_set_isotherm(sess, !s.iso_on);
@@ -1384,11 +1393,29 @@ public:
      * scalars are re-read, so this is cheap. */
     int measure_key(int k)
     {
-        if (!apply_measure_key(sess_, k))
+        if (!apply_measure_key(sess_, k, alarm_setpoint_))
             return 0;
         resnap();
         return 1;
     }
+
+    /* The threshold the High TEMP. Alarm row arms at, in Celsius.  The panel
+     * owns the field and pushes the value here (push_alarm, the same
+     * panel-is-the-view split push_layout uses), and a change while the alarm
+     * is armed re-arms it — so the number on screen and the number the session
+     * compares against cannot drift apart.  Clamped on the way in, so every
+     * path into this — the field, --selftest, a preference — meets the same
+     * limit. */
+    void set_alarm_setpoint(float c)
+    {
+        alarm_setpoint_ = dyt_vm_alarm_clamp_setpoint(c);
+        if (sess_ && snap_.alarm_on) {
+            dyt_session_set_alarm(sess_, DYT_ALARM_SETPOINT_MIN,
+                                  alarm_setpoint_, DYT_ALARM_HYST_DEFAULT);
+            resnap();
+        }
+    }
+    float alarm_setpoint() const { return alarm_setpoint_; }
 
     /* Re-read the scalars — and the polygon outline — so an overlay change
      * shows at once rather than at the next tick.  The measurements are
@@ -2164,6 +2191,9 @@ private:
     /* The hottest/coldest markers, on by default (the reference viewer always
      * marks them).  The Windows panel's Tracking switch drives this. */
     bool                show_hot_    = true;
+    /* The High TEMP. Alarm threshold, in Celsius.  The panel's field pushes it
+     * here (set_alarm_setpoint); this is only the value 'a' arms at. */
+    float               alarm_setpoint_ = DYT_ALARM_SETPOINT_DEFAULT;
     float               override_v_[5]  = { 0.f, 0.f, 0.f, 0.f, 0.f };
     int                 override_on_[5] = { 0, 0, 0, 0, 0 };
 
@@ -3646,6 +3676,19 @@ public:
     QSpinBox *layout_spin_x() const { return layout_spin_x_; }
     QSpinBox *layout_spin_y() const { return layout_spin_y_; }
 
+    /* The High TEMP. Alarm threshold.  The panel owns the field and reports
+     * changes through `on_alarm_setpoint_changed_`; the window pushes the value
+     * into the canvas, which is what arms at it (push_alarm). */
+    std::function<void()> on_alarm_setpoint_changed_;
+    double alarm_setpoint() const
+    {
+        return alarm_spin_ ? alarm_spin_->value()
+                           : (double)DYT_ALARM_SETPOINT_DEFAULT;
+    }
+    /* The field itself, so the selftest can pin its clamp — the same
+     * DYT_ALARM_SETPOINT_MIN/MAX the engine's helper enforces. */
+    QDoubleSpinBox *alarm_spin() const { return alarm_spin_; }
+
     /* Push the loaded layout's path (or "(none)") into the page, the way
      * sync_compare() pushes the reference path. */
     void sync_layout(const QString &path)
@@ -3836,7 +3879,8 @@ private:
      * means "off" from every mode, and the Off row has to ask the session
      * which key means "off" from where it is. */
     QPushButton *row(QGroupBox *g, Id id, const QString &text, int key,
-                     bool checkable, std::function<void()> act = {})
+                     bool checkable, std::function<void()> act = {},
+                     QBoxLayout *into = nullptr)
     {
         auto *b = new QPushButton(text, g);
         b->setObjectName(QStringLiteral("row"));
@@ -3859,7 +3903,13 @@ private:
             if (on_key)
                 on_key(key);
         });
-        qobject_cast<QVBoxLayout *>(g->layout())->addWidget(b);
+        /* `into` is for the one row that shares its line with a field (the
+         * alarm and its threshold); everything else goes straight down the
+         * group's column. */
+        if (into)
+            into->addWidget(b);
+        else
+            qobject_cast<QVBoxLayout *>(g->layout())->addWidget(b);
         btn_[id] = b;
         return b;
     }
@@ -3900,7 +3950,49 @@ private:
 
         QGroupBox *hot = group(QStringLiteral("High Temperature"));
         row(hot, Tracking,  QStringLiteral("High TEMP. Tracking"), 'm', true);
-        row(hot, Alarm,     QStringLiteral("High TEMP. Alarm"),    'a', true);
+
+        /* The alarm row shares its line with the threshold it arms at.  The
+         * vendor puts the field beside the row (`num_alarm_val` next to
+         * `label_alert`), and the port needs it for the same reason: a row
+         * that arms an alarm with no way to say *at what temperature* is the
+         * gap the Windows panel does not have.  Always enabled rather than
+         * enabled-on-arm as the vendor has it — a field you must arm before
+         * you can type in is a control the user cannot reach, and the arm uses
+         * whatever it holds either way. */
+        {
+            auto *line = new QHBoxLayout;
+            line->setContentsMargins(0, 0, 0, 0);
+            line->setSpacing(6);
+            row(hot, Alarm, QStringLiteral("High TEMP. Alarm"), 'a', true,
+                {}, line);
+
+            alarm_spin_ = new QDoubleSpinBox(hot);
+            alarm_spin_->setObjectName(QStringLiteral("row"));
+            alarm_spin_->setFocusPolicy(Qt::NoFocus);
+            alarm_spin_->setDecimals(1);
+            alarm_spin_->setRange((double)DYT_ALARM_SETPOINT_MIN,
+                                  (double)DYT_ALARM_SETPOINT_MAX);
+            alarm_spin_->setSingleStep(1.0);
+            alarm_spin_->setSuffix(QStringLiteral(" \u00b0C"));
+            alarm_spin_->setValue((double)DYT_ALARM_SETPOINT_DEFAULT);
+            /* Narrow enough that the row keeps most of the line — the vendor's
+             * field is a small box beside the row, not a second row. */
+            alarm_spin_->setMaximumWidth(96);
+            alarm_spin_->setToolTip(
+                QStringLiteral("the temperature the alarm trips above "
+                               "(%1 to %2 \u00b0C)")
+                    .arg((double)DYT_ALARM_SETPOINT_MIN, 0, 'f', 0)
+                    .arg((double)DYT_ALARM_SETPOINT_MAX, 0, 'f', 0));
+            QObject::connect(alarm_spin_,
+                             QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                             this, [this](double) {
+                                 if (on_alarm_setpoint_changed_)
+                                     on_alarm_setpoint_changed_();
+                             });
+            line->addWidget(alarm_spin_, 1);
+            qobject_cast<QVBoxLayout *>(hot->layout())->addLayout(line);
+        }
+
         row(hot, Highlight, QStringLiteral("Highlight High TEMP. Area"),
             'i', true);
         lay->addWidget(hot);
@@ -4439,6 +4531,10 @@ private:
     QSpinBox  *layout_spin_y_  = nullptr;
     QSlider   *layout_opacity_ = nullptr;
     QCheckBox *layout_show_    = nullptr;
+    /* The High TEMP. Alarm threshold field.  The canvas is what arms at it, so
+     * this pushes through push_alarm() on every change — the same split the
+     * layout controls take. */
+    QDoubleSpinBox *alarm_spin_ = nullptr;
     /* The mode the last sync reported, so the Off row knows which key means
      * "off" from where the session is.  Kept as the last *synced* mode rather
      * than read live because the panel has no session handle — it reports, it
@@ -4458,6 +4554,16 @@ static void push_layout(ControlPanel *panel, FrameView *view)
     view->set_layout_align(panel->layout_dx(), panel->layout_dy());
     view->set_layout_opacity(panel->layout_opacity());
     view->set_layout_shown(panel->layout_shown());
+}
+
+/* Push the High TEMP. Alarm threshold field into the canvas, which is what
+ * arms at it.  The same free-function contract as push_layout: one place joins
+ * the panel to the canvas, so run_gui and --selftest exercise the same path. */
+static void push_alarm(ControlPanel *panel, FrameView *view)
+{
+    if (!panel || !view)
+        return;
+    view->set_alarm_setpoint((float)panel->alarm_setpoint());
 }
 
 /* --------------------------------------------------------- settings dialog */
@@ -6973,28 +7079,33 @@ static int selftest(const opts &o)
             fails++;
     }
 
-    /* 25. The alarm key arms the band the view model derives from the current
-     * range, and a second press disarms. */
+    /* 25. The alarm key arms at the panel's threshold field, and a second press
+     * disarms.  The Windows panel's High TEMP. Alarm is a *setpoint* — a
+     * number the user types beside the row (num_alarm_val) — not the band the
+     * port used to derive from the frame, so what the key arms at is the
+     * field's value with the low side parked on the clamp's floor where
+     * nothing a sensor reports can reach it.
+     *
+     * The field itself is exercised further down, where the panel is in scope;
+     * this pins the arm/disarm the key alone is responsible for. */
     {
         dyt_snapshot_t s{};
 
         send_key(Qt::Key_A);
         dyt_session_snapshot(sess, &s, nullptr, 0);
-        const bool armed = s.alarm_on != 0 && s.alarm_lo < s.alarm_hi;
-
-        float lo = 0.f, hi = 0.f, hyst = 0.f;
-        dyt_vm_alarm_band(&s, &lo, &hi, &hyst);
-        const bool matches = std::fabs(s.alarm_lo - lo) < 1e-4f &&
-                             std::fabs(s.alarm_hi - hi) < 1e-4f;
+        const bool armed = s.alarm_on != 0;
+        const bool at_field =
+            std::fabs(s.alarm_hi - DYT_ALARM_SETPOINT_DEFAULT) < 1e-4f &&
+            std::fabs(s.alarm_lo - DYT_ALARM_SETPOINT_MIN) < 1e-4f;
         const float armed_lo = s.alarm_lo, armed_hi = s.alarm_hi;
 
         send_key(Qt::Key_A);
         dyt_session_snapshot(sess, &s, nullptr, 0);
         const bool disarmed = s.alarm_on == 0;
 
-        const bool ok = armed && matches && disarmed;
-        std::printf("  %-4s the alarm key arms the derived band, then disarms "
-                    "(%.1f..%.1f)\n", ok ? "ok" : "FAIL",
+        const bool ok = armed && at_field && disarmed;
+        std::printf("  %-4s the alarm key arms at the threshold field's value, "
+                    "then disarms (%.1f..%.1f)\n", ok ? "ok" : "FAIL",
                     (double)armed_lo, (double)armed_hi);
         if (!ok)
             fails++;
@@ -9458,6 +9569,62 @@ static int selftest(const opts &o)
             panel->on_layout_changed_ = nullptr;
         }
 
+        /* The High TEMP. Alarm threshold field.  Its own clamp, then the whole
+         * field→push→session path through the very function run_gui wires — a
+         * field whose value the session never sees would arm at whatever the
+         * default was, which is exactly the "no way to set the temperature"
+         * gap the Windows panel closes with num_alarm_val. */
+        bool alarm_clamp_ok = false, alarm_push_ok = false,
+             alarm_follows_ok = false;
+        if (panel && view && panel->alarm_spin()) {
+            panel->on_alarm_setpoint_changed_ = [&]() {
+                push_alarm(panel, view);
+            };
+
+            QDoubleSpinBox *sp = panel->alarm_spin();
+            sp->setValue(-1000.0);
+            const bool lo_ok =
+                std::fabs(sp->value() - (double)DYT_ALARM_SETPOINT_MIN) < 1e-6;
+            sp->setValue(1000.0);
+            const bool hi_ok =
+                std::fabs(sp->value() - (double)DYT_ALARM_SETPOINT_MAX) < 1e-6;
+            alarm_clamp_ok = lo_ok && hi_ok;
+
+            sp->setValue(42.5);              /* fires the push */
+            alarm_push_ok = std::fabs(view->alarm_setpoint() - 42.5f) < 1e-3f;
+
+            /* Arm at the field, then edit it: the session must follow, or the
+             * number on screen and the number being compared against would
+             * disagree about when the alarm fires. */
+            view->measure_key('a');
+            dyt_snapshot_t a1{};
+            dyt_session_snapshot(sess, &a1, nullptr, 0);
+            const bool armed_at_42 = a1.alarm_on != 0 &&
+                                     std::fabs(a1.alarm_hi - 42.5f) < 1e-3f;
+
+            sp->setValue(55.0);              /* fires the push, which re-arms */
+            dyt_snapshot_t a2{};
+            dyt_session_snapshot(sess, &a2, nullptr, 0);
+            alarm_follows_ok = armed_at_42 &&
+                               std::fabs(a2.alarm_hi - 55.0f) < 1e-3f;
+
+            view->measure_key('a');          /* disarm */
+
+            sp->setValue((double)DYT_ALARM_SETPOINT_DEFAULT);
+            panel->on_alarm_setpoint_changed_ = nullptr;
+        }
+        {
+            const bool ok = alarm_clamp_ok && alarm_push_ok && alarm_follows_ok;
+            std::printf("  %-4s the alarm's threshold field clamps to -20..450 "
+                        "and the session arms at what it holds "
+                        "(clamp %s, pushed %s, follows an armed edit %s)\n",
+                        ok ? "ok" : "FAIL", alarm_clamp_ok ? "yes" : "NO",
+                        alarm_push_ok ? "yes" : "NO",
+                        alarm_follows_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
         /* A 256x192 layout, one opaque stripe and the rest transparent — the
          * shape that makes "did it composite?" a pixel question rather than a
          * colour one, so it cannot be confused with the picture underneath. */
@@ -10208,6 +10375,14 @@ static int run_gui(const opts &o_in, QApplication &app)
     /* The controls start where the page built them (centred, opaque, shown),
      * so the canvas and the page agree before any click. */
     push_layout(win.panel(), win.view());
+
+    /* The High TEMP. Alarm threshold.  The field is the panel's; the canvas is
+     * what arms at it, so every change is pushed — including while the alarm
+     * is up, which is what makes the threshold editable live. */
+    win.panel()->on_alarm_setpoint_changed_ = [&]() {
+        push_alarm(win.panel(), win.view());
+    };
+    push_alarm(win.panel(), win.view());
 
     /* An explicit --layout-image loads at start-up, the way the button does,
      * so a scripted run can pin the overlay without a click.  A path that
