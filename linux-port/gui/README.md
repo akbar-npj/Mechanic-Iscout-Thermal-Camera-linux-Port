@@ -33,7 +33,9 @@ MainWindow : QWidget
     ├── centre column (stretch 1, QVBoxLayout)
     │   ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
     │   │   └── GalleryPanel          the saved-items list, an overlay child widget
-    │   └── StatusStrip (stretch 0)   three left-aligned lines
+    │   └── StatusStrip (stretch 0)   three lines: status / readout / state,
+    │                                 the last with a connection dot, the
+    │                                 camera serial and the fps
     └── ControlPanel (stretch 0)  right panel: QTabWidget
         ├── "Troubleshoot"        Temperature Measurement / Analysis /
         │                         High Temperature / Image Enhancement / Capture
@@ -1631,13 +1633,23 @@ binary actually links — and the extracted `usr/bin/dytqt --selftest` reports
 matching `libqt6opengl6`/`libqt6openglwidgets6`, and `packaging/check.sh` pins
 that it does.
 
+Both packages have been rebuilt and their extracted binaries run after **every
+feature since** (the Comparison tab, the Circuit Design overlay, the serial and
+the connection dot), with no packaging change needed for the last three: the
+layout image is user-supplied and the serial and dot are the same binary. The
+re-verification is `make deb && make rpm`, then `dpkg-deb -x` / `rpm2cpio` into
+a scratch tree and run its `usr/bin/dytqt --selftest` **from the project
+directory**, because the default fixture path is relative to the cwd.
+
 The RPM was then installed for real — `sudo dnf install ./build/dytqt-*.rpm` —
 and the **GUI launched from `/usr/bin/dytqt`**, which is exactly what the
 staged-tree `--selftest` could not catch: the default source was the
 source-tree fixture, so a menu launch (cwd `$HOME`) died on a missing
 `testdata/…raw` before a window appeared. The default now falls back to the
 camera when no fixture is readable — see "Run" — and launching the installed
-binary from both a checkout and `/tmp` is the check that covers it.
+binary from both a checkout and `/tmp` is the check that covers it. That
+installed build **predates the redesign**, so re-running the install is the
+last step of this work and is not done here: it changes the host.
 
 `make check` runs `packaging/check.sh`, which pins the cross-file invariants a
 syntax linter cannot see: that the entry's `Exec`, `Icon` and `StartupWMClass`
@@ -1852,12 +1864,37 @@ only when the session wrote a parameter — then abandons it the same way.
   Driving the window with XTEST needs `QT_QPA_PLATFORM=xcb`: under the Wayland
   platform plugin the window is a native Wayland surface that X11 cannot see, and
   the key sender reports "no window matching" for a window that is plainly there.
+* **The circuit-layout overlay is stretched, and placed by hand.** The layout
+  image is scaled to the drawn picture with the aspect ratio ignored, so a
+  layout whose own aspect does not match the sensor's (4:3) is distorted rather
+  than letterboxed — the choice is deliberate (a layout is meant to cover the
+  picture, and the align offsets are how it is fitted), but it is not
+  registration. There is no auto-alignment and no homography: the user lines it
+  up with the X/Y offsets, which shift in drawn-image pixels and are clamped to
+  ±40. A layout drawn at the sensor's size needs no scaling and is exact.
+* **The live-only states are asserted, not observed.** The connection dot's
+  green/amber/red and the serial segment are exercised through `--selftest` with
+  a synthetic `dyt_device_info_t` and each `DevState` in turn, because no camera
+  is attached on this host. What the fixture path actually shows — the grey dot
+  and no serial — is the one case a render here can confirm. A real camera's
+  serial, and the dot's transition across a real connect/stall/reconnect, are
+  camera-only.
+* **The 3D surface's GL path is exercised headlessly.** `--selftest` runs under
+  the offscreen plugin, which on this host does give a valid GL context, so
+  `initializeGL`, the shader build and the buffer upload all run — but against
+  the offscreen surface, not a compositor's. The software renderer is what the
+  coverage assertion pins, and it is the path that exists everywhere. The same
+  applies to the layout overlay, which is pure `QPainter`.
 * **The `.deb` is not installed by its own package manager here.** The RPM *is*:
   `sudo dnf install` completed on 2026-09-25 and laid the files out under `/usr`,
-  which is what surfaced the fixture-default bug above. The deb is only built,
-  inspected with `dpkg-deb` and run from its staged tree — `dpkg -i` is not run,
-  and its dependency closure is checked by resolving every `Requires` against
-  the host's package database rather than by installing.
+  which is what surfaced the fixture-default bug above. That installed build
+  **predates the redesign** (the rail, the tabbed panel and every feature from
+  it), so `/usr/bin/dytqt` is not what `build/dytqt` is; re-running the install
+  is the last step of the redesign and needs an explicit go-ahead, because it
+  changes the host. The deb is only built, inspected with `dpkg-deb` and run from
+  its staged tree — `dpkg -i` is not run, and its dependency closure is checked
+  by resolving every `Requires` against the host's package database rather than
+  by installing.
 * **The RPM is a local artifact, not a Fedora submission.** It builds with this
   host's `rpmbuild` (6.0.2) and has not been through a Fedora review, `fedpkg` or
   `mock`. It ships no AppStream metainfo — `rpmlint` would say
