@@ -485,6 +485,85 @@ static void test_bar(void)
              dyt_vm_bar_label(&s, 3, b, sizeof b), -1);
 }
 
+/* The bar's scale and its inverse.  These are what put the Windows panel's two
+ * range handles at the right height and read back where a dragged handle
+ * landed, so the round-trip is what matters most: a pair that disagreed would
+ * make a drag jump under the pointer. */
+static void test_bar_scale(void)
+{
+    float f;
+    int   i;
+
+    f = dyt_vm_bar_frac(35.0f, 30.0f, 40.0f);
+    if (fabsf(f - 0.5f) < 1e-6f)
+        ok("bar scale: the midpoint is halfway up");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.4f", (double)f);
+        fail("bar scale: the midpoint is halfway up", d);
+    }
+
+    f = dyt_vm_bar_frac(30.0f, 30.0f, 40.0f);
+    const bool at_lo = fabsf(f - 0.0f) < 1e-6f;
+    f = dyt_vm_bar_frac(40.0f, 30.0f, 40.0f);
+    const bool at_hi = fabsf(f - 1.0f) < 1e-6f;
+    if (at_lo && at_hi)
+        ok("bar scale: the ends are 0 and 1");
+    else
+        fail("bar scale: the ends are 0 and 1", "ends wrong");
+
+    /* A temperature off either end lands on the bar rather than off it. */
+    f = dyt_vm_bar_frac(20.0f, 30.0f, 40.0f);
+    const bool below = fabsf(f - 0.0f) < 1e-6f;
+    f = dyt_vm_bar_frac(50.0f, 30.0f, 40.0f);
+    const bool above = fabsf(f - 1.0f) < 1e-6f;
+    if (below && above)
+        ok("bar scale: a temperature off the scale clamps onto it");
+    else
+        fail("bar scale: a temperature off the scale clamps onto it", "no");
+
+    /* A flat range has no fraction to speak of; the middle is the honest
+     * answer and it keeps the divide out of the function. */
+    f = dyt_vm_bar_frac(30.0f, 30.0f, 30.0f);
+    if (fabsf(f - 0.5f) < 1e-6f)
+        ok("bar scale: a flat range reports the middle");
+    else {
+        char d[64];
+        snprintf(d, sizeof d, "got %.4f", (double)f);
+        fail("bar scale: a flat range reports the middle", d);
+    }
+
+    f = dyt_vm_bar_temp(0.5f, 30.0f, 40.0f);
+    const bool mid_ok = fabsf(f - 35.0f) < 1e-4f;
+    f = dyt_vm_bar_temp(0.0f, 30.0f, 40.0f);
+    const bool lo_ok = fabsf(f - 30.0f) < 1e-4f;
+    f = dyt_vm_bar_temp(1.0f, 30.0f, 40.0f);
+    const bool hi_ok = fabsf(f - 40.0f) < 1e-4f;
+    if (mid_ok && lo_ok && hi_ok)
+        ok("bar scale: a fraction reads back as its temperature");
+    else
+        fail("bar scale: a fraction reads back as its temperature", "no");
+
+    f = dyt_vm_bar_temp(-1.0f, 30.0f, 40.0f);
+    const bool cl_lo = fabsf(f - 30.0f) < 1e-4f;
+    f = dyt_vm_bar_temp(2.0f, 30.0f, 40.0f);
+    const bool cl_hi = fabsf(f - 40.0f) < 1e-4f;
+    if (cl_lo && cl_hi)
+        ok("bar scale: a fraction off the bar clamps onto it");
+    else
+        fail("bar scale: a fraction off the bar clamps onto it", "no");
+
+    /* The round-trip a drag depends on. */
+    for (i = 0; i <= 20; i++) {
+        const float c = 30.0f + (float)i * 0.5f;
+        const float back =
+            dyt_vm_bar_temp(dyt_vm_bar_frac(c, 30.0f, 40.0f), 30.0f, 40.0f);
+        if (fabsf(back - c) > 1e-4f)
+            break;
+    }
+    intcheck("bar scale: frac then temp is the identity", i, 21);
+}
+
 /* ------------------------------------------------------------ device panel */
 
 static void test_info(void)
@@ -1750,6 +1829,7 @@ int main(void)
     test_hover_label();
     test_roi_label();
     test_bar();
+    test_bar_scale();
     test_info();
     test_param();
     test_isotherm();

@@ -304,6 +304,31 @@ int dyt_vm_bar_label(const dyt_snapshot_t *snap, int which, char *out, size_t n)
     return dyt_vm_temp(snap, c, out, n);
 }
 
+float dyt_vm_bar_frac(float c, float lo, float hi)
+{
+    float span = hi - lo;
+    float u;
+
+    if (!(span > 0.0f))          /* flat or inverted: the middle, not a divide */
+        return 0.5f;
+
+    u = (c - lo) / span;
+    if (u < 0.0f)
+        u = 0.0f;
+    if (u > 1.0f)
+        u = 1.0f;
+    return u;
+}
+
+float dyt_vm_bar_temp(float frac, float lo, float hi)
+{
+    if (frac < 0.0f)
+        frac = 0.0f;
+    if (frac > 1.0f)
+        frac = 1.0f;
+    return lo + frac * (hi - lo);
+}
+
 /* ----------------------------------------------------------- device panel */
 
 /* A parameter's effective value: the runtime override if this session sent

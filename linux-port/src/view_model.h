@@ -119,6 +119,20 @@ int dyt_vm_bar_index(int row, int rows);
  * (snap->lo).  Returns 0 on success, -1 on a bad argument. */
 int dyt_vm_bar_label(const dyt_snapshot_t *snap, int which, char *out, size_t n);
 
+/* Where a temperature sits on the colour bar, as a fraction from the bottom.
+ *
+ * The bar is a *scale* over a temperature range, and these two are the scale
+ * and its inverse: the Qt canvas uses them to put the Windows panel's two
+ * range handles at the right height and to read back where a dragged handle
+ * landed.  Keeping them here rather than in the widget is what lets --selftest
+ * pin the round-trip with no window and no session.
+ *
+ * A zero-width range has no meaningful fraction, so it reports the middle
+ * rather than dividing by zero.  Both clamp, so a temperature outside the
+ * scale (or a fraction off the end) still lands on the bar instead of off it. */
+float dyt_vm_bar_frac(float c, float lo, float hi);
+float dyt_vm_bar_temp(float frac, float lo, float hi);
+
 /* ----------------------------------------------------------- device panel */
 
 #define DYT_VM_INFO_MAX_LINES 8
