@@ -37,7 +37,6 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QColor>
-#include <QComboBox>
 #include <QContextMenuEvent>
 #include <QDialog>
 #include <QDoubleSpinBox>
@@ -3498,7 +3497,7 @@ class MainWindow;   /* forward: IconRail reports clicks to the window */
 class IconRail : public QWidget {
 public:
     enum RailItem {
-        Palette = 0, Mark, Rotate, Compare, ResetImage,
+        Palette = 0, Fusion, Mark, Rotate, Compare, ResetImage,
         Tutorials, ContactUs, Setting,
         N_RailItems
     };
@@ -3578,6 +3577,24 @@ public:
             p.setBrush(Qt::NoBrush);
             p.setPen(QPen(white, 1.0));
             p.drawEllipse(circ);
+            break;
+        }
+        case Fusion: {
+            /* Two overlapping planes — the thermal image and the visible one —
+             * with their overlap filled: the fused glyph.  The vendor's own
+             * model switch shows the *current* mode's picture, which needs
+             * assets this package does not ship; the glyph stays a vector and
+             * the button's lit state is what carries the mode (see
+             * sync_actions). */
+            const QRect a(cx - 9, cy - 9, 12, 12);
+            const QRect b(cx - 3, cy - 3, 12, 12);
+            p.setPen(Qt::NoPen);
+            p.setBrush(cyan);
+            p.drawRect(a.intersected(b));
+            p.setBrush(Qt::NoBrush);
+            p.setPen(pen);
+            p.drawRoundedRect(a, 2, 2);
+            p.drawRoundedRect(b, 2, 2);
             break;
         }
         case Mark:
@@ -3673,7 +3690,7 @@ private:
     QPushButton *make_button(RailItem i)
     {
         static const char *const kLabels[N_RailItems] = {
-            "Palette", "Mark", "Rotate", "Compare", "Reset",
+            "Palette", "Fusion", "Mark", "Rotate", "Compare", "Reset",
             "Tutorials", "Contact", "Setting" };
         auto *b = new QPushButton(this);
         b->setObjectName(QStringLiteral("rail"));
@@ -3686,6 +3703,14 @@ private:
         if (i == Mark)
             b->setToolTip(QStringLiteral("Mark — left-click: back to the last "
                                          "tool; right-click: Text / Arrow"));
+        /* Fusion names its patterns, because the glyph cannot: the vendor's
+         * model switch shows the current mode's picture and this package ships
+         * no assets, so the lit state and this list are what say which mode is
+         * on. */
+        if (i == Fusion)
+            b->setToolTip(QStringLiteral("Fusion — the imaging mode "
+                                         "(ir / visible / edge / blend / pip / "
+                                         "edge-black)"));
         b->setIconSize(QSize(24, 24));
         b->setMinimumHeight(48);
         /* Paint the icon into a pixmap once — the glyph never changes. */
@@ -5913,9 +5938,10 @@ public:
         /* ---- Display: the view options the retired menu bar carried.  They
          * are here rather than in the Troubleshoot tab because the reference's
          * tab has exactly four groups and this dialog is the reference's own
-         * catch-all Setting panel.  Palette is deliberately absent: the rail's
-         * Palette item is its popup picker, and two routes to one list would
-         * be one more than the reference has. ---- */
+         * catch-all Setting panel.  Palette *and* Fusion are deliberately
+         * absent: the rail's Palette and Fusion items are their popup pickers,
+         * and two routes to one list would be one more than the reference
+         * has. ---- */
         auto *disp = new QGroupBox(QStringLiteral("Display"), this);
         auto *dlay = new QGridLayout(disp);
         dlay->setContentsMargins(8, 6, 8, 8);
@@ -5946,24 +5972,13 @@ public:
                          });
         dlay->addWidget(ubox, 0, 1);
 
-        /* Fusion — likewise absolute. */
-        dlay->addWidget(new QLabel(QStringLiteral("Fusion"), disp), 1, 0);
-        fusion_ = new QComboBox(disp);
-        fusion_->setObjectName(QStringLiteral("setting"));
-        fusion_->setFocusPolicy(Qt::NoFocus);
-        for (int i = 0; i < DYT_FUSION_N; i++) {
-            const char *nm = dyt_fusion_name((dyt_fusion_t)i);
-            fusion_->addItem(QString::fromUtf8(nm ? nm : "?"));
-        }
-        QObject::connect(fusion_, &QComboBox::currentIndexChanged, this,
-                         [this](int i) {
-                             if (on_fusion)
-                                 on_fusion((dyt_fusion_t)i);
-                         });
-        dlay->addWidget(fusion_, 1, 1);
+        /* Fusion used to sit here as a combo box.  It is a rail item now —
+         * between Palette and Mark, where the vendor's own model switch lives
+         * — so the dialog no longer offers a second route to the same six
+         * patterns.  The rows below are numbered from here. */
 
         /* Zoom — a delta, so it has keys and they are what the buttons run. */
-        dlay->addWidget(new QLabel(QStringLiteral("Zoom"), disp), 2, 0);
+        dlay->addWidget(new QLabel(QStringLiteral("Zoom"), disp), 1, 0);
         auto *zbox = new QWidget(disp);
         auto *zlay = new QHBoxLayout(zbox);
         zlay->setContentsMargins(0, 0, 0, 0);
@@ -5980,21 +5995,21 @@ public:
             zoom_[k == '+' ? 1 : 0] = b;
         }
         zlay->addStretch(1);
-        dlay->addWidget(zbox, 2, 1);
+        dlay->addWidget(zbox, 1, 1);
 
         fullscreen_ = new QCheckBox(QStringLiteral("Full screen"), disp);
         fullscreen_->setObjectName(QStringLiteral("setting"));
         fullscreen_->setFocusPolicy(Qt::NoFocus);
         QObject::connect(fullscreen_, &QCheckBox::clicked, this,
                          [this]() { if (on_key) on_key(Qt::Key_F11); });
-        dlay->addWidget(fullscreen_, 3, 0, 1, 2);
+        dlay->addWidget(fullscreen_, 2, 0, 1, 2);
 
         info_ = new QCheckBox(QStringLiteral("Device panel"), disp);
         info_->setObjectName(QStringLiteral("setting"));
         info_->setFocusPolicy(Qt::NoFocus);
         QObject::connect(info_, &QCheckBox::clicked, this,
                          [this]() { if (on_key) on_key('d'); });
-        dlay->addWidget(info_, 4, 0, 1, 2);
+        dlay->addWidget(info_, 3, 0, 1, 2);
 
         dlay->setColumnStretch(1, 1);
         outer->addWidget(disp);
@@ -6019,7 +6034,7 @@ public:
         outer->addLayout(buttons);
 
         seed(nullptr);
-        sync_display(DYT_UNIT_C, DYT_FUSION_INFRARED, false, false);
+        sync_display(DYT_UNIT_C, false, false);
     }
 
     /* Point every row at the value the session knows, and label the ones the
@@ -6057,17 +6072,12 @@ public:
      * in.  Called on every open beside seed(), for the same reason: a unit
      * changed from the keyboard, or a full screen toggled with F11, must not
      * leave the dialog showing the other one. */
-    void sync_display(dyt_unit_t unit, dyt_fusion_t fusion, bool fullscreen,
-                      bool info)
+    void sync_display(dyt_unit_t unit, bool fullscreen, bool info)
     {
         if (units_) {
             const QSignalBlocker block(units_);
             if (QAbstractButton *b = units_->button((int)unit))
                 b->setChecked(true);
-        }
-        if (fusion_) {
-            const QSignalBlocker block(fusion_);
-            fusion_->setCurrentIndex((int)fusion);
         }
         if (fullscreen_) {
             const QSignalBlocker block(fullscreen_);
@@ -6111,7 +6121,6 @@ public:
         return units_ ? qobject_cast<QPushButton *>(units_->button((int)u))
                       : nullptr;
     }
-    QComboBox *fusion_box() const { return fusion_; }
     QPushButton *retry_button() const { return retry_; }
     QPushButton *zoom_button(bool in) const { return zoom_[in ? 1 : 0]; }
     QPushButton *about_button() const { return about_; }
@@ -6125,7 +6134,6 @@ public:
      * them rather than calling the engine. */
     std::function<void(int)>           on_key;
     std::function<void(dyt_unit_t)>    on_unit;
-    std::function<void(dyt_fusion_t)>  on_fusion;
 
 private:
     static int decimals(dyt_order_type_t t)
@@ -6151,7 +6159,6 @@ private:
     QPushButton    *sends_[DYT_ORDER_DISTANCE + 1] = {};
     /* Display. */
     QButtonGroup *units_      = nullptr;
-    QComboBox    *fusion_     = nullptr;
     QPushButton  *retry_      = nullptr;
     QPushButton  *zoom_[2]    = {};   /* [0] out, [1] in */
     QPushButton  *about_      = nullptr;
@@ -6231,16 +6238,24 @@ public:
          * and as the retired menu items did. */
         panel_->on_key = [this](int k) { handle_key(k); };
 
-        /* The rail's items.  Setting and Contact open a dialog; Palette opens
-         * its picker; Mark and Reset act on the session; Rotate turns the
-         * picture; Tutorials is the guide.  Compare stays a no-op until the
-         * engine behind it exists (the two-board comparison), so no rail button
-         * is ever a control that does nothing *silently* — the one that waits is
-         * documented here and in the README. */
+        /* The rail's items.  Setting and Contact open a dialog; Palette and
+         * Fusion open their pickers; Mark and Reset act on the session; Rotate
+         * turns the picture; Compare switches the panel to its tab; Tutorials
+         * is the guide.  Every one of them reaches something — no rail button
+         * is a control that does nothing *silently*. */
         rail_->on_action = [this](IconRail::RailItem i) {
             switch (i) {
             case IconRail::Palette:
                 show_palette_popup();
+                break;
+            case IconRail::Fusion:
+                /* The imaging mode, as the vendor's own model switch offers it:
+                 * `panel_model_switch` opens `contextMenuStrip_model`, whose
+                 * six items are thermal / visible light / white border / black
+                 * border / fusion / PiP (CAAnalyzer.decompiled.cs:22959-23030).
+                 * The port's list is the engine's own six patterns, so the
+                 * menu, the `f` key and the status line name the same things. */
+                show_fusion_popup();
                 break;
             case IconRail::Mark:
                 /* Back to the tool the user last had.  The panel's Temperature
@@ -6378,23 +6393,18 @@ public:
             /* The Display controls route the same two ways every other
              * control does: through handle_key when the action has a key, and
              * through the session when it is an absolute choice no key can
-             * express (unit, fusion — the same split the retired menu bar
-             * made). */
+             * express (unit — the same split the retired menu bar made).
+             * Fusion is no longer one of them: its picker is the rail's
+             * Fusion item, the way Palette's is the rail's Palette item. */
             settings_->on_key = [this](int k) { handle_key(k); };
             settings_->on_unit = [this](dyt_unit_t u) {
                 if (sess_)
                     dyt_session_set_unit(sess_, u);
             };
-            settings_->on_fusion = [this](dyt_fusion_t f) {
-                if (sess_)
-                    dyt_session_set_fusion(sess_, f);
-            };
         }
         settings_->seed(settings_current());
         settings_->sync_display(
             (dyt_unit_t)(snap_.unit < DYT_UNIT_N ? snap_.unit : DYT_UNIT_C),
-            (dyt_fusion_t)(snap_.fusion < DYT_FUSION_N ? snap_.fusion
-                                                       : DYT_FUSION_INFRARED),
             fullscreen_, view_ && view_->info_shown());
         return settings_;
     }
@@ -6490,6 +6500,45 @@ public:
         menu->addSeparator();
         menu->addAction(key_action(QStringLiteral("Next palette"), '.', "."));
         menu->addAction(key_action(QStringLiteral("Previous palette"), ',', ","));
+        return menu;
+    }
+
+    /* The imaging modes, as the vendor's model switch offers them.
+     * `panel_model_switch` opens `contextMenuStrip_model`, six items that set
+     * the control's background picture: thermal / visible light / white border
+     * / black border / fusion / PiP (CAAnalyzer.decompiled.cs:22959-23030).
+     * The port's six are the engine's own patterns, named with
+     * `dyt_fusion_name()` *verbatim* — the same strings `--fusion`, the status
+     * line's `fusion ir` and the `f` key's cycle all use, so the menu cannot
+     * name a mode the rest of the app calls something else.
+     *
+     * Like the palette picker: rebuilt on each call and owned by its caller,
+     * because the tick has to be the session's *current* pattern.  Public, so
+     * --selftest can inspect it without a nested loop. */
+    QMenu *fusion_menu()
+    {
+        if (!sess_)
+            return nullptr;
+
+        auto *menu = new QMenu(this);
+        auto *grp  = new QActionGroup(menu);
+        grp->setExclusive(true);
+
+        for (int i = 0; i < DYT_FUSION_N; i++) {
+            const char *nm = dyt_fusion_name((dyt_fusion_t)i);
+            QAction *a = plain_action(QString::fromUtf8(nm ? nm : "?"),
+                                      [this, i]() {
+                                          if (sess_)
+                                              dyt_session_set_fusion(
+                                                  sess_, (dyt_fusion_t)i);
+                                      }, true);
+            a->setChecked((int)snap_.fusion == i);
+            grp->addAction(a);
+            menu->addAction(a);
+        }
+
+        menu->addSeparator();
+        menu->addAction(key_action(QStringLiteral("Next pattern"), 'f', "f"));
         return menu;
     }
 
@@ -7213,6 +7262,19 @@ private:
         menu->popup(btn->mapToGlobal(QPoint(0, btn->height())));
     }
 
+    /* Opens fusion_menu() under the rail's button — the same build/show split
+     * and the same popup() rule as the palette picker above, for the same two
+     * reasons. */
+    void show_fusion_popup()
+    {
+        QPushButton *btn = rail_ ? rail_->button(IconRail::Fusion) : nullptr;
+        QMenu *menu = fusion_menu();
+        if (!btn || !menu)
+            return;
+        menu->setAttribute(Qt::WA_DeleteOnClose);
+        menu->popup(btn->mapToGlobal(QPoint(0, btn->height())));
+    }
+
     /* The Mark kinds menu, under whatever position the rail's button reports.
      * The builder is public (see mark_menu); this is the show half, which only
      * the rail's right-click uses. */
@@ -7288,6 +7350,15 @@ private:
             if (QPushButton *b = rail_->button(IconRail::Rotate)) {
                 const QSignalBlocker block(b);
                 b->setChecked(snap_.xform.rot != DYT_ROT_NONE);
+            }
+            /* Fusion is a mode too, and the glyph cannot show which one: the
+             * vendor's model switch swaps its background picture and this
+             * package ships no assets.  So the button is lit whenever the
+             * mode is *not* the plain infrared image — the same "this is not
+             * the default state" reading Rotate's lit state has. */
+            if (QPushButton *b = rail_->button(IconRail::Fusion)) {
+                const QSignalBlocker block(b);
+                b->setChecked(snap_.fusion != DYT_FUSION_INFRARED);
             }
         }
 
@@ -10319,20 +10390,26 @@ static int selftest(const opts &o)
      * menu bar carried.  Pinned for the same reason as every other control:
      * each one must reach the session or the window through the one dispatch,
      * and must show the state the session is in rather than the last thing
-     * clicked.  Unit and fusion are the two the keyboard cannot express (they
-     * are absolute choices), so those go to the session directly, exactly as
-     * the menu bar did; the rest have keys and press them. */
+     * clicked.  Unit is the one the keyboard cannot express (it is an absolute
+     * choice), so it goes to the session directly, exactly as the menu bar did;
+     * the rest have keys and press them.  Fusion is no longer here at all — its
+     * picker is the rail's Fusion item, driven by 53g. */
     {
         SettingsDialog *dlg = win.settings_dialog();
         dyt_snapshot_t  s0{};
         dyt_session_snapshot(sess, &s0, nullptr, 0);
 
-        /* Seeded from the session, not from a default. */
+        /* Seeded from the session *and* the window, not from a default: the
+         * unit comes from the session, the two boxes from the window.  A
+         * dialog that opened showing the last thing clicked rather than the
+         * live state would fail this. */
         const bool seeded =
             dlg->unit_button(s0.unit) &&
             dlg->unit_button(s0.unit)->isChecked() &&
-            dlg->fusion_box() &&
-            dlg->fusion_box()->currentIndex() == (int)s0.fusion;
+            dlg->fullscreen_box() &&
+            dlg->fullscreen_box()->isChecked() == win.fullscreen() &&
+            dlg->info_box() &&
+            dlg->info_box()->isChecked() == fv->info_shown();
 
         /* Unit: an absolute choice, so the radio moves the session itself. */
         const dyt_unit_t want_u =
@@ -10343,22 +10420,13 @@ static int selftest(const opts &o)
         dyt_session_snapshot(sess, &s1, nullptr, 0);
         const bool unit_ok = s1.unit == want_u;
 
-        /* Fusion: likewise.  Driven through the combo's own index so the
-         * signal a user's selection would raise is the one that runs. */
-        const dyt_fusion_t want_f = s1.fusion == DYT_FUSION_BLEND
-                                        ? DYT_FUSION_INFRARED : DYT_FUSION_BLEND;
-        dlg->fusion_box()->setCurrentIndex((int)want_f);
-        dyt_snapshot_t s2{};
-        dyt_session_snapshot(sess, &s2, nullptr, 0);
-        const bool fusion_ok = s2.fusion == want_f;
-
         /* Zoom is a delta, so its buttons press the keys. */
-        const int zoom_before = s2.xform.zoom;
+        const int zoom_before = s1.xform.zoom;
         if (QPushButton *zb = dlg->zoom_button(true))
             zb->click();
-        dyt_snapshot_t s3{};
-        dyt_session_snapshot(sess, &s3, nullptr, 0);
-        const bool zoom_ok = s3.xform.zoom > zoom_before;
+        dyt_snapshot_t s2{};
+        dyt_session_snapshot(sess, &s2, nullptr, 0);
+        const bool zoom_ok = s2.xform.zoom > zoom_before;
         if (QPushButton *zb = dlg->zoom_button(false))
             zb->click();                    /* put it back */
 
@@ -10394,15 +10462,14 @@ static int selftest(const opts &o)
 
         /* Restore the session state this assertion moved. */
         dyt_session_set_unit(sess, s0.unit);
-        dyt_session_set_fusion(sess, s0.fusion);
 
-        const bool ok = dlg && seeded && unit_ok && fusion_ok && zoom_ok &&
+        const bool ok = dlg && seeded && unit_ok && zoom_ok &&
                         fs_ok && fs_restored && info_ok && wired;
         std::printf("  %-4s the Settings Display section drives the session and "
-                    "the window (seeded %s, unit %s, fusion %s, zoom %s, "
+                    "the window (seeded %s, unit %s, zoom %s, "
                     "full screen %s, panel %s, retry+about %s)\n",
                     ok ? "ok" : "FAIL", seeded ? "yes" : "NO",
-                    unit_ok ? "yes" : "NO", fusion_ok ? "yes" : "NO",
+                    unit_ok ? "yes" : "NO",
                     zoom_ok ? "yes" : "NO",
                     (fs_ok && fs_restored) ? "yes" : "NO",
                     info_ok ? "yes" : "NO", wired ? "yes" : "NO");
@@ -10483,6 +10550,65 @@ static int selftest(const opts &o)
         const bool popup_ok = popped != nullptr;
         if (popped)
             popped->close();
+
+        /* --- Fusion.  The imaging mode used to be a combo box in the Settings
+         * dialog's Display group; it is a rail item now, between Palette and
+         * Mark, which is where the vendor's own model switch lives
+         * (`panel_model_switch` opens `contextMenuStrip_model`).  Its popup is
+         * another route to the same six patterns the `f` key cycles and the
+         * status line names, so it is pinned exactly the way the palette
+         * picker is: one entry per pattern, the tick on the session's *current*
+         * one, and a choice that moves the session.
+         *
+         * The mode is first moved *off* the default, because the tick check
+         * would otherwise be vacuous: `ir` is index 0, so a menu that always
+         * marked its first entry would pass against the state the fixture
+         * starts in. */
+        dyt_snapshot_t f_orig{};
+        dyt_session_snapshot(sess, &f_orig, nullptr, 0);
+        dyt_session_set_fusion(sess, DYT_FUSION_BLEND);
+        pm.step();              /* so snap_ (which the picker marks from) is fresh */
+
+        dyt_snapshot_t f0{};
+        dyt_session_snapshot(sess, &f0, nullptr, 0);
+
+        QMenu *fmenu = win.fusion_menu();
+        QList<QAction *> pats;
+        for (QAction *a : fmenu ? fmenu->actions() : QList<QAction *>())
+            if (a->isCheckable())
+                pats.append(a);
+
+        const bool pat_count_ok = fmenu && pats.size() == DYT_FUSION_N;
+        const bool pat_mark_ok  = f0.fusion != DYT_FUSION_INFRARED &&
+                                  f0.fusion >= 0 && f0.fusion < pats.size() &&
+                                  pats[(int)f0.fusion]->isChecked() &&
+                                  !pats[DYT_FUSION_INFRARED]->isChecked();
+
+        bool pat_pick_ok = false;
+        const int want_pat = (f0.fusion == DYT_FUSION_BLEND)
+                                 ? DYT_FUSION_INFRARED : DYT_FUSION_BLEND;
+        if (want_pat >= 0 && want_pat < pats.size()) {
+            pats[want_pat]->trigger();
+            dyt_snapshot_t f1{};
+            dyt_session_snapshot(sess, &f1, nullptr, 0);
+            pat_pick_ok = f1.fusion == want_pat;
+        }
+        delete fmenu;
+
+        /* The rail button opens that popup — the same popup() contract the
+         * palette picker above is held to. */
+        QPushButton *fbtn = rail ? rail->button(IconRail::Fusion) : nullptr;
+        if (fbtn)
+            fbtn->click();
+        QMenu *fpopped = nullptr;
+        for (QMenu *m : win.findChildren<QMenu *>())
+            if (m->isVisible())
+                fpopped = m;
+        const bool fpopup_ok = fpopped != nullptr;
+        if (fpopped)
+            fpopped->close();
+
+        dyt_session_set_fusion(sess, f_orig.fusion);    /* put it back */
 
         /* --- Mark re-arms the last active tool.  'l' makes Line the last
          * active tool, 'n' clears the tool without changing that memory, and
@@ -10634,16 +10760,24 @@ static int selftest(const opts &o)
             panel->tabs()->setCurrentIndex(before_tab);
 
         const bool ok = count_ok && mark_ok && low_ok && high_ok &&
-                        popup_ok && mark_tool_ok && reset_ok && help_ok &&
-                        rot_ok && rot_fit_ok && rot_reset_ok && compare_ok;
+                        popup_ok && pat_count_ok && pat_mark_ok &&
+                        pat_pick_ok && fpopup_ok && mark_tool_ok && reset_ok &&
+                        help_ok && rot_ok && rot_fit_ok && rot_reset_ok &&
+                        compare_ok;
         std::printf("  %-4s the rail's items reach what they claim "
                     "(%d palette entries %s, mark %s, pick %s/%s, popup %s, "
-                    "re-arm %s, reset %s, rotate %s, refit %s, rotate-reset %s, "
-                    "tutorials %s, compare %s)\n",
+                    "%d fusion patterns %s, fusion mark %s, fusion pick %s, "
+                    "fusion popup %s, re-arm %s, reset %s, rotate %s, refit %s, "
+                    "rotate-reset %s, tutorials %s, compare %s)\n",
                     ok ? "ok" : "FAIL", (int)pals.size(),
                     count_ok ? "yes" : "NO", mark_ok ? "yes" : "NO",
                     low_ok ? "yes" : "NO", high_ok ? "yes" : "NO",
-                    popup_ok ? "yes" : "NO", mark_tool_ok ? "yes" : "NO",
+                    popup_ok ? "yes" : "NO", (int)pats.size(),
+                    pat_count_ok ? "yes" : "NO",
+                    pat_mark_ok ? "yes" : "NO",
+                    pat_pick_ok ? "yes" : "NO",
+                    fpopup_ok ? "yes" : "NO",
+                    mark_tool_ok ? "yes" : "NO",
                     reset_ok ? "yes" : "NO", rot_ok ? "yes" : "NO",
                     rot_fit_ok ? "yes" : "NO", rot_reset_ok ? "yes" : "NO",
                     help_ok ? "yes" : "NO", compare_ok ? "yes" : "NO");

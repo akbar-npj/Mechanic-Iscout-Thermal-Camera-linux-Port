@@ -28,8 +28,9 @@ against the default look.
 ```
 MainWindow : QWidget
 └── QHBoxLayout (margins 0, spacing 0)
-    ├── IconRail    (stretch 0)   left rail: Palette / Mark / Rotate / Compare /
-    │                             Reset, then Tutorials / Contact / Setting
+    ├── IconRail    (stretch 0)   left rail: Palette / Fusion / Mark / Rotate /
+    │                             Compare / Reset, then Tutorials / Contact /
+    │                             Setting
     ├── centre column (stretch 1, QVBoxLayout)
     │   ├── FrameView   (stretch 1)   the frame, the colour bar, the bar's labels
     │   │   └── GalleryPanel          the saved-items list, an overlay child widget
@@ -405,10 +406,14 @@ page could not be made to fit a small screen either. 53h checks both halves.
 
 ### The rail
 
-The rail's eight items split three ways: those that act on the session, those
-that open a dialog or a popup, and the one whose engine has not landed.
+The rail's nine items split two ways: those that act on the session, and those
+that open a dialog or a popup. Every one of them reaches something — there is no
+greyed-out placeholder left.
 
-The **top group** acts on the picture. **Palette** opens its picker; **Mark**
+The **top group** acts on the picture. **Palette** opens its picker; **Fusion**
+opens its own, which is the imaging mode — `ir`, `visible`, `edge`, `blend`,
+`pip` and `edge-black`, the engine's six patterns, the same list the `f` key
+cycles; **Mark**
 re-arms the tool the user last had — `sync_actions()` remembers the last
 *active* tool, so `n` clearing the tool does not erase it, and Mark brings it
 back rather than always choosing Spot; a *right-click* on the Mark button opens
@@ -455,6 +460,27 @@ painting, and the button can be driven in a test. The menu deletes itself when
 dismissed. Assertion 53g pins both pick routes (a digit-keyed entry and a keyless
 one), the mark, and that the button opens the picker at all.
 
+The **Fusion picker** sits between Palette and Mark, and is the same kind of
+popup for the same reason. It used to be a combo box in the Settings dialog's
+Display group; it moved here because the imaging mode is a *view* choice, and
+because the vendor puts its own model switch on the main window — the reference's
+`panel_model_switch` opens `contextMenuStrip_model`, whose six items are thermal
+/ visible light / white border / black border / fusion / PiP
+(`CAAnalyzer.decompiled.cs:22959-23030`). The port's six entries are named with
+`dyt_fusion_name()` *verbatim*, so the menu cannot name a mode that `--fusion`,
+the status line's `fusion ir` or the `f` key's cycle calls something else; the
+menu is rebuilt on each open so its tick is the session's current pattern.
+
+The button is checkable and lit while the mode is **not** the plain infrared
+image — the same "this is not the default state" reading Rotate's lit state has.
+That is carrying weight here rather than decoration: the vendor's model switch
+shows the current mode by swapping its background *picture*, and this package
+ships no assets, so the vector glyph plus the lit state are what say which mode
+is on. The tooltip names the six patterns for the same reason. Assertion 53g
+moves the mode off the default first, then checks the menu's entry count, that
+the tick is on the *current* pattern and not on entry 0, that choosing an entry
+moves the session, and that the rail button opens the popup.
+
 The **bottom group** is Tutorials, Contact and Setting. Tutorials opens the same
 guide the Help item does. Contact is a read-only information panel — the Windows
 app's "Contact us" has nothing to act on — in a `QTextBrowser` so an address can
@@ -491,18 +517,20 @@ reported falls back to the ladder. The same assertion drives the rail's Setting
 button, so the wiring is pinned too, and requires the dialog to be modeless.
 
 The dialog has a second group, **Display**, holding the view options the retired
-menu bar carried: Unit, Fusion, Zoom, Full screen and the device panel. They live
+menu bar carried: Unit, Zoom, Full screen and the device panel. They live
 here rather than in the Troubleshoot tab because the reference's tab has exactly
 four groups (Temperature Measurement / Analysis / High Temperature / Image
 Enhancement), and this dialog is the reference's own catch-all Setting panel —
-the same reason it is the rail's catch-all item. Palette is deliberately absent:
-the rail's Palette item *is* its popup picker, and two routes to one list would be
-one more than the reference has.
+the same reason it is the rail's catch-all item. Palette *and* Fusion are
+deliberately absent: the rail's Palette and Fusion items *are* their popup
+pickers, and two routes to one list would be one more than the reference has.
+(Fusion used to be a combo box here; it moved onto the rail — see
+[The rail](#the-rail) — and the Display group's grid was renumbered behind it.)
 
 Each Display control routes the same way every other control does: through
 `handle_key` when the action has a key (`+`/`-` for zoom, F11, `d`, `r`, `?`),
-and to the session when it is an absolute choice no key can express (Unit,
-Fusion — the same split the menu bar made). Like the parameter rows, they are
+and to the session when it is an absolute choice no key can express (Unit — the
+same split the menu bar made). Like the parameter rows, they are
 re-seeded on every open, so a unit changed from the keyboard or a full screen
 toggled with F11 cannot leave the dialog showing the other one. Assertion 53f
 pins all of it, including that the full-screen checkbox *presses F11* rather than
@@ -550,7 +578,8 @@ duplication.
 | Quit | the window's close button, and `q` |
 | Full screen / Device panel | the Settings dialog's **Display** group |
 | Palette, and Next/Previous | the rail's **Palette** popup |
-| Unit, Fusion | the Settings dialog's **Display** group |
+| Unit | the Settings dialog's **Display** group |
+| Fusion | the rail's **Fusion** popup |
 | Zoom in / out | the Settings dialog's **Display** group |
 | Fixed range, Flip H, Flip V | the Troubleshoot tab's **Image Enhancement** group |
 | Super-resolution Off / Visible / Thermal | the **Super Resolution** tab |
@@ -1487,12 +1516,12 @@ $ ./build/dytqt --selftest
   ok   the tracking key hides and shows the extremes (hidden yes, back yes, drawing changed yes)
   ok   the checkmarks follow the frame, not the click (flip h 0 then 1, matched yes / yes)
   ok   the control panel cannot take the keyboard (35 control(s), 0 that would)
-  ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
+  ok   the icon rail cannot take the keyboard (9 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
   ok   the Settings dialog opens from the rail, is modeless, and sends what its fields hold through the ladder's own write path (4 row(s), open yes, modeless yes, seeded yes, sent yes, refusal yes, re-seeded yes)
-  ok   the Settings Display section drives the session and the window (seeded yes, unit yes, fusion yes, zoom yes, full screen yes, panel yes, retry+about yes)
-  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
+  ok   the Settings Display section drives the session and the window (seeded yes, unit yes, zoom yes, full screen yes, panel yes, retry+about yes)
+  ok   the rail's items reach what they claim (28 palette entries yes, mark yes, pick yes/yes, popup yes, 6 fusion patterns yes, fusion mark yes, fusion pick yes, fusion popup yes, re-arm yes, reset yes, rotate yes, refit yes, rotate-reset yes, tutorials yes, compare yes)
   ok   the control panel asks for its content's height (panel 1050 of 1050, page 1024 of 1024, shrinks yes, keeps yes, scrolls yes)
   ok   the canvas fits the window when there is room (1:1 yes, grown 1.39x yes, centred yes, back yes)
   ok   a click at a scaled position names the right pixel (1.39x, (511,382) -> (85,64), wanted (85,64))
