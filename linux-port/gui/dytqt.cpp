@@ -3342,6 +3342,14 @@ struct SurfaceModel {
      * backend or resizing does not move the view. */
     float yaw = kSurfaceYaw0, pitch = kSurfacePitch0, zoom = kSurfaceZoom0;
 
+    /* The Windows 3D page's height mode: Morphological Change (the window)
+     * or Color Changes (the grid).  Held here rather than in the widget
+     * because it is an input to the mesh, not to the drawing. */
+    int mode_ = DYT_SURFACE_SHAPE;
+
+    void set_mode(int m) { mode_ = m; }
+    int  mode() const { return mode_; }
+
     bool empty() const { return verts.empty() || idx.empty(); }
     long tri_count() const { return (long)(idx.size() / 3); }
     long vertex_count() const { return (long)verts.size(); }
@@ -3385,41 +3393,55 @@ struct SurfaceModel {
 
         w = dw;
         h = dh;
+
+        /* The grid's own finite extremes, read off the decimated copy — the
+         * same numbers dyt_surface_vertices() would compute, but needed before
+         * the mesh exists so the height range can be chosen first. */
+        float gzlo = 0.0f, gzhi = 0.0f;
+        bool  seen = false;
+        for (size_t k = 0; k < small.size(); k++) {
+            const float z = small[k];
+            if (!std::isfinite(z))
+                continue;
+            if (!seen || z < gzlo) gzlo = z;
+            if (!seen || z > gzhi) gzhi = z;
+            seen = true;
+        }
+
+        /* Which range the height is normalised across is the Windows page's
+         * two modes: the display window (Morphological Change, its default)
+         * or the grid's own extremes (Color Changes).  The colour is the
+         * window's either way, so only the shape moves. */
+        float zlo = gzlo, zhi = gzhi;
+        if (seen && dyt_surface_z_range(mode_, gzlo, gzhi, lo, hi,
+                                        &zlo, &zhi) != 0) {
+            zlo = gzlo;
+            zhi = gzhi;
+        }
+
         verts.resize((size_t)w * h);
         idx.resize((size_t)dyt_surface_index_count(w, h));
-        if (dyt_surface_vertices(small.data(), w, h, verts.data()) != 0 ||
+        if (dyt_surface_vertices_range(small.data(), w, h, zlo, zhi - zlo,
+                                       verts.data()) != 0 ||
             dyt_surface_indices(w, h, idx.data()) != 0) {
             clear();
             return;
         }
 
         /* Display positions: x,y are already in [-1, 1]; the height is the
-         * temperature normalised to [0, 1].  Normalising here rather than in
-         * the renderers is what keeps the engine's normals — computed on the
-         * same normalised height — describing the shape that is actually
-         * drawn, and it gives the surface a sensible aspect whatever the
-         * Celsius range happens to be. */
-        float zlo = 0.0f, zhi = 0.0f;
-        bool  seen = false;
-        for (size_t k = 0; k < verts.size(); k++) {
-            const float z = verts[k].z;
-            if (!std::isfinite(z))
-                continue;
-            if (!seen || z < zlo) zlo = z;
-            if (!seen || z > zhi) zhi = z;
-            seen = true;
-        }
-        const float zrange = seen ? zhi - zlo : 0.0f;
+         * temperature normalised to [0, 1] over the same range the engine's
+         * normals were computed from, so the shading describes the shape that
+         * is actually drawn.  dyt_surface_hnorm() is the one definition of
+         * that height — re-deriving it here would let the two clamp
+         * differently. */
+        const float zrange = zhi - zlo;
 
         pos.resize(verts.size() * 3);
         col.resize(verts.size() * 3);
         for (size_t k = 0; k < verts.size(); k++) {
-            float hn = zrange > 0.0f ? (verts[k].z - zlo) / zrange : 0.0f;
-            if (!std::isfinite(hn))
-                hn = 0.0f;
             pos[k * 3 + 0] = verts[k].x;
             pos[k * 3 + 1] = verts[k].y;
-            pos[k * 3 + 2] = hn;
+            pos[k * 3 + 2] = dyt_surface_hnorm(verts[k].z, zlo, zrange);
 
             /* The same lookup the canvas uses, so the two views agree about
              * what a temperature looks like. */
@@ -3721,6 +3743,19 @@ public:
         gl_set_model();
     }
 
+    /* The height mode.  The normalisation is baked into the mesh's positions,
+     * so a change needs the next frame to rebuild it — which is the pump's
+     * job, exactly as it is for a range change on the canvas.  The update()
+     * here is only so the widget repaints promptly. */
+    void set_mode(int m)
+    {
+        if (model_.mode() == m)
+            return;
+        model_.set_mode(m);
+        sw_->update();
+    }
+    int mode() const { return model_.mode(); }
+
     void set_camera(float yaw, float pitch, float zoom)
     {
         model_.yaw = yaw;
@@ -3835,6 +3870,7 @@ public:
         FlipH, FlipV, FixedRange,
         RapidDiag,
         LeakShort, LeakLarge, LeakSmall,
+        SurfShape, SurfColor,
         Still, Record, Gallery,
         SrOff, SrVisible, SrThermal,
         N_Ids
@@ -3870,10 +3906,12 @@ public:
         tabs_->addTab(build_super_resolution(),
                       QStringLiteral("Super Resolution"));
 
-        /* The circuit mode's checkmark is this panel's own state, so it has to
-         * be lit from the same source sync() uses — a frame will not arrive
-         * before the first paint on the fixture path. */
+        /* The circuit mode's and the height mode's checkmarks are this panel's
+         * own state, so they have to be lit from the same sources sync() uses
+         * — a frame will not arrive before the first paint on the fixture
+         * path. */
         sync_leak_marks();
+        sync_surface_marks();
     }
 
     /* A click on the control whose key is `key`.  Set by MainWindow, which owns
@@ -4043,6 +4081,23 @@ public:
         set_checked(btn_[LeakSmall], leak_mode_ == DYT_LEAK_SMALL);
     }
 
+    void sync_surface_marks()
+    {
+        const int m = surface_ ? surface_->mode() : DYT_SURFACE_SHAPE;
+        set_checked(btn_[SurfShape], m == DYT_SURFACE_SHAPE);
+        set_checked(btn_[SurfColor], m == DYT_SURFACE_COLOR);
+    }
+
+    /* The 3D page's height mode.  Held by the SurfaceView (it is an input to
+     * the mesh), so this only forwards and re-lights the rows; the pump
+     * rebuilds the grid on its next frame. */
+    void set_surface_mode(int m)
+    {
+        if (surface_)
+            surface_->set_mode(m);
+        sync_surface_marks();
+    }
+
     /* Bring every checkmark up to date with the frame just painted.  The
      * session-derived states come from `snap`; the four that live on the
      * canvas, the window or this panel (the marker toggle, a running clip, an
@@ -4070,6 +4125,7 @@ public:
         set_checked(btn_[Record],    recording);
         set_checked(btn_[Gallery],   gallery_open);
         sync_leak_marks();
+        sync_surface_marks();
     }
 
     /* The circuit mode is this panel's own state — nothing in the snapshot
@@ -4379,10 +4435,27 @@ private:
         clay->addWidget(reset);
         lay->addWidget(cam);
 
+        /* The Windows page's pair of height buttons, with its own labels.  The
+         * keys are the shift forms: 'p' is the point tool and 'c' is chart
+         * analysis, and handle_key reads them above the fold so neither can
+         * fall through. */
+        QGroupBox *ht = group(QStringLiteral("Height"));
+        auto *hgrp = new QButtonGroup(this);
+        hgrp->setExclusive(true);
+        hgrp->addButton(row(ht, SurfShape,
+                            QStringLiteral("Morphological Change"), 'P', true));
+        hgrp->addButton(row(ht, SurfColor,
+                            QStringLiteral("Color Changes"), 'C', true));
+        lay->addWidget(ht);
+
         auto *hint = new QLabel(
             QStringLiteral("Drag to rotate, scroll to zoom.  Height is the "
                            "temperature and colour is the active palette, so "
-                           "the surface and the canvas agree."), page);
+                           "the surface and the canvas agree.  Morphological "
+                           "Change scales the height to the display range; "
+                           "Color Changes scales it to the frame's own "
+                           "extremes and leaves the window to the colour."),
+            page);
         hint->setObjectName(QStringLiteral("hint3d"));
         hint->setWordWrap(true);
         hint->setFocusPolicy(Qt::NoFocus);
@@ -4836,6 +4909,27 @@ private:
                           << QPointF(cx - 5, cy - 1) << QPointF(cx - 3, cy + 7));
             p.setPen(QPen(cyan, 1.3));
             p.drawLine(cx + 3, cy - 6, cx + 3, cy + 6);
+            break;
+        case SurfShape:
+            /* a landscape: two ridges and a valley, the shape the height
+             * carries. */
+            p.drawPolyline(QPolygonF()
+                           << QPointF(cx - 8, cy + 5) << QPointF(cx - 4, cy - 4)
+                           << QPointF(cx - 1, cy + 2) << QPointF(cx + 2, cy - 6)
+                           << QPointF(cx + 8, cy + 5));
+            p.setPen(QPen(cyan, 1.0, Qt::DotLine));
+            p.drawLine(cx - 8, cy + 6, cx + 8, cy + 6);
+            break;
+        case SurfColor:
+            /* three swatches: the palette doing the talking. */
+            p.setPen(Qt::NoPen);
+            for (int s = 0; s < 3; s++) {
+                p.setBrush(s == 0 ? QColor(40, 90, 200)
+                          : s == 1 ? QColor(60, 200, 120)
+                                   : QColor(230, 160, 40));
+                p.drawRect(cx - 7 + s * 5, cy - 6, 4, 12);
+            }
+            p.setBrush(Qt::NoBrush);
             break;
         case Still:
             /* a camera */
@@ -6100,6 +6194,15 @@ public:
             return 1;
         }
 
+        /* The 3D page's height mode, also on its shift forms — 'p' is the
+         * point tool and 'c' is chart analysis, and both would otherwise be
+         * reached by the fold. */
+        if ((raw == 'P' || raw == 'C') && panel_ && panel_->surface()) {
+            panel_->set_surface_mode(raw == 'P' ? DYT_SURFACE_SHAPE
+                                                : DYT_SURFACE_COLOR);
+            return 1;
+        }
+
         /* How the picture is shown: palette, unit, range, flip, zoom, fusion.
          * Routed with the unfolded character, because two of the bindings are
          * Shift forms ('H' flips vertically where 'h' flips horizontally) and
@@ -6684,6 +6787,7 @@ static const key_line_t kKeyLines[] = {
     { "the picture", "  t             range auto/fixed\n" },
     { "the picture", "  F             rapid diagnostics: auto-fit the range\n" },
     { "the picture", "  S L M         circuit: short / large leak / small leak\n" },
+    { "the picture", "  P C           3D height: morphological / colour changes\n" },
     { "the picture", "  h H           flip horizontally / vertically\n" },
     { "the picture", "  + -           zoom\n" },
     { "the picture", "  z Z           super-resolve the visible / thermal plane\n" },
@@ -10316,6 +10420,119 @@ static int selftest(const opts &o)
                         "%s)\n", ok ? "ok" : "FAIL", row_ok ? "yes" : "NO",
                         def_ok ? "yes" : "NO", large_ok ? "yes" : "NO",
                         small_ok ? "yes" : "NO", short_ok ? "yes" : "NO");
+            if (!ok)
+                fails++;
+        }
+
+        /* ---- 67. The 3D page's height modes ------------------------------
+         *
+         * The two modes differ only in the range the mesh's height is
+         * normalised across, so they are indistinguishable until the window is
+         * *narrower* than the frame — which is the state this sets up.  A
+         * narrow window makes the shape mode clamp most of the scene into
+         * plateaus at 0 and 1; the colour mode, normalising across the frame's
+         * own extremes, clamps almost nothing.  Counting the clamped vertices
+         * is what separates them. */
+        {
+            ControlPanel *panel = win.panel();
+            SurfaceView  *surf  = panel ? panel->surface() : nullptr;
+
+            bool rows_ok = false, key_ok = false, shape_ok = false,
+                 color_ok = false, differ_ok = false, inrange_ok = false;
+
+            /* How many vertices sit at exactly 0 or 1 — the plateaus.  The
+             * heights are also required to *be* in [0, 1]: the vendor clamps
+             * its height index (:2636), and an unclamped one would put the
+             * mesh far off the viewport rather than plateauing. */
+            auto clamped_frac = [&](bool *in_range) -> double {
+                *in_range = true;
+                if (!surf)
+                    return -1.0;
+                const SurfaceModel &m = surf->model();
+                long n = 0, c = 0;
+                for (size_t k = 0; k < m.verts.size(); k++) {
+                    if (!std::isfinite(m.verts[k].z))
+                        continue;
+                    n++;
+                    const float h = m.pos[k * 3 + 2];
+                    if (!(h >= 0.0f && h <= 1.0f))
+                        *in_range = false;
+                    if (h <= 0.0f || h >= 1.0f)
+                        c++;
+                }
+                return n ? (double)c / (double)n : -1.0;
+            };
+
+            if (surf && panel) {
+                send_char(27);
+                panel->tabs()->setCurrentIndex(ControlPanel::TabAnalysis3D);
+                dyt_session_reset_view(sess);
+                pm.step();
+
+                QPushButton *ps = panel->button(ControlPanel::SurfShape);
+                QPushButton *pc = panel->button(ControlPanel::SurfColor);
+                rows_ok = ps && pc &&
+                          ps->text() == QStringLiteral("Morphological Change") &&
+                          pc->text() == QStringLiteral("Color Changes") &&
+                          surf->mode() == DYT_SURFACE_SHAPE &&
+                          ps->isChecked() && !pc->isChecked();
+
+                dyt_snapshot_t s{};
+                dyt_session_snapshot(sess, &s, nullptr, 0);
+                const float span = s.stats.hi - s.stats.lo;
+                const float mid  = (s.stats.hi + s.stats.lo) * 0.5f;
+
+                if (span > 0.2f) {
+                    /* A fifth of the frame's span: most of the scene falls
+                     * outside it. */
+                    dyt_session_set_fixed_range(sess, mid - span * 0.1f,
+                                                mid + span * 0.1f);
+                    pm.step();
+
+                    send_char('P');
+                    pm.step();
+                    dyt_snapshot_t sp{};
+                    dyt_session_snapshot(sess, &sp, nullptr, 0);
+                    bool shape_in = false;
+                    const double shape_frac = clamped_frac(&shape_in);
+
+                    send_char('C');
+                    pm.step();
+                    dyt_snapshot_t sc{};
+                    dyt_session_snapshot(sess, &sc, nullptr, 0);
+                    bool color_in = false;
+                    const double color_frac = clamped_frac(&color_in);
+
+                    /* The keys must not have been folded into the tools they
+                     * shadow: 'P' is not the point tool and 'C' is not chart
+                     * analysis, which would have picked up the line tool. */
+                    key_ok = surf->mode() == DYT_SURFACE_COLOR &&
+                             pc && pc->isChecked() && ps && !ps->isChecked() &&
+                             sp.tool != DYT_TOOL_POINT &&
+                             sc.tool != DYT_TOOL_LINE;
+
+                    shape_ok = shape_frac > 0.25;
+                    color_ok = color_frac >= 0.0 && color_frac < 0.10;
+                    differ_ok = shape_frac > color_frac + 0.20;
+                    inrange_ok = shape_in && color_in;
+                }
+
+                panel->set_surface_mode(DYT_SURFACE_SHAPE);
+                dyt_session_reset_view(sess);
+                panel->tabs()->setCurrentIndex(ControlPanel::TabTroubleshoot);
+                pm.step();
+            }
+
+            const bool ok = rows_ok && key_ok && shape_ok && color_ok &&
+                            differ_ok && inrange_ok;
+            std::printf("  %-4s the 3D height modes scale the mesh to the "
+                        "window or to the frame (rows %s, keys %s, shape "
+                        "clamps %s, colour clamps %s, differ %s, in range "
+                        "%s)\n",
+                        ok ? "ok" : "FAIL", rows_ok ? "yes" : "NO",
+                        key_ok ? "yes" : "NO", shape_ok ? "yes" : "NO",
+                        color_ok ? "yes" : "NO", differ_ok ? "yes" : "NO",
+                        inrange_ok ? "yes" : "NO");
             if (!ok)
                 fails++;
         }

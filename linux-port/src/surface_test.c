@@ -404,6 +404,91 @@ static void test_build(void)
              dyt_surface_build(t, 0, H, v, idx), -1);
 }
 
+/* The 3D page's two height modes.  The interesting case is a display window
+ * *narrower* than the grid: then the shape and the colour modes disagree, and
+ * only a grid whose data runs outside the window can tell them apart. */
+static void test_modes(void)
+{
+    float                t[NPIX];
+    dyt_surface_vertex_t v[NPIX];
+    float                zlo = 0.0f, zhi = 0.0f;
+
+    build_ramp_x(t);                 /* 0, 1, 2, 3, 4 per row */
+
+    /* The shape mode takes the window; the colour mode the grid. */
+    intcheck("modes: shape takes the window",
+             dyt_surface_z_range(DYT_SURFACE_SHAPE, 0.0f, 4.0f, 1.0f, 3.0f,
+                                 &zlo, &zhi), 0);
+    const bool shape_ok = (zlo == 1.0f && zhi == 3.0f);
+    intcheck("modes: colour takes the grid",
+             dyt_surface_z_range(DYT_SURFACE_COLOR, 0.0f, 4.0f, 1.0f, 3.0f,
+                                 &zlo, &zhi), 0);
+    const bool color_ok = (zlo == 0.0f && zhi == 4.0f);
+    if (shape_ok && color_ok)
+        ok("modes: the two ranges are the window and the grid");
+    else
+        fail("modes: the two ranges are the window and the grid", "no");
+
+    /* The vendor's default is the shape (:8858), and 0 is that value. */
+    boolcheck("modes: Morphological Change is the default value",
+              DYT_SURFACE_SHAPE == 0 && DYT_SURFACE_COLOR == 1);
+
+    intcheck("modes: a null output is refused",
+             dyt_surface_z_range(DYT_SURFACE_SHAPE, 0, 4, 1, 3, NULL, &zhi),
+             -1);
+    intcheck("modes: an unknown mode is refused",
+             dyt_surface_z_range(7, 0.0f, 4.0f, 1.0f, 3.0f, &zlo, &zhi), -1);
+    intcheck("modes: a non-finite end is refused",
+             dyt_surface_z_range(DYT_SURFACE_SHAPE, 0.0f, NAN, 1.0f, 3.0f,
+                                 &zlo, &zhi), -1);
+
+    /* The height itself: clamped into the range, so data outside the window
+     * saturates into a plateau the way the vendor's own clamp makes it. */
+    floatcheck("modes: the range's floor is 0", dyt_surface_hnorm(1.0f, 1.0f, 2.0f), 0.0f, 1e-6f);
+    floatcheck("modes: the range's top is 1", dyt_surface_hnorm(3.0f, 1.0f, 2.0f), 1.0f, 1e-6f);
+    floatcheck("modes: the middle is a half", dyt_surface_hnorm(2.0f, 1.0f, 2.0f), 0.5f, 1e-6f);
+    floatcheck("modes: below the range clamps to 0", dyt_surface_hnorm(-5.0f, 1.0f, 2.0f), 0.0f, 1e-6f);
+    floatcheck("modes: above the range clamps to 1", dyt_surface_hnorm(50.0f, 1.0f, 2.0f), 1.0f, 1e-6f);
+    floatcheck("modes: a flat range is a flat sheet", dyt_surface_hnorm(2.0f, 2.0f, 0.0f), 0.0f, 1e-6f);
+    floatcheck("modes: a non-finite height is the floor", dyt_surface_hnorm(NAN, 1.0f, 2.0f), 0.0f, 1e-6f);
+
+    /* Through the mesh: the same grid, the same window, the two modes, and
+     * the vertex heights must differ because the ranges differ.  The ramp runs
+     * 0..3 and the window is 1..2, so in shape mode both ends saturate and in
+     * colour mode they are the grid's own 0 and 1. */
+    intcheck("modes: shape mesh builds",
+             dyt_surface_vertices_range(t, W, H, 1.0f, 1.0f, v), 0);
+    const float shape_lo = dyt_surface_hnorm(v[0].z, 1.0f, 1.0f);
+    const float shape_hi = dyt_surface_hnorm(v[W - 1].z, 1.0f, 1.0f);
+    const bool shape_ends = (shape_lo == 0.0f && shape_hi == 1.0f);
+
+    intcheck("modes: colour mesh builds",
+             dyt_surface_vertices_range(t, W, H, 0.0f, 3.0f, v), 0);
+    const float color_lo = dyt_surface_hnorm(v[0].z, 0.0f, 3.0f);
+    const float color_hi = dyt_surface_hnorm(v[W - 1].z, 0.0f, 3.0f);
+    const bool color_ends = (color_lo == 0.0f && color_hi == 1.0f);
+
+    /* The same grid drawn with a window it overruns: in shape mode anything
+     * past the window's top shares the edge's height — the plateau. */
+    const float at_edge = dyt_surface_hnorm(v[W - 1].z, 1.0f, 1.0f);
+    const float past    = dyt_surface_hnorm(v[W - 1].z + 9.0f, 1.0f, 1.0f);
+    const bool plateau  = (at_edge == 1.0f && past == 1.0f);
+
+    if (shape_ends && color_ends && plateau)
+        ok("modes: the shape mode saturates where the colour mode does not");
+    else
+        fail("modes: the shape mode saturates where the colour mode does not",
+             "no");
+
+    /* dyt_surface_vertices() must still be the grid's own span — the wrapper
+     * is what every existing caller uses. */
+    intcheck("modes: the plain entry point is unchanged",
+             dyt_surface_vertices(t, W, H, v), 0);
+    floatcheck("modes: its heights run the grid", v[0].z, 0.0f, 1e-6f);
+    floatcheck("modes: its heights run the grid (top)",
+               v[W - 1].z, 3.0f, 1e-6f);
+}
+
 int main(void)
 {
     printf("=== surface_test (mesh / normals / NaN) ===\n");
@@ -415,6 +500,7 @@ int main(void)
     test_nan();
     test_view();
     test_build();
+    test_modes();
 
     if (fails) {
         printf("=== %d FAILURE(S) ===\n", fails);

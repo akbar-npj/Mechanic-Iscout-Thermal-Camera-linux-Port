@@ -66,22 +66,63 @@ static void finite_span(const float *temps, size_t npix, float *lo, float *range
     *range = seen ? zmax - zmin : 0.0f;
 }
 
-/* The normalised height at (i, j): 0..1 across the finite range, with a
- * non-finite sample sitting at the floor.  A flat grid is all zeros, so
- * every normal comes out (0, 0, 1). */
+/* The normalised height at (i, j): 0..1 across [zlo, zlo+zrange], clamped,
+ * with a non-finite sample sitting at the floor.  A flat grid is all zeros,
+ * so every normal comes out (0, 0, 1). */
 static double hnorm(const float *temps, int w, float floor,
                     float zlo, float zrange, int i, int j)
 {
     float z = temps[(size_t)j * (size_t)w + (size_t)i];
     if (!isfinite(z))
         z = floor;
-    return zrange > 0.0f ? (double)((z - zlo) / zrange) : 0.0;
+    return (double)dyt_surface_hnorm(z, zlo, zrange);
 }
 
-int dyt_surface_vertices(const float *temps, int w, int h,
-                         dyt_surface_vertex_t *verts)
+float dyt_surface_hnorm(float z, float zlo, float zrange)
 {
-    float  floor, zlo, zrange;
+    double h;
+
+    if (!isfinite(z) || !isfinite(zlo) || !isfinite(zrange) ||
+        !(zrange > 0.0f))
+        return 0.0f;
+
+    h = ((double)z - (double)zlo) / (double)zrange;
+    if (h < 0.0)
+        h = 0.0;
+    if (h > 1.0)
+        h = 1.0;
+    return (float)h;
+}
+
+int dyt_surface_z_range(int mode, float grid_lo, float grid_hi,
+                        float win_lo, float win_hi,
+                        float *out_lo, float *out_hi)
+{
+    if (!out_lo || !out_hi)
+        return -1;
+    if (!isfinite(grid_lo) || !isfinite(grid_hi) ||
+        !isfinite(win_lo) || !isfinite(win_hi))
+        return -1;
+
+    switch (mode) {
+    case DYT_SURFACE_SHAPE:
+        *out_lo = win_lo;
+        *out_hi = win_hi;
+        return 0;
+    case DYT_SURFACE_COLOR:
+        *out_lo = grid_lo;
+        *out_hi = grid_hi;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+int dyt_surface_vertices_range(const float *temps, int w, int h,
+                               float zlo, float zrange,
+                               dyt_surface_vertex_t *verts)
+{
+    float  floor;
     double dx, dy;
     size_t npix;
     int    i, j;
@@ -91,7 +132,6 @@ int dyt_surface_vertices(const float *temps, int w, int h,
 
     npix = (size_t)w * (size_t)h;
     finite_floor(temps, npix, &floor);
-    finite_span(temps, npix, &zlo, &zrange);
 
     dx = (w > 1) ? 2.0 / (double)(w - 1) : 1.0;
     dy = (h > 1) ? 2.0 / (double)(h - 1) : 1.0;
@@ -138,6 +178,20 @@ int dyt_surface_vertices(const float *temps, int w, int h,
         }
     }
     return 0;
+}
+
+int dyt_surface_vertices(const float *temps, int w, int h,
+                         dyt_surface_vertex_t *verts)
+{
+    float  zlo, zrange;
+    size_t npix;
+
+    if (!temps || !verts || w <= 0 || h <= 0)
+        return -1;
+
+    npix = (size_t)w * (size_t)h;
+    finite_span(temps, npix, &zlo, &zrange);
+    return dyt_surface_vertices_range(temps, w, h, zlo, zrange, verts);
 }
 
 int dyt_surface_indices(int w, int h, uint32_t *idx)

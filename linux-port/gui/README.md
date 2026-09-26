@@ -198,16 +198,37 @@ Colour comes from the **active palette**, through the same `dyt_palette_index()`
 lookup the canvas uses, at the same display range the snapshot resolved — so a
 peak reads the same colour in the surface as in the 2D view. The mesh is
 decimated to at most 96x96 (stride-subsampled, both ends pinned) so the software
-renderer stays interactive; the height is the temperature normalised to [0, 1],
-which is the same normalisation the engine's normals were computed on, so the
-shading describes the shape actually drawn. Drag orbits, the wheel zooms, and
-**Reset view** returns to the opening camera. Assertion 60 builds a mesh from a
-live frame, checks the first and last vertices are the first and last source
-pixels (so the height is the frame's temperature, not a fiction), checks every
-colour against the palette lookup, drives the camera with a synthetic drag and
-wheel, and grabs the software renderer to require a sizeable, roughly *square*
-patch of many shades — square being the check that the aspect term in the
-matrix still keeps the mesh square in a wide viewport.
+renderer stays interactive. Drag orbits, the wheel zooms, and **Reset view**
+returns to the opening camera. Assertion 60 builds a mesh from a live frame,
+checks the first and last vertices are the first and last source pixels (so the
+height is the frame's temperature, not a fiction), checks every colour against
+the palette lookup, drives the camera with a synthetic drag and wheel, and grabs
+the software renderer to require a sizeable, roughly *square* patch of many
+shades — square being the check that the aspect term in the matrix still keeps
+the mesh square in a wide viewport.
+
+The page's **Height** group is the Windows page's pair of buttons, with its own
+labels. `Morphological Change` (the vendor's default, `TempWidthType = 0`)
+normalises the mesh's height across the **display window**, so the landscape is
+stretched to the same range the canvas is, and data outside the window saturates
+into a plateau exactly as the vendor's own clamp makes it. `Color Changes`
+normalises across the **frame's own extremes** and leaves the window to the
+colour. Only the height differs: the vendor's renderer takes the colour from the
+window-normalised index in both branches, and so does this one.
+
+Two consequences worth knowing. The modes are indistinguishable while the range
+is auto — with no window engaged the two ranges are the same numbers — which is
+also true of the vendor, whose `is_temp_width` is false until a window is set.
+And the *normals* have to be computed on the same field the shape is drawn with,
+so `dyt_surface_vertices_range()` takes the range rather than deriving it and
+`dyt_surface_hnorm()` is the one definition of a vertex's height, used by both
+the engine and the widget — a surface shaded for a different scaling would light
+as though it were a different landscape. Assertion 67 is the one that separates
+the two: it sets a window a fifth of the frame wide, counts the vertices clamped
+to exactly 0 or 1, and requires the shape mode to clamp most of the scene while
+the colour mode clamps almost none, that every drawn height is inside [0, 1],
+and that the `P`/`C` keys were not folded into the point tool and chart analysis
+they shadow.
 
 **Comparison** is the tab the Windows panel puts between Troubleshoot and
 Circuit Design. The engine is `src/compare.c` — a pure-C, no-allocation module
@@ -1224,8 +1245,10 @@ only there because the port's super-resolution model was recovered against it.
 Once the window is up, `p`/`l`/`b`/`n` place and clear measurements, `a` arms the
 alarm and `i` shows the isotherm, `z`/`Z` turn on super-resolution, `s` saves a
 still and `v` records a clip, `g` browses what has been saved (and opens a still
-or plays a clip; `space` pauses it), `d` shows the device panel, and with
-`--live` the window reconnects on its own while `R` retries immediately — see
+or plays a clip; `space` pauses it), `d` shows the device panel, `S`/`L`/`M` pick
+the circuit mode, `F` auto-fits the range and `P`/`C` pick the 3D page's height
+mode — and with `--live` the window reconnects on its own while `R` retries
+immediately — see
 "Measurement and alarm", "Super-resolution", "Capture: stills and clips" and
 "The gallery". `F11` is full screen, and the picture scales up to fill a window
 enlarged by hand — see "Fit to window and full screen".
@@ -1304,7 +1327,8 @@ $ ./build/dytqt --selftest
   ok   the colour bar's range handles sit on the frame's scale, drag the window and reset to auto (geometry yes, painted yes, drag yes, moved yes, auto yes)
   ok   rapid diagnostics latches a fixed window over the frame, by the key and by the row (row yes, mode yes, contains yes, reframe yes, idempotent yes, row-same yes)
   ok   the circuit modes set the range and the view (rows yes, default yes, large yes, small yes, short yes)
-  ok   the control panel cannot take the keyboard (28 control(s), 0 that would)
+  ok   the 3D height modes scale the mesh to the window or to the frame (rows yes, keys yes, shape clamps yes, colour clamps yes, differ yes, in range yes)
+  ok   the control panel cannot take the keyboard (30 control(s), 0 that would)
   ok   the icon rail cannot take the keyboard (8 button(s), 0 that would)
   ok   the Super Resolution tab reflects the session (mode off, model loaded, plane yes, off yes)
   ok   every control-panel tab fits, with no scroll arrow (5 tab(s), 415 px of 438)
@@ -1492,7 +1516,7 @@ worth naming one by one:
   somewhere else while looking entirely plausible.
 
 The last stretch of the parity work — the Windows panel's remaining controls —
-added three more. **64** is the colour bar's two range handles: it reads their
+added four more. **64** is the colour bar's two range handles: it reads their
 geometry off the widget, finds the hot handle's pixel in a render, drags one and
 requires the session to hold the window the drag produced, then double-clicks
 back to auto. **65** is Rapid Diagnostics, and its second half is the one that
@@ -1501,10 +1525,13 @@ bites: pressing it twice must change nothing, because the second press reads the
 the same numbers, so nothing weaker separates them. **66** drives all three
 circuit modes and requires each to set the range the vendor's own handler sets,
 that only Small Current Leakage moves the panel to the 3D tab, and that the
-checkmark follows. The alarm's threshold field is pinned where it is defined
-rather than through the window: `a` must arm at the field's value (assertion
-25), the field's clamp and the vendor's rounding are `view_model_test`'s, and
-the fixed window a fresh session starts with is `session_test`'s.
+checkmark follows. **67** separates the 3D page's two height modes by counting
+clamped vertices under a window narrower than the frame, and requires every
+drawn height to be inside [0, 1] — the vendor's clamp. The alarm's threshold
+field is pinned where it is defined rather than through the window: `a` must arm
+at the field's value (assertion 25), the field's clamp and the vendor's rounding
+are `view_model_test`'s, the height ranges are `surface_test`'s, and the fixed
+window a fresh session starts with is `session_test`'s.
 
 37b is the still writer's 2× case: `save_still()` sizes its buffer from the
 snapshot's factor, so the assertion reads the written PNG's own IHDR back and
