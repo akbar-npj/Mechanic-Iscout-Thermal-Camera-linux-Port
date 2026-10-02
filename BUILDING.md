@@ -4,6 +4,7 @@ This is the build guide for the Linux port. Everything happens inside
 `linux-port/`; the reverse-engineering write-up lives in `RE Docs/` and is not
 needed to build.
 
+- [Automated build script](#automated-build-script)
 - [What gets built](#what-gets-built)
 - [Dependencies](#dependencies)
 - [Build](#build)
@@ -13,6 +14,76 @@ needed to build.
 - [Giving the app access to the camera](#giving-the-app-access-to-the-camera)
 - [Packages](#packages)
 - [Troubleshooting](#troubleshooting)
+
+## Automated build script
+
+`linux-port/build.sh` is a single-file shell script that wraps the Makefile
+and automates the full build → test cycle without requiring you to remember
+any `make` flags.  It validates prerequisites, enforces the mandatory
+`-ffp-contract=off` flag, and prints colour-coded summaries of every step.
+
+### Quick start
+
+```sh
+cd linux-port
+./build.sh                # build + make check (the default)
+./build.sh build          # compile only
+./build.sh check          # regression gate only
+./build.sh build check    # explicit form of the default
+./build.sh deb            # build a .deb  (needs dpkg-deb)
+./build.sh rpm            # build an .rpm (needs rpmbuild)
+./build.sh clean          # remove build/
+./build.sh install        # install to /usr/local
+```
+
+### Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `--jobs N` | `nproc` | parallel build workers |
+| `--jpeg libjpeg` | stb | use libjpeg as the JPEG codec backend instead of vendored stb |
+| `--mnn ROOT` | `third_party/mnn-install` | path to a pre-built MNN install |
+| `--prefix DIR` | `/usr/local` | installation prefix |
+| `--no-mnn-stub` | off | abort if no MNN runtime is found (instead of building the declining stub) |
+| `--version VER` | Makefile default (`0.1.0`) | override the package version string |
+| `--color` / `--no-color` | auto (terminal detection) | force or suppress ANSI colour |
+| `-v` / `--verbose` | off | echo every make command as it runs |
+| `-h` / `--help` | — | print usage and exit |
+
+### Package selection (newest timestamp)
+
+When `build/` contains more than one `.deb` or `.rpm` — for example after
+building multiple versions without running `clean` — the script always
+selects the file with the **newest modification timestamp**.  This means a
+re-run after a version bump verifies the freshly built package rather than
+accidentally reporting success against an old one.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | all requested targets succeeded |
+| `1` | one or more targets failed (failing target(s) printed) |
+| `2` | bad usage or missing prerequisite |
+
+### Examples
+
+```sh
+# Fast parallel build and check
+./build.sh --jobs 8 build check
+
+# Build with libjpeg backend and run only the regression gate
+./build.sh --jpeg libjpeg check
+
+# Build and package a .deb, overriding the version string
+./build.sh --version 0.2.0 build deb
+
+# Build with MNN super-resolution and require it to be present
+./build.sh --mnn third_party/mnn-install --no-mnn-stub build check
+
+# Install to /usr after building
+./build.sh --prefix /usr build install
+```
 
 ## What gets built
 
