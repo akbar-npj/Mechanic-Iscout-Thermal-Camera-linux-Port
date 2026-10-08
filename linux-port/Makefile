@@ -870,6 +870,7 @@ deb: $(BUILD)/dytqt packaging/deb/control.in packaging/deb/copyright \
 RPM_NAME   := dytqt
 RPM_ARCH   := $(shell rpm --eval '%{_arch}'   2>/dev/null || uname -m)
 RPM_LIBDIR := $(shell rpm --eval '%{_libdir}' 2>/dev/null || echo /usr/lib64)
+RPM_USER_TOPDIR := $(shell rpm --eval '%{_topdir}' 2>/dev/null || echo $(HOME)/rpmbuild)
 RPM_TOPDIR ?= $(HOME)/.cache/dytqt/rpmbuild
 RPM_STAGE  ?= $(HOME)/.cache/dytqt/stage
 RPM_SPEC   := packaging/rpm/dytqt.spec
@@ -901,6 +902,11 @@ rpm: $(BUILD)/dytqt $(RPM_SPEC)
 	    --define "_dytqt_version $(VERSION)" \
 	    $(RPM_WITH)
 	cp "$(RPM_TOPDIR)/RPMS/$(RPM_ARCH)/$(RPM_NAME)-$(VERSION)-"*.rpm $(BUILD)/
+	@if [ -d "$(RPM_USER_TOPDIR)" ] && [ "$(RPM_USER_TOPDIR)" != "$(RPM_TOPDIR)" ]; then \
+	    mkdir -p "$(RPM_USER_TOPDIR)/RPMS/$(RPM_ARCH)"; \
+	    cp -f "$(RPM_TOPDIR)/RPMS/$(RPM_ARCH)/$(RPM_NAME)-$(VERSION)-"*.rpm "$(RPM_USER_TOPDIR)/RPMS/$(RPM_ARCH)/"; \
+	    echo "copied $(RPM_NAME)-$(VERSION)-*.rpm to $(RPM_USER_TOPDIR)/RPMS/$(RPM_ARCH)/"; \
+	fi
 	@echo "built $(BUILD)/$(RPM_NAME)-$(VERSION)-*.rpm"
 	@rpm -qp --qf 'name=%{NAME} version=%{VERSION}-%{RELEASE} arch=%{ARCH}\n' \
 	    $(BUILD)/$(RPM_NAME)-$(VERSION)-*.rpm

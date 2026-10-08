@@ -353,7 +353,9 @@ otherwise — the recipe prints which it used). `make rpm` needs `rpmbuild`.
 `make rpm` takes a few variables, all with working defaults: `RPM_TOPDIR`,
 `RPM_STAGE` (both must be space-free paths), and `PREFIX` is set to `/usr`.
 Whether libMNN ships is decided by the same `HAVE_MNN` that decides whether
-`make install` ships it, so the two cannot disagree.
+`make install` ships it, so the two cannot disagree.  When `~/rpmbuild` (or
+`%_topdir`) is present on the system, `make rpm` also copies the package to
+`~/rpmbuild/RPMS/<arch>/`.
 
 ## Troubleshooting
 
