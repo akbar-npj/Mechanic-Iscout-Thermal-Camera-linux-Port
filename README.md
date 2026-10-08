@@ -1,11 +1,12 @@
-# Thermal Camera — Linux port
+# Mechanic iScout Thermal Camera — Linux Port
 
-Porting a DYT (`com.dyt.wcc`) USB thermal camera to Linux. The vendor ships Android
-and Windows software only; there is no Linux support.
+Porting the Mechanic iScout / DYT (`com.dyt.wcc`) USB thermal camera to Linux
+(`Mechanic-Iscout-Thermal-Camera-linux-Port`). The vendor ships Android and Windows
+software only; there is no official Linux support.
 
 The unit is a UVC "dual-vision" module — 256×192 radiometric thermal plus a visible
-camera, 8–14 µm, −15 °C … 600 °C — sold under many OEM brands (Mechanic-Ti, iScout,
-Xtherm, Aixun, MaAnt, MileSeey, QianLi, …).
+camera, 8–14 µm, −15 °C … 600 °C — sold under OEM brands including Mechanic iScout,
+Mechanic-Ti, Xtherm, Aixun, MaAnt, MileSeey, QianLi, etc.
 
 **Status (v0.1.0):** the eight-phase engine roadmap (`RE Docs/08` §8) is complete —
 units and display, measurement and alarms, device read-back and the one parameter
@@ -34,7 +35,8 @@ in `RE Docs/09`.
 ## Build and test
 
 ```bash
-cd linux-port
+git clone https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port.git
+cd Mechanic-Iscout-Thermal-Camera-linux-Port/linux-port
 make            # build
 make check      # regression gate — exits non-zero on any failure
 make clean

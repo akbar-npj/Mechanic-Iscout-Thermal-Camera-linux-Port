@@ -1,8 +1,9 @@
-# Reverse Engineering Documentation — iScout / Mechanic-Ti Thermal Camera
+# Reverse Engineering Documentation — Mechanic iScout / Mechanic-Ti Thermal Camera
 
 **Target:** DYT (德奕通) `com.dyt.wcc` thermal-camera platform, shipped under many OEM brands
 (Mechanic-Ti, iScout, Xtherm, Aixun, MaAnt, MileSeey, QianLi, …).
-**Goal:** Port the vendor's Android/Windows application stack to Linux.
+**Goal:** Port the vendor's Android/Windows application stack to Linux (`Mechanic-Iscout-Thermal-Camera-linux-Port`).
+**Repository:** https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port
 
 **Status of this document set:** produced from a single reconnaissance session.
 Every factual claim is tagged:

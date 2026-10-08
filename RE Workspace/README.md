@@ -1,4 +1,4 @@
-# RE Workspace — Thermal Camera
+# RE Workspace — Mechanic iScout Thermal Camera
 
 Generated analysis artifacts. **Disposable** — everything here is reproducible from
 `../iScout Mechanic-Ti VisualPlatformSetUp v3.0.6+windows/` using the recipes in

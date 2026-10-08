@@ -4,7 +4,7 @@ Everything in this document set can be regenerated from the two original artifac
 This file is the recipe. **All paths are relative to the thermal-camera folder.**
 
 ```
-Thermal Camera/                                            <- repository root
+Mechanic-Iscout-Thermal-Camera-linux-Port/                <- repository root
 ├── RE Docs/                                               <- THIS DOCUMENT SET
 ├── linux-port/                                            <- the Linux port (see 08)
 ├── RE Workspace/                                          <- generated, large, disposable

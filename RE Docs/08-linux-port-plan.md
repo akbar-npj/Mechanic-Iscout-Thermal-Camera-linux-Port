@@ -454,7 +454,7 @@ proposed a flat `dyt-thermal/` tree; the port is instead self-contained under
 `linux-port/`, so it builds and tests on its own.
 
 ```
-Thermal Camera/
+Mechanic-Iscout-Thermal-Camera-linux-Port/
 ├── RE Docs/                this document set
 ├── RE Workspace/           generated, disposable (see 02); only the scripts are tracked
 ├── linux-port/

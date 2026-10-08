@@ -1,8 +1,8 @@
-# Building, installing and running
+# Building, installing and running — Mechanic iScout Thermal Camera
 
-This is the build guide for the Linux port. Everything happens inside
-`linux-port/`; the reverse-engineering write-up lives in `RE Docs/` and is not
-needed to build.
+This is the build guide for the Linux port (`Mechanic-Iscout-Thermal-Camera-linux-Port`).
+Everything happens inside `linux-port/`; the reverse-engineering write-up lives in `RE Docs/`
+and is not needed to build.
 
 - [Automated build script](#automated-build-script)
 - [What gets built](#what-gets-built)
@@ -25,7 +25,8 @@ any `make` flags.  It validates prerequisites, enforces the mandatory
 ### Quick start
 
 ```sh
-cd linux-port
+git clone https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port.git
+cd Mechanic-Iscout-Thermal-Camera-linux-Port/linux-port
 ./build.sh                # build + make check (the default)
 ./build.sh build          # compile only
 ./build.sh check          # regression gate only
