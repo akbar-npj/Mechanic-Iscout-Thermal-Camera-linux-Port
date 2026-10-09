@@ -17,7 +17,7 @@ visible camera, **8–14 µm**, **−15 °C … 600 °C** — sold under OEM bra
 including Mechanic iScout, Mechanic-Ti, Xtherm, Aixun, MaAnt, MileSeey, QianLi,
 and others.
 
-> **New here?** Start with the [layman's wiki](docs/wiki/Home.md) — a plain-language
+> **New here?** Start with the [layman's wiki](https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port/wiki) — a plain-language
 > tour of every option in the app. To build from source, see [`BUILDING.md`](BUILDING.md).
 
 ## Status (v0.1.0)
@@ -91,7 +91,7 @@ access to the camera, and packaging.
 
 | Path | What |
 |---|---|
-| `docs/wiki/` | **The layman's guide** — every option explained in plain language. |
+| `docs/wiki/` | A short pointer to the [layman's wiki](https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port/wiki) on GitHub. |
 | `RE Docs/` | The reverse-engineering write-up. Tagged **[V]** verified / **[I]** inferred / **[?]** unknown. |
 | `linux-port/` | The port: engine, GUI, tests, CLI tools, vendored libuvc. |
 | `linux-port/gui/README.md` | The deep engineering notes for the Qt6 front end. |
@@ -103,7 +103,7 @@ access to the camera, and packaging.
 
 | | |
 |---|---|
-| [`docs/wiki/Home.md`](docs/wiki/Home.md) | The layman's wiki — start here if you just want to use the app |
+| [The layman's wiki](https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port/wiki) | Start here if you just want to use the app |
 | [`BUILDING.md`](BUILDING.md) | How to build, install, package, and grant camera access |
 | [`linux-port/gui/README.md`](linux-port/gui/README.md) | How the Qt6 window is built and why (engineering detail) |
 | [`RE Docs/README.md`](RE%20Docs/README.md) | Orientation and the executive summary of findings |
@@ -131,7 +131,7 @@ two: it refuses any opcode whose table entry is marked `WRITE`
 without a device attached. The one write the app itself makes is the four runtime
 radiometric parameters (emissivity, ambient, reflected, distance), which the
 device supports and which are armed and confirmed explicitly — see
-[the device page](docs/wiki/The-device.md).
+[the device page](https://github.com/akbar-npj/Mechanic-Iscout-Thermal-Camera-linux-Port/wiki/The-device).
 
 ## Not tracked
 
